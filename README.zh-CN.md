@@ -73,6 +73,32 @@ EXQSERVE_API_KEY='change-me' \
   --host 0.0.0.0 --port 8000
 ```
 
+## Docker
+
+Docker 镜像面向 Linux x86_64 + NVIDIA GPU，并包含已经验证的 ExLlamaV3 运行环境。NVIDIA 驱动和 NVIDIA Container Toolkit 由宿主机提供；模型与密钥不写入镜像。版本标签会自动发布到 `ghcr.io/exq-ai/exqserve`。
+
+先在仓库中构建镜像；需要鉴权时在当前 shell 中设置 `EXQSERVE_API_KEY`，然后运行：
+
+```bash
+docker build -t exqserve .
+docker run --rm --gpus all --shm-size 8g \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e EXQSERVE_API_KEY \
+  exqserve \
+  /models/Qwen3.8-27B-exl3-SC_4.00bpw_H5 \
+  --model-root /models \
+  --host 0.0.0.0 --port 8000
+```
+
+使用 Docker Compose 时，将 `docker-compose.env.example` 复制为 `.env`，设置宿主机模型目录和模型名称，然后运行：
+
+```bash
+docker compose up -d
+```
+
+Compose 默认保留所有可见 NVIDIA GPU，并将共享内存设为 8 GiB，避免 Tensor Parallel 直接继承 Docker 较小的 `/dev/shm` 默认值；如有需要可通过 `EXQSERVE_SHM_SIZE` 调整。
+
 ## API 支持
 
 | API | Endpoint |
