@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Build/package output
+build/
+dist/
+*.egg-info/
+
+# Editors/OS
+.idea/
+.vscode/
+.DS_Store
+
+# Runtime/private artifacts
+logs/
+captures/
+models/
+*.log
+
+# Local agent coordination
+.ai-bridge/

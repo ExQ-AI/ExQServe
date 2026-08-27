@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exqserve"
+version = "0.1.0"
+description = "OpenAI- and Anthropic-compatible serving for ExLlamaV3"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "fastapi>=0.140,<1",
+    "huggingface-hub>=1.7,<2",
+    "jsonschema>=4.26,<5",
+    "prometheus-client>=0.22,<1",
+    "PyYAML>=6,<7",
+    "uvicorn>=0.51,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ExQ-AI/ExQServe"
+Repository = "https://github.com/ExQ-AI/ExQServe"
+Issues = "https://github.com/ExQ-AI/ExQServe/issues"
+
+[project.scripts]
+exqserve = "exqserve.server.cli:main"
+
+[project.optional-dependencies]
+runtime = [
+    "exllamav3>=1.4.2,<1.5",
+]
+dev = [
+    "build>=1.2,<2",
+    "httpx>=0.28,<1",
+    "mypy>=1.17,<2",
+    "pytest>=8.4,<9",
+    "ruff>=0.12,<1",
+    "types-jsonschema>=4.26,<5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
