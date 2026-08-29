@@ -71,7 +71,7 @@ def _reasoning_kwargs(
         effort_map = {
             ReasoningEffort.LOW: "low",
             ReasoningEffort.MEDIUM: "medium",
-            ReasoningEffort.HIGH: "high",
+            ReasoningEffort.HIGH: "xhigh",
             ReasoningEffort.XHIGH: "xhigh",
             ReasoningEffort.MAXIMUM: "xhigh",
         }

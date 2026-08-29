@@ -99,7 +99,10 @@ def _tool() -> FunctionTool:
     )
 
 
-def test_qwen38_real_template_accepts_compiled_agent_history_deterministically() -> None:
+@pytest.mark.parametrize("effort", (ReasoningEffort.HIGH, ReasoningEffort.MAXIMUM))
+def test_qwen38_real_template_accepts_compiled_agent_history_deterministically(
+    effort: ReasoningEffort,
+) -> None:
     adapter = _TransformersTemplateAdapter(_model_directory())
     compiler = QwenPromptCompiler(adapter)
     tool = _tool()
@@ -121,7 +124,7 @@ def test_qwen38_real_template_accepts_compiled_agent_history_deterministically()
             MessageItem(MessageRole.USER, "Summarize"),
         ),
     )
-    reasoning = ReasoningPolicy(ReasoningMode.ENABLED, ReasoningEffort.MAXIMUM)
+    reasoning = ReasoningPolicy(ReasoningMode.ENABLED, effort)
 
     first = compiler.compile(request, reasoning, policy)
     second = compiler.compile(request, reasoning, policy)

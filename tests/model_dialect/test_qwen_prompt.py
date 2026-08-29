@@ -134,7 +134,7 @@ def test_assistant_reasoning_text_tool_call_and_result_group_into_template_histo
     assert dict(prepared.template_kwargs) == {
         "enable_thinking": True,
         "preserve_thinking": True,
-        "reasoning_effort": "high",
+        "reasoning_effort": "xhigh",
     }
 
 
@@ -242,6 +242,10 @@ def test_tool_exposure_is_policy_aware_and_sorted_by_name() -> None:
         (ReasoningPolicy(), {}),
         (ReasoningPolicy(ReasoningMode.DISABLED), {"enable_thinking": False}),
         (ReasoningPolicy(ReasoningMode.ENABLED), {"enable_thinking": True}),
+        (
+            ReasoningPolicy(ReasoningMode.ENABLED, ReasoningEffort.HIGH),
+            {"enable_thinking": True, "reasoning_effort": "xhigh"},
+        ),
         (
             ReasoningPolicy(ReasoningMode.ENABLED, ReasoningEffort.XHIGH),
             {"enable_thinking": True, "reasoning_effort": "xhigh"},
