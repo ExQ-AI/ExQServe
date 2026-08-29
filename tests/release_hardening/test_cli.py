@@ -34,6 +34,10 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
             "4",
             "--max-chunk-size",
             "1024",
+            "--sysmem-kv-cache-mb",
+            "8192",
+            "--sysmem-recurrent-cache-mb",
+            "2048",
             "--mtp",
             "--mtp-draft-tokens",
             "6",
@@ -89,6 +93,8 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
     assert config.cache_tokens == 65536
     assert config.cache_key_bits is None
     assert config.cache_value_bits is None
+    assert config.sysmem_kv_cache_mb == 8192
+    assert config.sysmem_recurrent_cache_mb == 2048
     assert config.mtp_enabled is True
     assert config.mtp_draft_tokens == 6
     assert config.mtp_cache_bits is None
@@ -129,6 +135,8 @@ def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path)
                 "kv-cache-bits: fp16",
                 "max-batch-size: 2",
                 "max-chunk-size: 1024",
+                "sysmem-kv-cache-mb: 4096",
+                "sysmem-recurrent-cache-mb: 3072",
                 "tool-constraint-mode: format",
                 "reserve-per-device-gb: [1.25, 2.5]",
                 "device-ids: [0, 1]",
@@ -165,6 +173,8 @@ def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path)
     assert config.cache_value_bits is None
     assert config.max_batch_size == 2
     assert config.max_chunk_size == 1024
+    assert config.sysmem_kv_cache_mb == 4096
+    assert config.sysmem_recurrent_cache_mb == 3072
     assert config.tool_constraint_mode is ToolConstraintMode.FORMAT
     assert config.reserve_per_device_gb == (1.25, 2.5)
     assert config.device_ids == (0, 1)

@@ -91,6 +91,8 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
     assert q8.max_requeue_tokens is None
     assert q8.device_ids is None
     assert q8.chat_template is None
+    assert q8.sysmem_kv_cache_mb == 0
+    assert q8.sysmem_recurrent_cache_mb == 4096
     selected = ExLlamaV3LoadConfig("/m", 256, device_ids=(0, 2), tp_output_device=2)
     assert selected.device_ids == (0, 2)
 
@@ -140,6 +142,14 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
         ExLlamaV3LoadConfig("/m", 256, max_requeue_tokens=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="max_requeue_tokens"):
         ExLlamaV3LoadConfig("/m", 256, max_requeue_tokens=0)
+    with pytest.raises(TypeError, match="sysmem_kv_cache_mb"):
+        ExLlamaV3LoadConfig("/m", 256, sysmem_kv_cache_mb=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="sysmem_kv_cache_mb"):
+        ExLlamaV3LoadConfig("/m", 256, sysmem_kv_cache_mb=-1)
+    with pytest.raises(TypeError, match="sysmem_recurrent_cache_mb"):
+        ExLlamaV3LoadConfig("/m", 256, sysmem_recurrent_cache_mb=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="sysmem_recurrent_cache_mb"):
+        ExLlamaV3LoadConfig("/m", 256, sysmem_recurrent_cache_mb=0)
     with pytest.raises(ValueError, match="must not be empty"):
         ExLlamaV3LoadConfig("/m", 256, device_ids=())
     with pytest.raises(ValueError, match="non-negative"):

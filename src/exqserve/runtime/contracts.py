@@ -137,6 +137,8 @@ class ExLlamaV3LoadConfig:
     device_ids: tuple[int, ...] | None = None
     chat_template: str | None = None
     vision_cache_mb: int = 256
+    sysmem_kv_cache_mb: int = 0
+    sysmem_recurrent_cache_mb: int = 4096
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_directory, str):
@@ -226,6 +228,18 @@ class ExLlamaV3LoadConfig:
             raise TypeError("vision_cache_mb must be an integer")
         if self.vision_cache_mb < 0:
             raise ValueError("vision_cache_mb must be non-negative")
+        if not isinstance(self.sysmem_kv_cache_mb, int) or isinstance(
+            self.sysmem_kv_cache_mb, bool
+        ):
+            raise TypeError("sysmem_kv_cache_mb must be an integer")
+        if self.sysmem_kv_cache_mb < 0:
+            raise ValueError("sysmem_kv_cache_mb must be non-negative")
+        if not isinstance(self.sysmem_recurrent_cache_mb, int) or isinstance(
+            self.sysmem_recurrent_cache_mb, bool
+        ):
+            raise TypeError("sysmem_recurrent_cache_mb must be an integer")
+        if self.sysmem_recurrent_cache_mb <= 0:
+            raise ValueError("sysmem_recurrent_cache_mb must be positive")
         if self.draft_model_directory is not None:
             if not isinstance(self.draft_model_directory, str):
                 raise TypeError("draft_model_directory must be a string or None")

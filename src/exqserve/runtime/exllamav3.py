@@ -1138,6 +1138,8 @@ class ExLlamaV3Runtime:
             generator_options = {
                 "dynamic_draft_tokens": dynamic_draft,
                 "draft_confidence": config.draft_confidence,
+                "cpu_cache_size": config.sysmem_kv_cache_mb * 1024**2,
+                "recurrent_cache_size": config.sysmem_recurrent_cache_mb * 1024**2,
             }
             # Supported ExLlamaV3 Generator contract keeps draft construction positional through
             # the draft-token count: model, cache, tokenizer, batch/chunk limits, queue size,
@@ -1161,6 +1163,8 @@ class ExLlamaV3Runtime:
                 text_codec,
                 max_batch_size=config.max_batch_size,
                 max_chunk_size=config.max_chunk_size,
+                cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
+                recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
             )
         return self._generator
 

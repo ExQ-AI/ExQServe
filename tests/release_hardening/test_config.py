@@ -25,6 +25,8 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.max_request_body_bytes == 16 * 1024 * 1024
     assert config.max_injection_body_bytes == 64 * 1024
     assert config.vision_cache_mb == 256
+    assert config.sysmem_kv_cache_mb == 0
+    assert config.sysmem_recurrent_cache_mb == 4096
     assert config.tool_constraint_mode is ToolConstraintMode.OFF
     assert config.api_keys == ()
     assert config.protect_metrics is True
@@ -56,6 +58,8 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert runtime.device_ids is None
     assert runtime.chat_template is None
     assert runtime.vision_cache_mb == 256
+    assert runtime.sysmem_kv_cache_mb == 0
+    assert runtime.sysmem_recurrent_cache_mb == 4096
 
     control = config.request_control_config()
     assert control.max_in_flight == 8
@@ -104,6 +108,26 @@ def test_server_config_validates_vision_cache_budget(tmp_path: Path) -> None:
         ServerConfig(tmp_path / "model", vision_cache_mb=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="vision_cache_mb"):
         ServerConfig(tmp_path / "model", vision_cache_mb=-1)
+
+
+def test_server_config_round_trips_sysmem_cache_budgets(tmp_path: Path) -> None:
+    config = ServerConfig(
+        tmp_path / "model",
+        sysmem_kv_cache_mb=8192,
+        sysmem_recurrent_cache_mb=2048,
+    )
+    runtime = config.runtime_load_config()
+    assert runtime.sysmem_kv_cache_mb == 8192
+    assert runtime.sysmem_recurrent_cache_mb == 2048
+
+    with pytest.raises(TypeError, match="sysmem_kv_cache_mb"):
+        ServerConfig(tmp_path / "model", sysmem_kv_cache_mb=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="sysmem_kv_cache_mb"):
+        ServerConfig(tmp_path / "model", sysmem_kv_cache_mb=-1)
+    with pytest.raises(TypeError, match="sysmem_recurrent_cache_mb"):
+        ServerConfig(tmp_path / "model", sysmem_recurrent_cache_mb=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="sysmem_recurrent_cache_mb"):
+        ServerConfig(tmp_path / "model", sysmem_recurrent_cache_mb=0)
 
 
 def test_server_config_model_identity_override_and_context_ceiling(tmp_path: Path) -> None:

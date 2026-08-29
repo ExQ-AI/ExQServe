@@ -66,6 +66,8 @@ class ServerConfig:
     vision_cache_mb: int = 256
     model_dialect: str = "auto"
     tool_constraint_mode: ToolConstraintMode = ToolConstraintMode.OFF
+    sysmem_kv_cache_mb: int = 0
+    sysmem_recurrent_cache_mb: int = 4096
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -163,13 +165,15 @@ class ServerConfig:
             "response_store_max_bytes",
             "max_injection_body_bytes",
             "vision_cache_mb",
+            "sysmem_kv_cache_mb",
+            "sysmem_recurrent_cache_mb",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{name} must be an integer")
-            if name == "vision_cache_mb":
+            if name in {"vision_cache_mb", "sysmem_kv_cache_mb"}:
                 if value < 0:
-                    raise ValueError("vision_cache_mb must be non-negative")
+                    raise ValueError(f"{name} must be non-negative")
                 continue
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -239,6 +243,8 @@ class ServerConfig:
             device_ids=self.device_ids,
             chat_template=self._chat_template_text,
             vision_cache_mb=self.vision_cache_mb,
+            sysmem_kv_cache_mb=self.sysmem_kv_cache_mb,
+            sysmem_recurrent_cache_mb=self.sysmem_recurrent_cache_mb,
             lora_adapters=tuple(
                 LoRAAdapterConfig(
                     str(path),

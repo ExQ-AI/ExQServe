@@ -624,6 +624,8 @@ def test_mtp_load_builds_draft_component_cache_history_and_lazy_generator(
         mtp_cache_bits=4,
         dynamic_draft_tokens=True,
         draft_confidence=0.55,
+        sysmem_kv_cache_mb=6144,
+        sysmem_recurrent_cache_mb=3072,
     )
 
     runtime.load(config)
@@ -664,6 +666,8 @@ def test_mtp_load_builds_draft_component_cache_history_and_lazy_generator(
         assert generator.args[8] == 2
         assert generator.kwargs["dynamic_draft_tokens"] is True
         assert generator.kwargs["draft_confidence"] == 0.55
+        assert generator.kwargs["cpu_cache_size"] == 6144 * 1024**2
+        assert generator.kwargs["recurrent_cache_size"] == 3072 * 1024**2
         await runtime.close()
 
     asyncio.run(scenario())
@@ -1776,6 +1780,8 @@ def test_submit_passes_explicit_requeue_budget_to_exllamav3_job(
             "/models/qwen",
             cache_tokens=1024,
             max_requeue_tokens=1024,
+            sysmem_kv_cache_mb=2048,
+            sysmem_recurrent_cache_mb=1024,
         )
     )
 
@@ -1784,6 +1790,9 @@ def test_submit_passes_explicit_requeue_budget_to_exllamav3_job(
 
     asyncio.run(scenario())
 
+    generator = backend._state["generator"]
+    assert generator.kwargs["cpu_cache_size"] == 2048 * 1024**2
+    assert generator.kwargs["recurrent_cache_size"] == 1024 * 1024**2
     _, _, _, kwargs = _FakeAsyncJob.calls[0]
     assert kwargs["max_rq_tokens"] == 1024
 

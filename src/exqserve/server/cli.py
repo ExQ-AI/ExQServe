@@ -59,6 +59,8 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "allow_remote_images": False,
     "max_image_bytes": 20 * 1024 * 1024,
     "vision_cache_mb": 256,
+    "sysmem_kv_cache_mb": 0,
+    "sysmem_recurrent_cache_mb": 4096,
     "max_in_flight": 8,
     "max_prompt_tokens": None,
     "max_output_tokens": None,
@@ -283,6 +285,19 @@ def _build_parser(
         "--vision-cache-mb",
         type=int,
         help="CPU tensor budget for cached vision embeddings in MiB; 0 disables the cache.",
+    )
+    parser.add_argument(
+        "--sysmem-kv-cache-mb",
+        type=int,
+        help=(
+            "Pinned system-memory budget in MiB for ExLlamaV3's second-tier K/V page cache; "
+            "0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--sysmem-recurrent-cache-mb",
+        type=int,
+        help="System-memory budget in MiB for ExLlamaV3 recurrent-state checkpoints.",
     )
     parser.add_argument("--max-in-flight", type=int)
     parser.add_argument("--max-prompt-tokens", type=int)
@@ -557,6 +572,8 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.vision_cache_mb,
         args.model_dialect,
         ToolConstraintMode(args.tool_constraint_mode),
+        args.sysmem_kv_cache_mb,
+        args.sysmem_recurrent_cache_mb,
     )
 
 
