@@ -25,6 +25,14 @@ Agent-focused OpenAI- and Anthropic-compatible serving for ExLlamaV3 / EXL3.
 
 Adapted families preserve their model-native reasoning and tool protocols. Vision has been validated on Qwen3.8, Gemma 4, and Muse Glimmer; Generic HF can preserve multimodal input when the backend exposes a compatible vision component. Image input is opt-in with `--vision`, and unsupported model/backend combinations fail explicitly instead of silently falling back to text mode.
 
+## Roadmap
+
+ExQServe is under active development. Current priorities include:
+
+- [ ] Pluggable model dialects for easier model-native Agent protocol extensions
+- [ ] LLGuidance-backed constrained decoding for Tool Calling and Structured Outputs
+- [ ] Broader model-family adaptations
+
 ## Installation
 
 ExQServe requires Python 3.12+, an NVIDIA GPU, a CUDA-enabled PyTorch build, and ExLlamaV3 `>=1.4.4,<1.5`.

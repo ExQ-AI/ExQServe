@@ -25,6 +25,14 @@ ExQServe 是面向 ExLlamaV3 / EXL3 的推理服务，兼容 OpenAI 和 Anthropi
 
 已适配系列会保留各自的思考与工具调用格式。Qwen3.8、Gemma 4 和 Muse Glimmer 已验证图片输入；其他 Hugging Face 模型在后端提供兼容视觉组件时也可以保留多模态输入。图片能力需要显式开启 `--vision`，不支持的模型或后端会直接报错，不会静默退回纯文本模式。
 
+## 开发计划
+
+ExQServe 仍在持续开发中，目前主要关注：
+
+- [ ] Dialect 插件系统，降低模型原生 Agent 协议的扩展与维护成本
+- [ ] 基于 LLGuidance 的 Constrained Decoding，用于 Tool Calling 与 Structured Outputs
+- [ ] 更多模型系列适配
+
 ## 安装
 
 ExQServe 需要 Python 3.12+、NVIDIA GPU、支持 CUDA 的 PyTorch，以及 ExLlamaV3 `>=1.4.4,<1.5`。
