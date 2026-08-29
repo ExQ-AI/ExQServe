@@ -142,7 +142,7 @@ def test_runtime_text_is_parsed_and_stop_completion_emits_usage_then_terminal() 
             ]
         )
         parser = _Parser("req")
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled))
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled))
 
         events = [event async for event in await engine.submit(_serving_request())]
 
@@ -180,7 +180,7 @@ def test_only_user_requested_stop_sequence_is_exposed_canonically() -> None:
         )
         internal_engine = ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning: _Parser(request_id),
+            lambda request_id, reasoning, tool_policy: _Parser(request_id),
             _Controller(internal),
         )
         internal_events = [event async for event in await internal_engine.submit(_serving_request(("END",)))]
@@ -194,7 +194,7 @@ def test_only_user_requested_stop_sequence_is_exposed_canonically() -> None:
         )
         requested_engine = ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning: _Parser(request_id),
+            lambda request_id, reasoning, tool_policy: _Parser(request_id),
             _Controller(requested),
         )
         requested_events = [
@@ -224,7 +224,7 @@ def test_measured_runtime_timing_is_copied_before_usage_without_estimation() -> 
                 ),
             ]
         )
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: _Parser(request_id), _Controller(controlled))
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: _Parser(request_id), _Controller(controlled))
 
         events = [event async for event in await engine.submit(_serving_request())]
 
@@ -244,7 +244,7 @@ def test_length_stop_maps_to_length_completion() -> None:
             [RuntimeStarted("req"), RuntimeFinished("req", RuntimeStopReason.LENGTH, usage, RuntimeTiming())]
         )
         parser = _Parser("req")
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled))
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled))
 
         events = [event async for event in await engine.submit(_serving_request())]
 
@@ -266,7 +266,7 @@ def test_runtime_failure_closes_parser_channels_then_preserves_error() -> None:
         )
         controlled = _Controlled([RuntimeStarted("req"), RuntimeFailed("req", error)])
         parser = _Parser("req")
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled))
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled))
 
         events = [event async for event in await engine.submit(_serving_request())]
 
@@ -285,7 +285,7 @@ def test_timeout_runtime_cancel_maps_to_safe_timeout_failure() -> None:
         controlled = _Controlled([RuntimeCancelled("req")])
         controlled.terminal_reason = RequestTerminalReason.TIMEOUT
         parser = _Parser("req")
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled))
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled))
 
         events = [event async for event in await engine.submit(_serving_request())]
 
@@ -302,7 +302,7 @@ def test_ordinary_runtime_cancel_maps_to_generation_cancelled() -> None:
         controlled = _Controlled([RuntimeCancelled("req")])
         controlled.terminal_reason = RequestTerminalReason.CLIENT_CANCELLED
         parser = _Parser("req")
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled))
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled))
 
         events = [event async for event in await engine.submit(_serving_request())]
 

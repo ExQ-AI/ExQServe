@@ -18,7 +18,7 @@ from exqserve.core.items import (
 )
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import RenderedPrompt, TemplateRequest
-from exqserve.model.glm5 import GLM5_CAPABILITIES, Glm5IncrementalParser, Glm5PromptCompiler
+from exqserve.model.glm5 import GLM5_CAPABILITIES, Glm5PromptCompiler
 from exqserve.model.registry import Glm5Dialect
 
 
@@ -146,7 +146,7 @@ def test_glm5_rejects_multimodal_input_instead_of_template_silently_dropping_it(
         compiler.prepare(request, ReasoningPolicy(), _policy())
 
 
-def test_glm5_compile_snapshots_lightweight_parser_context() -> None:
+def test_glm5_compile_is_parser_context_stateless() -> None:
     compiler = Glm5PromptCompiler(_FakeTemplateAdapter())
     compiler.compile(
         _request(MessageItem(MessageRole.USER, "search")),
@@ -154,27 +154,11 @@ def test_glm5_compile_snapshots_lightweight_parser_context() -> None:
         _policy(_tool()),
     )
 
-    parser_context = compiler.take_parser_context("req-glm5")
-    assert parser_context is not None
-    parser = Glm5IncrementalParser(
-        "req-glm5",
-        start_in_reasoning=True,
-        parser_context=parser_context,
-    )
-    events = list(
-        parser.feed(
-            "</think><tool_call>lookup<arg_key>query</arg_key><arg_value>123</arg_value></tool_call>"
-        )
-    )
-    events.extend(parser.finish().events)
-    calls = [event.call for event in events if isinstance(event, ToolCallCompleted)]
-
-    assert len(calls) == 1
-    assert calls[0].arguments_json == '{"query":"123"}'
-    assert compiler.take_parser_context("req-glm5") is None
+    assert not hasattr(compiler, "take_parser_context")
+    assert not hasattr(compiler, "_parser_contexts")
 
 
-def test_glm5_dialect_hands_compiled_tool_schema_to_parser() -> None:
+def test_glm5_dialect_derives_parser_schema_from_current_tool_policy() -> None:
     dialect = Glm5Dialect()
     compiler = dialect.create_compiler(_FakeTemplateAdapter())
     tool = FunctionTool(
@@ -187,7 +171,7 @@ def test_glm5_dialect_hands_compiled_tool_schema_to_parser() -> None:
     request = _request(MessageItem(MessageRole.USER, "lookup"))
     compiler.compile(request, ReasoningPolicy(), _policy(tool))
 
-    parser = dialect.create_parser("req-glm5", ReasoningPolicy())
+    parser = dialect.create_parser("req-glm5", ReasoningPolicy(), _policy(tool))
     events = list(
         parser.feed(
             "</think><tool_call>lookup<arg_key>id</arg_key><arg_value>123</arg_value></tool_call>"
@@ -201,8 +185,9 @@ def test_glm5_dialect_hands_compiled_tool_schema_to_parser() -> None:
 
 
 
-def test_glm5_parser_schema_context_is_request_scoped_not_last_compile_only() -> None:
-    compiler = Glm5PromptCompiler(_FakeTemplateAdapter())
+def test_glm5_parser_schema_context_is_request_local_without_compiler_state() -> None:
+    dialect = Glm5Dialect()
+    compiler = dialect.create_compiler(_FakeTemplateAdapter())
     first = CanonicalRequest(
         "req-first",
         "glm5",
@@ -213,25 +198,14 @@ def test_glm5_parser_schema_context_is_request_scoped_not_last_compile_only() ->
         "glm5",
         items=(MessageItem(MessageRole.USER, "second"),),
     )
+    first_policy = _policy(_tool("first"))
+    second_policy = _policy(_tool("second"))
 
-    compiler.compile(first, ReasoningPolicy(), _policy(_tool("first")))
-    compiler.compile(second, ReasoningPolicy(), _policy(_tool("second")))
+    compiler.compile(first, ReasoningPolicy(), first_policy)
+    compiler.compile(second, ReasoningPolicy(), second_policy)
 
-    first_context = compiler.take_parser_context("req-first")
-    second_context = compiler.take_parser_context("req-second")
-    assert first_context is not None
-    assert second_context is not None
-
-    first_parser = Glm5IncrementalParser(
-        "req-first",
-        start_in_reasoning=True,
-        parser_context=first_context,
-    )
-    second_parser = Glm5IncrementalParser(
-        "req-second",
-        start_in_reasoning=True,
-        parser_context=second_context,
-    )
+    first_parser = dialect.create_parser("req-first", ReasoningPolicy(), first_policy)
+    second_parser = dialect.create_parser("req-second", ReasoningPolicy(), second_policy)
     first_events = first_parser.feed(
         "</think><tool_call>first<arg_key>query</arg_key><arg_value>123</arg_value></tool_call>"
     )
@@ -243,3 +217,4 @@ def test_glm5_parser_schema_context_is_request_scoped_not_last_compile_only() ->
     second_calls = [event.call for event in second_events if isinstance(event, ToolCallCompleted)]
     assert first_calls[0].arguments_json == '{"query":"123"}'
     assert second_calls[0].arguments_json == '{"query":"456"}'
+    assert not hasattr(compiler, "_parser_contexts")

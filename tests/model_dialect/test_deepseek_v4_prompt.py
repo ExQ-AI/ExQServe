@@ -164,6 +164,18 @@ def test_deepseek_v4_without_tools_drops_old_reasoning_before_latest_user() -> N
     assert compiled.text.endswith("<｜User｜>second<｜Assistant｜><think>")
 
 
+def test_deepseek_v4_compile_is_parser_context_stateless() -> None:
+    compiler = DeepSeekV4PromptCompiler(_Adapter())
+    compiler.compile(
+        _request(MessageItem(MessageRole.USER, "lookup")),
+        ReasoningPolicy(),
+        _policy(_tool()),
+    )
+
+    assert not hasattr(compiler, "take_parser_context")
+    assert not hasattr(compiler, "_parser_contexts")
+
+
 def test_deepseek_v4_systemless_tool_request_inserts_native_tool_system_envelope() -> None:
     compiled = DeepSeekV4PromptCompiler(_Adapter()).compile(
         _request(MessageItem(MessageRole.USER, "lookup 123")),

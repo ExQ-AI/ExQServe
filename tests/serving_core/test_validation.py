@@ -151,7 +151,7 @@ def test_undeclared_completed_tool_fails_before_completion_is_released() -> None
         )
         controlled = _Controlled([RuntimeStarted("req"), RuntimeTextDelta("req", "raw"), _finished()])
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -182,7 +182,7 @@ def test_named_choice_mismatch_fails_at_candidate_completion() -> None:
             )
         )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -208,7 +208,7 @@ def test_tool_choice_none_fails_when_model_completes_a_tool_call() -> None:
             )
         )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -238,7 +238,7 @@ def test_parallel_false_accepts_first_call_then_fails_second_completion() -> Non
             )
         )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -265,7 +265,7 @@ def test_schema_invalid_completed_call_fails_before_completion_is_released() -> 
             )
         )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -285,7 +285,7 @@ def test_required_policy_without_call_fails_at_generation_end() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.REQUIRED), allow_parallel=True)
         parser = _ScriptedParser(())
         controlled = _Controlled([_finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -304,7 +304,7 @@ def test_incomplete_tool_syntax_is_model_failure() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         parser = _ScriptedParser((), _Finish((), incomplete_tool_call=True))
         controlled = _Controlled([_finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy)
         )
 
@@ -325,7 +325,7 @@ def test_incomplete_tool_attempt_takes_precedence_over_structured_output_validat
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         parser = _ScriptedParser((), _Finish((), incomplete_tool_call=True))
         controlled = _Controlled([_finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy, structured=structured)
         )
 
@@ -346,7 +346,7 @@ def test_invalid_structured_output_fails_only_on_no_tool_final_turn() -> None:
         policy = ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         parser = _ScriptedParser((TextStarted("req"), TextDelta("req", "not-json")))
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy, structured=structured)
         )
 
@@ -375,7 +375,7 @@ def test_valid_tool_turn_skips_structured_output_validation_and_completes_tool_c
             )
         )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
-        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: parser, _Controller(controlled)).submit(
             _request(policy, structured=structured)
         )
 

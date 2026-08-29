@@ -14,13 +14,15 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from exqserve.agent.reasoning import ReasoningPolicy
+from exqserve.agent.tools import ToolPolicy
 from exqserve.control.request import RequestController
 from exqserve.core.model import ServedModelInfo
-from exqserve.model.registry import ModelDialect, default_model_dialect_registry
+from exqserve.model.registry import default_model_dialect_registry
 from exqserve.observability.capture import CaptureManager, CaptureMode, JsonlCaptureSink
 from exqserve.observability.http import create_metrics_router
 from exqserve.observability.metrics import MetricsRegistry
 from exqserve.observability.observer import ObservedRawServingEngine, ObservedServingEngine
+from exqserve.plugin_api import ModelDialect
 from exqserve.protocol.anthropic.api import create_anthropic_router
 from exqserve.protocol.openai.api import create_openai_router
 from exqserve.protocol.openai.lifecycle import InMemoryResponseLifecycleStore
@@ -149,8 +151,9 @@ def _dialect_parser(
     dialect: ModelDialect,
     request_id: str,
     reasoning: ReasoningPolicy,
+    tool_policy: ToolPolicy,
 ) -> IncrementalParserLike:
-    return dialect.create_parser(request_id, reasoning)
+    return dialect.create_parser(request_id, reasoning, tool_policy)
 
 
 def _build_model_bundle(
@@ -174,11 +177,18 @@ def _build_model_bundle(
         config.request_control_config(runtime_object.model_metadata.max_context_tokens),
     )
     template_adapter = RuntimeTemplateAdapter(runtime_object)
-    dialect = default_model_dialect_registry().resolve(runtime_object.model_metadata.architecture)
+    dialect = default_model_dialect_registry().resolve(
+        runtime_object.model_metadata.architecture,
+        config.model_dialect,
+    )
     compiler = dialect.create_compiler(template_adapter)
 
-    def parser_factory(request_id: str, reasoning: ReasoningPolicy) -> IncrementalParserLike:
-        return _dialect_parser(dialect, request_id, reasoning)
+    def parser_factory(
+        request_id: str,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> IncrementalParserLike:
+        return _dialect_parser(dialect, request_id, reasoning, tool_policy)
 
     engine = ServingEngine(compiler, parser_factory, cast(RequestControllerLike, controller))
     raw_engine = RawServingEngine(runtime_object, cast(RawRequestController, controller))

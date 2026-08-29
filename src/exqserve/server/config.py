@@ -63,6 +63,7 @@ class ServerConfig:
     chat_template: Path | None = None
     max_injection_body_bytes: int = 64 * 1024
     vision_cache_mb: int = 256
+    model_dialect: str = "auto"
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -102,6 +103,12 @@ class ServerConfig:
             raise TypeError("host must be a string")
         if not self.host.strip():
             raise ValueError("host must not be empty")
+        if not isinstance(self.model_dialect, str):
+            raise TypeError("model_dialect must be a string")
+        normalized_dialect = self.model_dialect.strip()
+        if not normalized_dialect:
+            raise ValueError("model_dialect must not be empty")
+        object.__setattr__(self, "model_dialect", normalized_dialect)
         if not isinstance(self.port, int) or isinstance(self.port, bool):
             raise TypeError("port must be an integer")
         if not 1 <= self.port <= 65535:

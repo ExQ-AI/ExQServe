@@ -214,7 +214,7 @@ class RequestControllerLike(Protocol):
         ...
 
 
-type ParserFactory = Callable[[str, ReasoningPolicy], IncrementalParserLike]
+type ParserFactory = Callable[[str, ReasoningPolicy, ToolPolicy], IncrementalParserLike]
 
 
 def _safe_error(
@@ -299,7 +299,9 @@ class ServingEngine:
         compiled = await self._compile_request_async(request)
 
         try:
-            parser = self._parser_factory(request.input.request_id, request.reasoning)
+            parser = self._parser_factory(
+                request.input.request_id, request.reasoning, request.tools
+            )
         except Exception as exc:
             raise ServingRejected(
                 _safe_error(

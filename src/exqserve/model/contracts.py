@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import string
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolPolicy
@@ -301,3 +301,52 @@ class IncrementalParserLike(Protocol):
 
     def finish(self) -> ParserFinishLike:
         ...
+
+
+MODEL_DIALECT_PLUGIN_API_VERSION = 1
+MODEL_DIALECT_ENTRY_POINT_GROUP = "exqserve.model_dialects"
+
+
+@runtime_checkable
+class ModelDialect(Protocol):
+    """Protocol-neutral extension contract implemented by one model Agent dialect."""
+
+    @property
+    def dialect_id(self) -> str:
+        ...
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        ...
+
+    def matches(self, architecture: str | None) -> bool:
+        ...
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> PromptCompilerLike:
+        ...
+
+    def create_parser(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> IncrementalParserLike:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDialectPluginRegistration:
+    """Versioned entry-point payload exported by a trusted local plugin package."""
+
+    api_version: int
+    dialects: tuple[ModelDialect, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.api_version, int) or isinstance(self.api_version, bool):
+            raise TypeError("api_version must be an integer")
+        if not isinstance(self.dialects, tuple):
+            raise TypeError("dialects must be a tuple")
+        if not self.dialects:
+            raise ValueError("dialects must not be empty")
+        if not all(isinstance(dialect, ModelDialect) for dialect in self.dialects):
+            raise TypeError("dialects must implement ModelDialect")

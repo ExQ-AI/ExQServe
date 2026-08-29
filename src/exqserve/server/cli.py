@@ -25,6 +25,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "config": None,
     "served_model_id": None,
     "model_root": None,
+    "model_dialect": "auto",
     "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,
@@ -133,6 +134,10 @@ def _build_parser(
         "--model-root",
         type=Path,
         help="Discover switchable models as immediate children of this directory.",
+    )
+    parser.add_argument(
+        "--model-dialect",
+        help="Select a model Agent dialect by id; default 'auto' discovers installed dialect plugins.",
     )
     parser.add_argument(
         "--chat-template",
@@ -543,6 +548,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.chat_template,
         args.max_injection_body_bytes,
         args.vision_cache_mb,
+        args.model_dialect,
     )
 
 

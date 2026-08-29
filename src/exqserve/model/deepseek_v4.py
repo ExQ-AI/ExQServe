@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
-from collections import OrderedDict
 from dataclasses import dataclass
 
 from exqserve.agent._json import (
@@ -191,6 +189,13 @@ def _parser_context_from_tools(tools: tuple[TemplateTool, ...]) -> DeepSeekV4Par
             key for key in declared if isinstance(key, str) and key
         )
     return DeepSeekV4ParserContext(bool(tools), properties)
+
+
+def deepseek_v4_parser_context(tool_policy: ToolPolicy) -> DeepSeekV4ParserContext:
+    """Derive parser-only tool schema state directly from the current request policy."""
+    if not isinstance(tool_policy, ToolPolicy):
+        raise TypeError("tool_policy must be a ToolPolicy")
+    return _parser_context_from_tools(_exposed_tools(tool_policy))
 
 
 def _effort_prefix(policy: ReasoningPolicy) -> str:
@@ -431,14 +436,6 @@ class DeepSeekV4PromptCompiler:
 
     def __init__(self, template_adapter: ChatTemplateAdapter) -> None:
         self._template_adapter = template_adapter
-        self._parser_contexts: OrderedDict[str, DeepSeekV4ParserContext] = OrderedDict()
-        self._parser_context_lock = threading.Lock()
-
-    def take_parser_context(self, request_id: str) -> DeepSeekV4ParserContext | None:
-        if not isinstance(request_id, str):
-            raise TypeError("request_id must be a string")
-        with self._parser_context_lock:
-            return self._parser_contexts.pop(request_id, None)
 
     def compile(
         self,
@@ -454,12 +451,6 @@ class DeepSeekV4PromptCompiler:
             raise TypeError("tool_policy must be a ToolPolicy")
         turns = _canonical_turns(request)
         tools = _exposed_tools(tool_policy)
-        parser_context = _parser_context_from_tools(tools)
-        with self._parser_context_lock:
-            self._parser_contexts[request.request_id] = parser_context
-            self._parser_contexts.move_to_end(request.request_id)
-            while len(self._parser_contexts) > 256:
-                self._parser_contexts.popitem(last=False)
         text = _render_prompt(turns, tools, reasoning)
         rendered = self._template_adapter.tokenize_encoded_prompt(text)
         snapshot = _template_snapshot(turns, tools)

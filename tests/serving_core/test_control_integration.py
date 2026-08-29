@@ -91,7 +91,7 @@ def test_model_tool_policy_mismatch_passthrough_still_releases_controller_slot()
             JsonSchema('{"type":"object","properties":{}}'),
         )
         policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
-        engine = ServingEngine(_Compiler(), lambda request_id, reasoning: _Parser(), controller)
+        engine = ServingEngine(_Compiler(), lambda request_id, reasoning, tool_policy: _Parser(), controller)
         request = ServingRequest(
             CanonicalRequest(
                 "req",

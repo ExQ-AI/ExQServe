@@ -133,7 +133,7 @@ def test_submit_compiles_and_builds_runtime_request_exactly_once() -> None:
     async def scenario() -> None:
         compiler = _Compiler()
         controller = _Controller()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), controller)
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
 
         session = await engine.submit(_request())
 
@@ -168,7 +168,7 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         plain_controller = _Controller()
         plain_engine = ServingEngine(
             _Compiler(raw_output_is_text_only=True),
-            lambda request_id, reasoning: _Parser(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
             plain_controller,
         )
         await plain_engine.submit(constrained)
@@ -178,7 +178,7 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         triggered_controller = _Controller()
         triggered_engine = ServingEngine(
             _Compiler(structured_output_trigger="</think>"),
-            lambda request_id, reasoning: _Parser(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
             triggered_controller,
         )
         await triggered_engine.submit(constrained)
@@ -188,7 +188,7 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         framed_controller = _Controller()
         framed_engine = ServingEngine(
             _Compiler(raw_output_is_text_only=False),
-            lambda request_id, reasoning: _Parser(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
             framed_controller,
         )
         await framed_engine.submit(constrained)
@@ -204,7 +204,11 @@ def test_count_input_tokens_compiles_without_parser_or_runtime_submission() -> N
         controller = _Controller()
         parser_calls = 0
 
-        def parser_factory(request_id: str, reasoning: ReasoningPolicy) -> _Parser:
+        def parser_factory(
+            request_id: str,
+            reasoning: ReasoningPolicy,
+            tool_policy: ToolPolicy,
+        ) -> _Parser:
             nonlocal parser_calls
             parser_calls += 1
             return _Parser()
@@ -223,7 +227,7 @@ def test_count_input_tokens_compiles_without_parser_or_runtime_submission() -> N
 def test_prompt_compilation_does_not_block_event_loop() -> None:
     async def scenario() -> None:
         compiler = _BlockingCompiler()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), _Controller())
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), _Controller())
         loop = asyncio.get_running_loop()
         loop.call_later(0.05, compiler.release.set)
 
@@ -240,7 +244,7 @@ def test_prompt_compilation_does_not_block_event_loop() -> None:
 def test_prompt_compilation_remains_serialized_across_concurrent_requests() -> None:
     async def scenario() -> None:
         compiler = _BlockingCompiler()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), _Controller())
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), _Controller())
         first = asyncio.create_task(engine.count_input_tokens(_request()))
         assert await asyncio.to_thread(compiler.started.wait, 0.5)
         second = asyncio.create_task(engine.count_input_tokens(_request()))
@@ -257,7 +261,7 @@ def test_prompt_compilation_remains_serialized_across_concurrent_requests() -> N
 def test_cancelled_compilation_keeps_serialized_lease_until_worker_exits() -> None:
     async def scenario() -> None:
         compiler = _BlockingCompiler()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), _Controller())
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), _Controller())
         first = asyncio.create_task(engine.count_input_tokens(_request()))
         assert await asyncio.to_thread(compiler.started.wait, 0.5)
 
@@ -280,7 +284,7 @@ def test_user_stop_conditions_are_merged_after_model_dialect_stops() -> None:
     async def scenario() -> None:
         compiler = _Compiler()
         controller = _Controller()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), controller)
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
         base = _request()
         request = ServingRequest(
             base.input,
@@ -302,7 +306,7 @@ def test_invalid_tool_history_rejects_before_compile_or_controller() -> None:
     async def scenario() -> None:
         compiler = _Compiler()
         controller = _Controller()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), controller)
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
 
         with pytest.raises(ServingRejected) as exc_info:
             await engine.submit(_request((ToolResultItem("missing", "x"),)))
@@ -320,7 +324,7 @@ def test_compile_failure_is_safe_invalid_request_and_consumes_no_slot() -> None:
         compiler = _Compiler()
         compiler.fail = True
         controller = _Controller()
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), controller)
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
 
         with pytest.raises(ServingRejected) as exc_info:
             await engine.submit(_request())
@@ -343,7 +347,7 @@ def test_request_control_rejection_is_preserved_exactly() -> None:
             "Server is at capacity.",
             retryable=True,
         )
-        engine = ServingEngine(compiler, lambda request_id, reasoning: _Parser(), controller)
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
 
         with pytest.raises(ServingRejected) as exc_info:
             await engine.submit(_request())

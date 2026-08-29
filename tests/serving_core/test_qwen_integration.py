@@ -111,7 +111,7 @@ def test_actual_qwen_compiler_parser_flow_through_serving_core_without_cuda() ->
         controller = _Controller(controlled)
         engine = ServingEngine(
             compiler,
-            lambda request_id, reasoning: QwenIncrementalParser(
+            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
                 request_id,
                 start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
             ),

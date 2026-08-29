@@ -537,3 +537,27 @@ def test_cli_empty_api_key_file_fails_without_starting(
     assert cli.main([str(tmp_path), "--api-key-file", str(key_file)]) == 2
     assert compose_calls == 0
     assert "API key file contains no keys" in capsys.readouterr().err
+
+
+def test_cli_model_dialect_defaults_to_auto_and_accepts_explicit_id(tmp_path: Path) -> None:
+    default_config = cli.parse_config([str(tmp_path)])
+    explicit_config = cli.parse_config([str(tmp_path), "--model-dialect", "custom-agent"])
+
+    assert default_config.model_dialect == "auto"
+    assert explicit_config.model_dialect == "custom-agent"
+
+
+def test_yaml_model_dialect_is_supported_and_cli_overrides_it(tmp_path: Path) -> None:
+    config_path = tmp_path / "dialect.yaml"
+    config_path.write_text(
+        f"model-directory: {tmp_path}\nmodel-dialect: yaml-agent\n",
+        encoding="utf-8",
+    )
+
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    cli_config = cli.parse_config(
+        ["--config", str(config_path), "--model-dialect", "cli-agent"]
+    )
+
+    assert yaml_config.model_dialect == "yaml-agent"
+    assert cli_config.model_dialect == "cli-agent"

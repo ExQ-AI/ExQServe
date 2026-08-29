@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import threading
-from collections import OrderedDict
 from dataclasses import dataclass
 
 from exqserve.agent._json import (
@@ -38,8 +36,6 @@ from exqserve.core.items import (
 )
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
-    ChatTemplateAdapter,
-    CompiledPrompt,
     ModelCapabilities,
     TemplateMessage,
     TemplateRequest,
@@ -97,11 +93,6 @@ class Glm5PromptCompiler(HFTemplatePromptCompiler):
 
     capabilities = GLM5_CAPABILITIES
     stop_conditions = _GLM5_STOP_CONDITIONS
-
-    def __init__(self, template_adapter: ChatTemplateAdapter) -> None:
-        super().__init__(template_adapter)
-        self._parser_context_lock = threading.Lock()
-        self._parser_contexts: OrderedDict[str, _Glm5ParserContext] = OrderedDict()
 
     def prepare(
         self,
@@ -207,32 +198,6 @@ class Glm5PromptCompiler(HFTemplatePromptCompiler):
             tools=_exposed_tools(tool_policy),
             template_kwargs=_reasoning_kwargs(reasoning),
         )
-
-    def compile(
-        self,
-        request: CanonicalRequest,
-        reasoning: ReasoningPolicy,
-        tool_policy: ToolPolicy,
-    ) -> CompiledPrompt:
-        compiled = super().compile(request, reasoning, tool_policy)
-        # Tool schemas are required to disambiguate GLM's unquoted scalar argument values.
-        # Keep request-scoped snapshots bounded so token-count-only calls cannot grow state forever,
-        # and so parser creation remains correct even if serving scheduling changes in the future.
-        with self._parser_context_lock:
-            if compiled.template_request.tools:
-                self._parser_contexts[request.request_id] = _parser_context_from_tools(
-                    compiled.template_request.tools
-                )
-                self._parser_contexts.move_to_end(request.request_id)
-                while len(self._parser_contexts) > 256:
-                    self._parser_contexts.popitem(last=False)
-            else:
-                self._parser_contexts.pop(request.request_id, None)
-        return compiled
-
-    def take_parser_context(self, request_id: str) -> _Glm5ParserContext | None:
-        with self._parser_context_lock:
-            return self._parser_contexts.pop(request_id, None)
 
     def _raw_output_is_text_only(
         self,
@@ -353,6 +318,13 @@ def _parser_context_from_tools(tools: tuple[TemplateTool, ...]) -> _Glm5ParserCo
             for name, property_schema in properties.items()
         }
     return _Glm5ParserContext(bool(tools), parameter_types)
+
+
+def glm5_parser_context(tool_policy: ToolPolicy) -> _Glm5ParserContext:
+    """Derive parser-only tool schema state directly from the current request policy."""
+    if not isinstance(tool_policy, ToolPolicy):
+        raise TypeError("tool_policy must be a ToolPolicy")
+    return _parser_context_from_tools(_exposed_tools(tool_policy))
 
 
 def _decode_argument(raw: str, schema_types: frozenset[str] | None) -> JsonValue:
