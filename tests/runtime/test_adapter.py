@@ -710,6 +710,8 @@ def test_ngram_drafting_builds_generator_without_draft_model(monkeypatch: pytest
     state = backend._state
     assert state["model_from_config_calls"] == ["text"]
     assert len(state["cache_calls"]) == 1
+    _, _, target_cache_kwargs = state["cache_calls"][0]
+    assert target_cache_kwargs["max_history"] == 7
     assert "generator" not in state
 
     async def scenario() -> None:

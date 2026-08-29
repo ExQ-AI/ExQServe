@@ -1236,6 +1236,11 @@ class ExLlamaV3Runtime:
                     draft_model,
                     config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
                 )
+            elif config.ngram_match_min:
+                # Native N-gram drafting still verifies multiple future positions at once. Recurrent
+                # cache layers therefore need the same history depth as the N-gram draft window,
+                # even though there is no separate draft model/cache.
+                cache_kwargs["max_history"] = config.ngram_draft_size
             if config.cache_key_bits is not None and config.cache_value_bits is not None:
                 cache_kwargs.update(
                     {
