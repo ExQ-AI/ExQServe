@@ -81,6 +81,7 @@ def _reasoning_kwargs(policy: ReasoningPolicy) -> tuple[tuple[str, str], ...]:
         ReasoningEffort.LOW: "low",
         ReasoningEffort.MEDIUM: "medium",
         ReasoningEffort.HIGH: "high",
+        ReasoningEffort.XHIGH: "xhigh",
         ReasoningEffort.MAXIMUM: "xhigh",
     }
     return (("reasoning_strength", effort_map[policy.effort]),)

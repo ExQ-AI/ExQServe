@@ -145,14 +145,18 @@ def test_responses_input_token_count_parse_does_not_require_generation_limit() -
     assert parsed.store is False
 
 
-def test_responses_reasoning_disabled_and_maximum_compatibility() -> None:
+def test_responses_reasoning_disabled_xhigh_and_maximum_compatibility() -> None:
     base = {"model": "m", "input": "hello", "max_output_tokens": 3}
     disabled = ResponsesRequestAdapter().parse(
         {**base, "reasoning": {"effort": "disabled"}}, request_id="r"
     )
     assert disabled.serving.reasoning.mode is ReasoningMode.DISABLED
-    maximum = ResponsesRequestAdapter().parse(
+    xhigh = ResponsesRequestAdapter().parse(
         {**base, "reasoning": {"effort": "xhigh"}}, request_id="r2"
+    )
+    assert xhigh.serving.reasoning.effort is ReasoningEffort.XHIGH
+    maximum = ResponsesRequestAdapter().parse(
+        {**base, "reasoning": {"effort": "max"}}, request_id="r3"
     )
     assert maximum.serving.reasoning.effort is ReasoningEffort.MAXIMUM
 

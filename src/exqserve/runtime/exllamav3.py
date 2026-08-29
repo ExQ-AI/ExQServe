@@ -1257,6 +1257,19 @@ class ExLlamaV3Runtime:
         )
         return RuntimeRenderedPrompt(text, _tensor_to_token_ids(encoded))
 
+    def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
+        """Tokenize a complete model-native prompt without adding another BOS token."""
+        _, text_codec = self._require_loaded()
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        encoded = text_codec.encode(
+            text,
+            add_bos=False,
+            add_eos=False,
+            encode_special_tokens=True,
+        )
+        return RuntimeRenderedPrompt(text, _tensor_to_token_ids(encoded))
+
     def render_chat_template(
         self,
         messages: list[dict[str, object]],

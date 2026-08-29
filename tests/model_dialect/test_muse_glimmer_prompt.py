@@ -101,18 +101,19 @@ def test_muse_glimmer_history_maps_reasoning_tools_and_results() -> None:
     assert dict(prepared.template_kwargs) == {"reasoning_strength": "high"}
 
 
-def test_muse_glimmer_reasoning_strength_maps_maximum_to_xhigh_and_rejects_disabled() -> None:
+def test_muse_glimmer_reasoning_strength_maps_top_efforts_to_xhigh_and_rejects_disabled() -> None:
     compiler = MuseGlimmerPromptCompiler(_FakeTemplateAdapter())
     request = _request(MessageItem(MessageRole.USER, "hello"))
 
     assert dict(compiler.prepare(request, ReasoningPolicy(), _policy()).template_kwargs) == {}
-    assert dict(
-        compiler.prepare(
-            request,
-            ReasoningPolicy(ReasoningMode.ENABLED, ReasoningEffort.MAXIMUM),
-            _policy(),
-        ).template_kwargs
-    ) == {"reasoning_strength": "xhigh"}
+    for effort in (ReasoningEffort.XHIGH, ReasoningEffort.MAXIMUM):
+        assert dict(
+            compiler.prepare(
+                request,
+                ReasoningPolicy(ReasoningMode.ENABLED, effort),
+                _policy(),
+            ).template_kwargs
+        ) == {"reasoning_strength": "xhigh"}
 
     with pytest.raises(ValueError, match="does not support disabling reasoning"):
         compiler.prepare(request, ReasoningPolicy(ReasoningMode.DISABLED), _policy())

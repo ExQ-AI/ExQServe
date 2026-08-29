@@ -180,6 +180,27 @@ def test_request_adapter_maps_json_output_format_and_omitted_thinking() -> None:
     assert schema["required"] == ["answer"]
 
 
+def test_request_adapter_preserves_xhigh_vs_max_effort_distinction() -> None:
+    adapter = AnthropicMessagesRequestAdapter()
+    base = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    xhigh = adapter.parse(
+        {**base, "output_config": {"effort": "xhigh"}},
+        request_id="req_xhigh",
+    )
+    maximum = adapter.parse(
+        {**base, "output_config": {"effort": "max"}},
+        request_id="req_max",
+    )
+
+    assert xhigh.serving.reasoning.effort is ReasoningEffort.XHIGH
+    assert maximum.serving.reasoning.effort is ReasoningEffort.MAXIMUM
+
+
 def test_request_adapter_rejects_invalid_output_format_and_disabled_display() -> None:
     adapter = AnthropicMessagesRequestAdapter()
     base = {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}

@@ -72,6 +72,7 @@ def _reasoning_kwargs(
             ReasoningEffort.LOW: "low",
             ReasoningEffort.MEDIUM: "medium",
             ReasoningEffort.HIGH: "high",
+            ReasoningEffort.XHIGH: "xhigh",
             ReasoningEffort.MAXIMUM: "xhigh",
         }
         values["reasoning_effort"] = effort_map[policy.effort]

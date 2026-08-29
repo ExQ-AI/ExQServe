@@ -139,7 +139,9 @@ def test_chat_reasoning_compatibility_values_map_explicitly() -> None:
     base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
     disabled = ChatRequestAdapter().parse({**base, "reasoning_effort": "none"}, request_id="r")
     assert disabled.serving.reasoning.mode is ReasoningMode.DISABLED
-    maximum = ChatRequestAdapter().parse({**base, "reasoning_effort": "xhigh"}, request_id="r2")
+    xhigh = ChatRequestAdapter().parse({**base, "reasoning_effort": "xhigh"}, request_id="r2")
+    assert xhigh.serving.reasoning.effort is ReasoningEffort.XHIGH
+    maximum = ChatRequestAdapter().parse({**base, "reasoning_effort": "max"}, request_id="r3")
     assert maximum.serving.reasoning.effort is ReasoningEffort.MAXIMUM
 
 

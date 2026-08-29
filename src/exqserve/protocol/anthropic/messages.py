@@ -274,7 +274,7 @@ def _parse_output_config(value: object) -> tuple[ReasoningEffort | None, Structu
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
         "high": ReasoningEffort.HIGH,
-        "xhigh": ReasoningEffort.MAXIMUM,
+        "xhigh": ReasoningEffort.XHIGH,
         "max": ReasoningEffort.MAXIMUM,
     }
     effort: ReasoningEffort | None = None

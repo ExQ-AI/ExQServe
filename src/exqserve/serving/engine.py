@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 
 
 class RuntimeTemplateRenderer(Protocol):
+    def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
+        ...
+
     def render_chat_template(
         self,
         messages: list[dict[str, object]],
@@ -160,6 +163,12 @@ class RuntimeTemplateAdapter:
             dict(request.template_kwargs),
             add_generation_prompt=request.add_generation_prompt,
         )
+        return RenderedPrompt(rendered.text, rendered.input_ids, rendered.runtime_attachments)
+
+    def tokenize_encoded_prompt(self, text: str) -> RenderedPrompt:
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        rendered = self._renderer.tokenize_encoded_prompt(text)
         return RenderedPrompt(rendered.text, rendered.input_ids, rendered.runtime_attachments)
 
 

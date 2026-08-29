@@ -12,6 +12,11 @@ from exqserve.model.contracts import (
     ModelCapabilities,
     PromptCompilerLike,
 )
+from exqserve.model.deepseek_v4 import (
+    DEEPSEEK_V4_CAPABILITIES,
+    DeepSeekV4IncrementalParser,
+    DeepSeekV4PromptCompiler,
+)
 from exqserve.model.gemma4 import GEMMA4_CAPABILITIES, Gemma4IncrementalParser, Gemma4PromptCompiler
 from exqserve.model.generic_hf import (
     GENERIC_HF_CAPABILITIES,
@@ -30,6 +35,13 @@ _GLM5_ARCHITECTURES = frozenset(
     {
         "glmmoedsaforcausallm",
         "glm_moe_dsa_for_causal_lm",
+    }
+)
+
+_DEEPSEEK_V4_ARCHITECTURES = frozenset(
+    {
+        "deepseekv4forcausallm",
+        "deepseek_v4_for_causal_lm",
     }
 )
 
@@ -132,6 +144,36 @@ class Glm5Dialect:
         )
 
 
+@dataclass(slots=True)
+class DeepSeekV4Dialect:
+    dialect_id: str = "deepseek-v4"
+    capabilities: ModelCapabilities = DEEPSEEK_V4_CAPABILITIES
+    _compiler: DeepSeekV4PromptCompiler | None = field(default=None, init=False, repr=False)
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        normalized = architecture.replace(".", "_").lower()
+        return normalized in _DEEPSEEK_V4_ARCHITECTURES
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> DeepSeekV4PromptCompiler:
+        compiler = DeepSeekV4PromptCompiler(template_adapter)
+        self._compiler = compiler
+        return compiler
+
+    def create_parser(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+    ) -> DeepSeekV4IncrementalParser:
+        parser_context = None if self._compiler is None else self._compiler.take_parser_context(request_id)
+        return DeepSeekV4IncrementalParser(
+            request_id,
+            start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
+            parser_context=parser_context,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class MuseGlimmerDialect:
     dialect_id: str = "muse-glimmer"
@@ -204,6 +246,6 @@ class ModelDialectRegistry:
 
 def default_model_dialect_registry() -> ModelDialectRegistry:
     return ModelDialectRegistry(
-        (QwenDialect(), Gemma4Dialect(), Glm5Dialect(), MuseGlimmerDialect()),
+        (QwenDialect(), Gemma4Dialect(), Glm5Dialect(), DeepSeekV4Dialect(), MuseGlimmerDialect()),
         GenericHFDialect(),
     )

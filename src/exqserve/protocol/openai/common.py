@@ -140,7 +140,8 @@ def parse_reasoning_effort(value: object, *, param: str) -> ReasoningPolicy:
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
         "high": ReasoningEffort.HIGH,
-        "xhigh": ReasoningEffort.MAXIMUM,
+        "xhigh": ReasoningEffort.XHIGH,
+        "max": ReasoningEffort.MAXIMUM,
         "maximum": ReasoningEffort.MAXIMUM,
     }
     effort = effort_map.get(normalized)

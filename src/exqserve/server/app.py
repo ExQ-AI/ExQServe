@@ -63,6 +63,9 @@ class ServerRuntimeLike(Protocol):
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         ...
 
+    def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
+        ...
+
     def render_chat_template(
         self,
         messages: list[dict[str, object]],

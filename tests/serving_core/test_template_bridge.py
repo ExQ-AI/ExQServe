@@ -18,6 +18,11 @@ from exqserve.serving.engine import RuntimeTemplateAdapter
 class _Renderer:
     def __init__(self) -> None:
         self.calls: list[tuple[object, object, object, bool]] = []
+        self.encoded_prompts: list[str] = []
+
+    def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
+        self.encoded_prompts.append(text)
+        return RuntimeRenderedPrompt(text, (7, 8, 9))
 
     def render_chat_template(
         self,
@@ -97,6 +102,18 @@ def test_runtime_template_bridge_converts_model_contracts_without_reordering() -
     ]
     assert kwargs == {"enable_thinking": True, "reasoning_effort": "high"}
     assert add_prompt is True
+
+
+def test_runtime_template_bridge_tokenizes_model_native_prompt_without_template_rendering() -> None:
+    renderer = _Renderer()
+    adapter = RuntimeTemplateAdapter(renderer)
+
+    rendered = adapter.tokenize_encoded_prompt("<bos>native")
+
+    assert rendered.text == "<bos>native"
+    assert rendered.input_ids == (7, 8, 9)
+    assert renderer.encoded_prompts == ["<bos>native"]
+    assert renderer.calls == []
 
 
 def test_runtime_template_bridge_preserves_multimodal_content_order() -> None:

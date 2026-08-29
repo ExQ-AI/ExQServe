@@ -16,6 +16,7 @@ def test_reasoning_effort_values_are_protocol_neutral() -> None:
         "low",
         "medium",
         "high",
+        "xhigh",
         "maximum",
     }
 

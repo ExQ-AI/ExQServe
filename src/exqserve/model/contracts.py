@@ -270,6 +270,10 @@ class ChatTemplateAdapter(Protocol):
         """Render one deterministic template request using the loaded model assets."""
         ...
 
+    def tokenize_encoded_prompt(self, text: str) -> RenderedPrompt:
+        """Tokenize a model-native prompt that already owns its BOS/special-token envelope."""
+        ...
+
 
 class PromptCompilerLike(Protocol):
     def compile(

@@ -4,12 +4,14 @@ from typing import get_type_hints
 
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.model.contracts import IncrementalParserLike, PromptCompilerLike
+from exqserve.model.deepseek_v4 import DeepSeekV4IncrementalParser, DeepSeekV4PromptCompiler
 from exqserve.model.gemma4 import Gemma4IncrementalParser, Gemma4PromptCompiler
 from exqserve.model.generic_hf import GenericHFIncrementalParser, GenericHFPromptCompiler
 from exqserve.model.glm5 import Glm5IncrementalParser, Glm5PromptCompiler
 from exqserve.model.muse_glimmer import MuseGlimmerIncrementalParser, MuseGlimmerPromptCompiler
 from exqserve.model.qwen import QwenIncrementalParser, QwenPromptCompiler
 from exqserve.model.registry import (
+    DeepSeekV4Dialect,
     Gemma4Dialect,
     GenericHFDialect,
     Glm5Dialect,
@@ -22,6 +24,9 @@ from exqserve.model.registry import (
 
 class _Adapter:
     def render_and_tokenize(self, request):  # type: ignore[no-untyped-def]
+        raise AssertionError("not called")
+
+    def tokenize_encoded_prompt(self, text):  # type: ignore[no-untyped-def]
         raise AssertionError("not called")
 
 
@@ -77,6 +82,23 @@ def test_default_registry_selects_exact_glm5_architecture() -> None:
         assert isinstance(dialect.create_parser("req-1", ReasoningPolicy()), Glm5IncrementalParser)
 
 
+def test_default_registry_selects_exact_deepseek_v4_architecture() -> None:
+    registry = default_model_dialect_registry()
+
+    for architecture in (
+        "DeepseekV4ForCausalLM",
+        "deepseek_v4_for_causal_lm",
+    ):
+        dialect = registry.resolve(architecture)
+        assert isinstance(dialect, DeepSeekV4Dialect)
+        assert dialect.dialect_id == "deepseek-v4"
+        assert isinstance(dialect.create_compiler(_Adapter()), DeepSeekV4PromptCompiler)
+        assert isinstance(
+            dialect.create_parser("req-1", ReasoningPolicy()),
+            DeepSeekV4IncrementalParser,
+        )
+
+
 
 def test_default_registry_selects_specialized_muse_glimmer_architectures() -> None:
     registry = default_model_dialect_registry()
@@ -106,6 +128,8 @@ def test_default_registry_uses_generic_fallback_for_unknown_or_missing_architect
         "MuseGlimmerAssistantModel",
         "GlmMoeDsaMTPModel",
         "GlmMoeDsaForConditionalGeneration",
+        "DeepseekV4MTPModel",
+        "DeepseekV4ForConditionalGeneration",
     ):
         dialect = registry.resolve(architecture)
         assert isinstance(dialect, GenericHFDialect)

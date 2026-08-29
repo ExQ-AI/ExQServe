@@ -962,6 +962,22 @@ def test_tokenize_text_is_raw_document_encoding_with_bos(monkeypatch: pytest.Mon
     assert tokenizer.encode_calls == [("raw document", True, False, True)]
 
 
+def test_tokenize_encoded_prompt_preserves_model_owned_bos(monkeypatch: pytest.MonkeyPatch) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    rendered = runtime.tokenize_encoded_prompt("<bos>native prompt")
+
+    assert rendered == RuntimeRenderedPrompt("<bos>native prompt", (1, 2, 3))
+    tokenizer = backend._state["tokenizer"]
+    assert tokenizer.render_calls == []
+    assert tokenizer.encode_calls == [("<bos>native prompt", False, False, True)]
+
+
 def test_text_only_load_does_not_probe_vision_when_backend_lacks_component(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

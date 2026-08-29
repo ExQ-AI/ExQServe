@@ -243,6 +243,10 @@ def test_tool_exposure_is_policy_aware_and_sorted_by_name() -> None:
         (ReasoningPolicy(ReasoningMode.DISABLED), {"enable_thinking": False}),
         (ReasoningPolicy(ReasoningMode.ENABLED), {"enable_thinking": True}),
         (
+            ReasoningPolicy(ReasoningMode.ENABLED, ReasoningEffort.XHIGH),
+            {"enable_thinking": True, "reasoning_effort": "xhigh"},
+        ),
+        (
             ReasoningPolicy(ReasoningMode.ENABLED, ReasoningEffort.MAXIMUM),
             {"enable_thinking": True, "reasoning_effort": "xhigh"},
         ),
