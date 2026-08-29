@@ -139,9 +139,16 @@ def _finished() -> RuntimeFinished:
     )
 
 
-def test_undeclared_tool_start_is_forwarded_as_model_output() -> None:
+def test_undeclared_completed_tool_fails_before_completion_is_released() -> None:
     async def scenario() -> None:
-        parser = _ScriptedParser((ToolCallStarted("req", "call-1", "bad", 0),))
+        invalid = ToolCallItem("call-1", "bad", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "bad", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", invalid),
+            )
+        )
         controlled = _Controlled([RuntimeStarted("req"), RuntimeTextDelta("req", "raw"), _finished()])
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
@@ -152,19 +159,28 @@ def test_undeclared_tool_start_is_forwarded_as_model_output() -> None:
 
         assert GenerationStarted("req") in events
         assert ToolCallStarted("req", "call-1", "bad", 0) in events
-        assert isinstance(events[-1], GenerationCompleted)
-        assert events[-1].reason is CompletionReason.STOP
-        assert controlled.cancel_calls == []
+        assert ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0) in events
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
 
     asyncio.run(scenario())
 
 
-def test_named_choice_mismatch_is_forwarded_as_model_output() -> None:
+def test_named_choice_mismatch_fails_at_candidate_completion() -> None:
     async def scenario() -> None:
         allowed = _tool("allowed")
         other = _tool("other")
         policy = ToolPolicy((allowed, other), ToolChoice(ToolChoiceMode.NAMED, "allowed"), allow_parallel=True)
-        parser = _ScriptedParser((ToolCallStarted("req", "call-1", "other", 0),))
+        invalid = ToolCallItem("call-1", "other", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "other", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", invalid),
+            )
+        )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
         session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
             _request(policy)
@@ -173,16 +189,24 @@ def test_named_choice_mismatch_is_forwarded_as_model_output() -> None:
         events = [event async for event in session]
 
         assert ToolCallStarted("req", "call-1", "other", 0) in events
-        assert isinstance(events[-1], GenerationCompleted)
-        assert controlled.cancel_calls == []
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
 
     asyncio.run(scenario())
 
 
-def test_parallel_false_does_not_hide_model_emitted_parallel_calls() -> None:
+def test_tool_choice_none_fails_when_model_completes_a_tool_call() -> None:
     async def scenario() -> None:
-        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
-        parser = _ScriptedParser((ToolCallStarted("req", "call-1", "lookup", 0), ToolCallStarted("req", "call-2", "lookup", 1)))
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.NONE), allow_parallel=True)
+        invalid = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", invalid),
+            )
+        )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
         session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
             _request(policy)
@@ -191,17 +215,28 @@ def test_parallel_false_does_not_hide_model_emitted_parallel_calls() -> None:
         events = [event async for event in session]
 
         assert ToolCallStarted("req", "call-1", "lookup", 0) in events
-        assert ToolCallStarted("req", "call-2", "lookup", 1) in events
-        assert isinstance(events[-1], GenerationCompleted)
+        assert ToolCallCompleted("req", invalid) not in events
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
 
     asyncio.run(scenario())
 
 
-def test_schema_invalid_completed_call_is_forwarded_to_agent_client() -> None:
+def test_parallel_false_accepts_first_call_then_fails_second_completion() -> None:
     async def scenario() -> None:
-        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
-        invalid = ToolCallItem("call-1", "lookup", '{"id":"not-an-int"}', 0)
-        parser = _ScriptedParser((ToolCallStarted("req", "call-1", "lookup", 0), ToolCallArgumentsDelta("req", "call-1", '{"id":"not-an-int"}', 0), ToolCallCompleted("req", invalid)))
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        second = ToolCallItem("call-2", "lookup", '{"id":2}', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+                ToolCallCompleted("req", second),
+            )
+        )
         controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
         session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
             _request(policy)
@@ -209,15 +244,43 @@ def test_schema_invalid_completed_call_is_forwarded_to_agent_client() -> None:
 
         events = [event async for event in session]
 
-        assert ToolCallCompleted("req", invalid) in events
-        assert isinstance(events[-1], GenerationCompleted)
-        assert events[-1].reason is CompletionReason.TOOL_CALLS
-        assert controlled.cancel_calls == []
+        assert ToolCallCompleted("req", first) in events
+        assert ToolCallStarted("req", "call-2", "lookup", 1) in events
+        assert ToolCallCompleted("req", second) not in events
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
 
     asyncio.run(scenario())
 
 
-def test_required_policy_without_call_returns_actual_model_completion() -> None:
+def test_schema_invalid_completed_call_fails_before_completion_is_released() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        invalid = ToolCallItem("call-1", "lookup", '{"id":"not-an-int"}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":"not-an-int"}', 0),
+                ToolCallCompleted("req", invalid),
+            )
+        )
+        controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
+        session = await ServingEngine(_Compiler(), lambda request_id, reasoning: parser, _Controller(controlled)).submit(
+            _request(policy)
+        )
+
+        events = [event async for event in session]
+
+        assert ToolCallArgumentsDelta("req", "call-1", '{"id":"not-an-int"}', 0) in events
+        assert ToolCallCompleted("req", invalid) not in events
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_invalid"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_required_policy_without_call_fails_at_generation_end() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.REQUIRED), allow_parallel=True)
         parser = _ScriptedParser(())
@@ -228,14 +291,15 @@ def test_required_policy_without_call_returns_actual_model_completion() -> None:
 
         events = [event async for event in session]
 
-        assert isinstance(events[-1], GenerationCompleted)
-        assert events[-1].reason is CompletionReason.STOP
-        assert controlled.cancel_calls == []
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert not any(isinstance(event, GenerationCompleted) for event in events)
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
 
     asyncio.run(scenario())
 
 
-def test_incomplete_tool_syntax_does_not_turn_model_output_into_server_failure() -> None:
+def test_incomplete_tool_syntax_is_model_failure() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         parser = _ScriptedParser((), _Finish((), incomplete_tool_call=True))
@@ -246,15 +310,16 @@ def test_incomplete_tool_syntax_does_not_turn_model_output_into_server_failure()
 
         events = [event async for event in session]
 
-        assert isinstance(events[-1], GenerationCompleted)
-        assert events[-1].reason is CompletionReason.STOP
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_incomplete"
         assert not any(isinstance(event, ToolCallCompleted) for event in events)
-        assert controlled.cancel_calls == []
+        assert not any(isinstance(event, GenerationCompleted) for event in events)
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
 
     asyncio.run(scenario())
 
 
-def test_incomplete_tool_attempt_skips_structured_output_failure() -> None:
+def test_incomplete_tool_attempt_takes_precedence_over_structured_output_validation() -> None:
     async def scenario() -> None:
         structured = StructuredOutputSpec(JsonSchema('{"type":"object","required":["ok"]}'))
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
@@ -266,8 +331,9 @@ def test_incomplete_tool_attempt_skips_structured_output_failure() -> None:
 
         events = [event async for event in session]
 
-        assert isinstance(events[-1], GenerationCompleted)
-        assert controlled.cancel_calls == []
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_incomplete"
+        assert not any(isinstance(event, GenerationCompleted) for event in events)
 
     asyncio.run(scenario())
 

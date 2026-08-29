@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
+    GenerationFailed,
     GenerationStarted,
     ReasoningCompleted,
     ReasoningDelta,
@@ -19,6 +23,7 @@ from exqserve.core.events import (
 )
 from exqserve.core.items import ToolCallItem
 from exqserve.core.usage import TokenUsage
+from exqserve.protocol.anthropic.common import AnthropicProtocolError
 from exqserve.protocol.anthropic.serialization import (
     AnthropicMessageAccumulator,
     AnthropicMessageStreamSerializer,
@@ -129,6 +134,55 @@ def test_stream_serializer_emits_anthropic_event_flow_and_tool_json_delta() -> N
         },
     }
     assert payloads[-1][1] == {"type": "message_stop"}
+
+
+def test_anthropic_invalid_tool_candidate_leaves_tentative_block_open_then_errors() -> None:
+    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_invalid")
+    events = (
+        GenerationStarted("req_1"),
+        ToolCallStarted("req_1", "toolu_1", "lookup", 0),
+        ToolCallArgumentsDelta("req_1", "toolu_1", '{"id":"bad"}', 0),
+        GenerationFailed(
+            "req_1",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+            ),
+        ),
+    )
+    payloads = [payload for event in events for payload in serializer.feed(event)]
+    names = [name for name, _ in payloads]
+
+    assert "content_block_start" in names
+    assert "content_block_delta" in names
+    assert "content_block_stop" not in names
+    assert "message_stop" not in names
+    assert names[-1] == "error"
+    assert payloads[-1][1]["type"] == "error"
+    assert payloads[-1][1]["error"]["type"] == "api_error"  # type: ignore[index]
+
+
+def test_anthropic_invalid_tool_candidate_nonstream_raises_instead_of_returning_tool_use() -> None:
+    accumulator = AnthropicMessageAccumulator("local-qwen", message_id="msg_invalid")
+    accumulator.consume(ToolCallStarted("req_1", "toolu_1", "lookup", 0))
+    accumulator.consume(ToolCallArgumentsDelta("req_1", "toolu_1", '{"id":"bad"}', 0))
+    accumulator.consume(
+        GenerationFailed(
+            "req_1",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+            ),
+        )
+    )
+    with pytest.raises(AnthropicProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.type == "api_error"
+    assert exc_info.value.message == "Model produced an invalid tool call."
 
 
 def test_omitted_thinking_hides_reasoning_text_but_preserves_signature() -> None:

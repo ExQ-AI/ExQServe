@@ -170,6 +170,55 @@ def test_responses_failure_and_cancel_have_distinct_terminal_statuses() -> None:
     assert cancelled["response"]["error"] is None  # type: ignore[index]
 
 
+def test_responses_invalid_tool_candidate_keeps_tentative_item_open_then_fails() -> None:
+    serializer = ResponsesStreamSerializer("m", response_id="resp_invalid", created_at=1)
+    events = (
+        GenerationStarted("r"),
+        ToolCallStarted("r", "call-1", "lookup", 0),
+        ToolCallArgumentsDelta("r", "call-1", '{"id":"bad"}', 0),
+        GenerationFailed(
+            "r",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+            ),
+        ),
+    )
+    wire = [item for event in events for item in serializer.feed(event)]
+    types = [item["type"] for item in wire]
+
+    assert "response.output_item.added" in types
+    assert "response.function_call_arguments.delta" in types
+    assert "response.function_call_arguments.done" not in types
+    assert "response.output_item.done" not in types
+    assert "response.completed" not in types
+    assert wire[-1]["type"] == "response.failed"
+    assert wire[-1]["response"]["status"] == "failed"  # type: ignore[index]
+    assert wire[-1]["response"]["error"]["code"] == "tool_call_invalid"  # type: ignore[index]
+
+
+def test_responses_invalid_tool_candidate_nonstream_raises_instead_of_returning_output() -> None:
+    accumulator = ResponsesAccumulator("m", response_id="resp_invalid", created_at=1)
+    accumulator.consume(ToolCallStarted("r", "call-1", "lookup", 0))
+    accumulator.consume(ToolCallArgumentsDelta("r", "call-1", '{"id":"bad"}', 0))
+    accumulator.consume(
+        GenerationFailed(
+            "r",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+            ),
+        )
+    )
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == "tool_call_invalid"
+
+
 def test_responses_nonstream_accumulates_completed_items_in_semantic_start_order() -> None:
     accumulator = ResponsesAccumulator(
         "qwen",

@@ -13,7 +13,12 @@ from exqserve.agent._json import InvalidJsonError, parse_json_strict
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.structured_output import StructuredOutputSpec, validate_structured_output
 from exqserve.agent.tools import ToolPolicy
-from exqserve.agent.validation import validate_tool_calls, validate_tool_history
+from exqserve.agent.validation import (
+    ValidationCode,
+    ValidationResult,
+    validate_tool_calls,
+    validate_tool_history,
+)
 from exqserve.control.request import RequestRejected, RequestTerminalReason
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import (
@@ -62,6 +67,25 @@ from exqserve.serving.runtime_events import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TOOL_CALL_INVALID_CODES = frozenset(
+    {
+        ValidationCode.INVALID_JSON,
+        ValidationCode.DUPLICATE_JSON_KEY,
+        ValidationCode.JSON_VALUE_NOT_OBJECT,
+        ValidationCode.SCHEMA_VALIDATION_FAILED,
+        ValidationCode.DUPLICATE_TOOL_CALL_ID,
+        ValidationCode.INVALID_TOOL_CALL_ORDER,
+    }
+)
+
+
+def _tool_validation_failure(result: ValidationResult) -> tuple[str, str]:
+    if result.is_valid:
+        raise ValueError("tool validation result must contain at least one issue")
+    if any(issue.code in _TOOL_CALL_INVALID_CODES for issue in result.issues):
+        return "tool_call_invalid", "Model produced an invalid tool call."
+    return "tool_policy_violation", "Model output violated the requested tool policy."
 
 
 class RuntimeTemplateRenderer(Protocol):
@@ -424,6 +448,17 @@ class ServingSession:
                     "Model completed a tool call that was not accepted.",
                 )
                 return
+            candidate_calls = (*self._completed_calls, event.call)
+            validation = validate_tool_calls(candidate_calls, self._tool_policy)
+            if not validation.is_valid:
+                logger.warning(
+                    "model produced invalid completed tool call request_id=%s issues=%s",
+                    self._request_id,
+                    ",".join(issue.code.value for issue in validation.issues),
+                )
+                code, message = _tool_validation_failure(validation)
+                await self._model_failure(code, message)
+                return
             self._completed_calls.append(event.call)
             self._pending.append(event)
             return
@@ -449,6 +484,11 @@ class ServingSession:
                 "model output ended with an incomplete tool call request_id=%s",
                 self._request_id,
             )
+            await self._model_failure(
+                "tool_call_incomplete",
+                "Model output ended with an incomplete tool call.",
+            )
+            return
 
         final_tool_validation = validate_tool_calls(tuple(self._completed_calls), self._tool_policy)
         if not final_tool_validation.is_valid:
@@ -457,6 +497,9 @@ class ServingSession:
                 self._request_id,
                 ",".join(issue.code.value for issue in final_tool_validation.issues),
             )
+            code, message = _tool_validation_failure(final_tool_validation)
+            await self._model_failure(code, message)
+            return
 
         if not incomplete_tool and not self._completed_calls and self._structured_output is not None:
             structured = validate_structured_output("".join(self._text_parts), self._structured_output)

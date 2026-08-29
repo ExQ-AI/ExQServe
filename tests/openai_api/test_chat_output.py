@@ -124,6 +124,57 @@ def test_chat_stream_failure_and_cancel_are_error_payloads_not_success_finishes(
     assert "choices" not in cancel_payload[0]
 
 
+def test_chat_invalid_tool_candidate_streams_tentative_deltas_then_errors() -> None:
+    serializer = ChatStreamSerializer("m", response_id="chatcmpl-invalid", created=1)
+    events = (
+        GenerationStarted("r"),
+        ToolCallStarted("r", "call-1", "lookup", 0),
+        ToolCallArgumentsDelta("r", "call-1", '{"id":"bad"}', 0),
+        GenerationFailed(
+            "r",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+            ),
+        ),
+    )
+    chunks = [chunk for event in events for chunk in serializer.feed(event)]
+
+    assert any(
+        chunk.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+        for chunk in chunks
+        if chunk.get("choices")
+    )
+    assert chunks[-1]["error"]["code"] == "tool_call_invalid"
+    assert not any(
+        choice.get("finish_reason") == "tool_calls"
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+def test_chat_invalid_tool_candidate_nonstream_raises_instead_of_returning_tool_turn() -> None:
+    accumulator = ChatAccumulator("m", response_id="chatcmpl-invalid", created=1)
+    accumulator.consume(ToolCallStarted("r", "call-1", "lookup", 0))
+    accumulator.consume(ToolCallArgumentsDelta("r", "call-1", '{"id":"bad"}', 0))
+    accumulator.consume(
+        GenerationFailed(
+            "r",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+            ),
+        )
+    )
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == "tool_call_invalid"
+
+
 def test_chat_nonstream_accumulates_reasoning_text_tools_and_truthful_usage() -> None:
     accumulator = ChatAccumulator("qwen", response_id="chatcmpl-test", created=123)
     for event in _events():
