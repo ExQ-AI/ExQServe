@@ -6,11 +6,13 @@ from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.model.contracts import IncrementalParserLike, PromptCompilerLike
 from exqserve.model.gemma4 import Gemma4IncrementalParser, Gemma4PromptCompiler
 from exqserve.model.generic_hf import GenericHFIncrementalParser, GenericHFPromptCompiler
+from exqserve.model.glm5 import Glm5IncrementalParser, Glm5PromptCompiler
 from exqserve.model.muse_glimmer import MuseGlimmerIncrementalParser, MuseGlimmerPromptCompiler
 from exqserve.model.qwen import QwenIncrementalParser, QwenPromptCompiler
 from exqserve.model.registry import (
     Gemma4Dialect,
     GenericHFDialect,
+    Glm5Dialect,
     ModelDialect,
     MuseGlimmerDialect,
     QwenDialect,
@@ -61,6 +63,21 @@ def test_default_registry_selects_specialized_gemma4_architectures() -> None:
         assert isinstance(dialect.create_parser("req-1", ReasoningPolicy()), Gemma4IncrementalParser)
 
 
+def test_default_registry_selects_exact_glm5_architecture() -> None:
+    registry = default_model_dialect_registry()
+
+    for architecture in (
+        "GlmMoeDsaForCausalLM",
+        "glm_moe_dsa_for_causal_lm",
+    ):
+        dialect = registry.resolve(architecture)
+        assert isinstance(dialect, Glm5Dialect)
+        assert dialect.dialect_id == "glm5"
+        assert isinstance(dialect.create_compiler(_Adapter()), Glm5PromptCompiler)
+        assert isinstance(dialect.create_parser("req-1", ReasoningPolicy()), Glm5IncrementalParser)
+
+
+
 def test_default_registry_selects_specialized_muse_glimmer_architectures() -> None:
     registry = default_model_dialect_registry()
 
@@ -87,6 +104,8 @@ def test_default_registry_uses_generic_fallback_for_unknown_or_missing_architect
         "LlamaForCausalLM",
         "GemmaForCausalLM",
         "MuseGlimmerAssistantModel",
+        "GlmMoeDsaMTPModel",
+        "GlmMoeDsaForConditionalGeneration",
     ):
         dialect = registry.resolve(architecture)
         assert isinstance(dialect, GenericHFDialect)

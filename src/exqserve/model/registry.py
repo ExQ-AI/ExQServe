@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from exqserve.agent.reasoning import ReasoningMode, ReasoningPolicy
@@ -18,12 +18,20 @@ from exqserve.model.generic_hf import (
     GenericHFIncrementalParser,
     GenericHFPromptCompiler,
 )
+from exqserve.model.glm5 import GLM5_CAPABILITIES, Glm5IncrementalParser, Glm5PromptCompiler
 from exqserve.model.muse_glimmer import (
     MUSE_GLIMMER_CAPABILITIES,
     MuseGlimmerIncrementalParser,
     MuseGlimmerPromptCompiler,
 )
 from exqserve.model.qwen import QWEN38_CAPABILITIES, QwenIncrementalParser, QwenPromptCompiler
+
+_GLM5_ARCHITECTURES = frozenset(
+    {
+        "glmmoedsaforcausallm",
+        "glm_moe_dsa_for_causal_lm",
+    }
+)
 
 _MUSE_GLIMMER_ARCHITECTURES = frozenset(
     {
@@ -95,6 +103,32 @@ class Gemma4Dialect:
         return Gemma4IncrementalParser(
             request_id,
             start_in_reasoning=reasoning.mode is ReasoningMode.ENABLED,
+        )
+
+
+@dataclass(slots=True)
+class Glm5Dialect:
+    dialect_id: str = "glm5"
+    capabilities: ModelCapabilities = GLM5_CAPABILITIES
+    _compiler: Glm5PromptCompiler | None = field(default=None, init=False, repr=False)
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        normalized = architecture.replace(".", "_").lower()
+        return normalized in _GLM5_ARCHITECTURES
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> Glm5PromptCompiler:
+        compiler = Glm5PromptCompiler(template_adapter)
+        self._compiler = compiler
+        return compiler
+
+    def create_parser(self, request_id: str, reasoning: ReasoningPolicy) -> Glm5IncrementalParser:
+        parser_context = None if self._compiler is None else self._compiler.take_parser_context(request_id)
+        return Glm5IncrementalParser(
+            request_id,
+            start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
+            parser_context=parser_context,
         )
 
 
@@ -170,6 +204,6 @@ class ModelDialectRegistry:
 
 def default_model_dialect_registry() -> ModelDialectRegistry:
     return ModelDialectRegistry(
-        (QwenDialect(), Gemma4Dialect(), MuseGlimmerDialect()),
+        (QwenDialect(), Gemma4Dialect(), Glm5Dialect(), MuseGlimmerDialect()),
         GenericHFDialect(),
     )
