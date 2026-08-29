@@ -19,8 +19,8 @@ Agent-focused OpenAI- and Anthropic-compatible serving for ExLlamaV3 / EXL3.
 | Qwen3.5 architecture family | Adapted | Covers Qwen3.5 / 3.6 / 3.8; reasoning, tools, parallel tools, and tool-result continuation |
 | Gemma 4 family | Adapted | Reasoning, tools, parallel tools, and tool-result continuation |
 | Muse Glimmer family | Adapted | ATEM/channel protocol; `low`, `medium`, `high`, and `xhigh` reasoning strengths |
-| DeepSeek family | Pending | Agent protocol adaptation is not yet complete |
-| GLM family | Pending | Agent protocol adaptation is not yet complete |
+| DeepSeek family | Adapted (untested) | Agent protocol adaptation is implemented; GPU validation is still pending |
+| GLM family | Adapted (untested) | Agent protocol adaptation is implemented; GPU validation is still pending |
 | Other compatible Hugging Face models | Generic compatibility | Uses the model's own Hugging Face chat template; reasoning and tool handling remain conservative |
 
 Adapted families preserve their model-native reasoning and tool protocols. Vision has been validated on Qwen3.8, Gemma 4, and Muse Glimmer; Generic HF can preserve multimodal input when the backend exposes a compatible vision component. Image input is opt-in with `--vision`, and unsupported model/backend combinations fail explicitly instead of silently falling back to text mode.

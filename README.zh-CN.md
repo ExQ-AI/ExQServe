@@ -19,8 +19,8 @@ ExQServe 是面向 ExLlamaV3 / EXL3 的推理服务，兼容 OpenAI 和 Anthropi
 | Qwen3.5 架构系列 | 已适配 | 覆盖 Qwen3.5 / 3.6 / 3.8；支持思考、工具调用、并行工具调用，工具结果回传后可继续对话 |
 | Gemma 4 系列 | 已适配 | 思考、工具调用、并行工具调用，工具结果回传后可继续对话 |
 | Muse Glimmer 系列 | 已适配 | ATEM/channel 协议；支持 `low`、`medium`、`high`、`xhigh` 四档思考强度 |
-| DeepSeek 系列 | 待适配 | Agent 协议适配尚未完成 |
-| GLM 系列 | 待适配 | Agent 协议适配尚未完成 |
+| DeepSeek 系列 | 已适配（未测试） | Agent 协议适配已完成，尚未进行 GPU 实测 |
+| GLM 系列 | 已适配（未测试） | Agent 协议适配已完成，尚未进行 GPU 实测 |
 | 其他兼容 Hugging Face 模型 | 通用兼容 | 使用模型自带的 Hugging Face chat template；思考和工具调用按保守方式处理 |
 
 已适配系列会保留各自的思考与工具调用格式。Qwen3.8、Gemma 4 和 Muse Glimmer 已验证图片输入；其他 Hugging Face 模型在后端提供兼容视觉组件时也可以保留多模态输入。图片能力需要显式开启 `--vision`，不支持的模型或后端会直接报错，不会静默退回纯文本模式。
