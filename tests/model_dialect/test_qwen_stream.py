@@ -309,3 +309,71 @@ def test_single_quoted_end_think_marker_remains_reasoning_text() -> None:
         events.extend(finished.events)
         assert finished.incomplete_tool_call is False
         assert _reasoning_text(events) == source
+
+
+def test_backtick_code_protocol_markers_remain_literal_at_every_split() -> None:
+    samples = (
+        "```text\n<think>\n</think>\n<tool_call>\n```\nstill reasoning",
+        "Use ``<tool_call>`` and then continue reasoning.",
+    )
+    for source in samples:
+        for split in range(len(source) + 1):
+            parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+            events = list(parser.feed(source[:split]))
+            events.extend(parser.feed(source[split:]))
+            finished = parser.finish()
+            events.extend(finished.events)
+            assert finished.incomplete_tool_call is False
+            assert _reasoning_text(events) == source
+            assert not _completed_calls(events)
+
+
+def test_real_end_think_after_closed_code_span_still_switches_channel() -> None:
+    source = "Discuss `</think>` literally.</think>final"
+    for split in range(len(source) + 1):
+        parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+        events = list(parser.feed(source[:split]))
+        events.extend(parser.feed(source[split:]))
+        finished = parser.finish()
+        events.extend(finished.events)
+        assert finished.incomplete_tool_call is False
+        assert _reasoning_text(events) == "Discuss `</think>` literally."
+        assert _text(events) == "final"
+
+
+def test_split_fenced_literal_then_real_close_streams_text_before_eos() -> None:
+    opening_splits = (("`", "``"), ("``", "`"), ("`", "`", "`"))
+    suffixes = ("FINAL text", "FINAL `x`", "FINAL ```code```")
+
+    for opening_chunks in opening_splits:
+        for suffix in suffixes:
+            parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+            events: list[GenerationEvent] = []
+            for chunk in opening_chunks:
+                events.extend(parser.feed(chunk))
+            events.extend(parser.feed("xml\n</think>\n"))
+            streamed = list(parser.feed(f"```\nactual reasoning</think>{suffix}"))
+            events.extend(streamed)
+
+            assert _text(streamed) == suffix
+            assert any(isinstance(event, ReasoningCompleted) for event in streamed)
+            assert _reasoning_text(events) == "```xml\n</think>\n```\nactual reasoning"
+            assert _text(events) == suffix
+
+            finished = parser.finish()
+            assert finished.incomplete_tool_call is False
+            assert _text(finished.events) == ""
+
+
+def test_parameter_close_literal_inside_json_string_is_not_treated_as_envelope_close() -> None:
+    source = (
+        '<tool_call><function=run><parameter=cmd>"echo </parameter> here"'
+        '</parameter></function></tool_call>'
+    )
+    for split in range(len(source) + 1):
+        events, incomplete = _parse([source[:split], source[split:]])
+        calls = _completed_calls(events)
+        assert incomplete is False
+        assert len(calls) == 1
+        assert calls[0].call.name == "run"
+        assert calls[0].call.arguments_json == '{"cmd":"echo </parameter> here"}'

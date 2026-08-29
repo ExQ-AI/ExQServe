@@ -222,6 +222,22 @@ def test_duplicate_plugin_dialect_id_fails_registry_construction() -> None:
         )
 
 
+def test_plugin_dialect_id_must_be_canonical_and_must_not_shadow_auto_selector() -> None:
+    for dialect in (
+        _Dialect(" external-test", "WhitespaceArchitecture"),
+        _Dialect("external-test ", "WhitespaceArchitecture"),
+    ):
+        with pytest.raises(ModelDialectSelectionError, match="leading or trailing whitespace"):
+            default_model_dialect_registry(
+                entry_points=(_entry_point(dialect),)  # type: ignore[arg-type]
+            )
+
+    with pytest.raises(ModelDialectSelectionError, match="auto.*reserved selector"):
+        default_model_dialect_registry(
+            entry_points=(_entry_point(_Dialect("auto", "AutoArchitecture")),)  # type: ignore[arg-type]
+        )
+
+
 def test_unknown_explicit_dialect_never_falls_back() -> None:
     registry = default_model_dialect_registry(entry_points=())
     with pytest.raises(ModelDialectSelectionError, match="unknown model dialect"):

@@ -49,6 +49,7 @@ from exqserve.model.contracts import (
     ToolGenerationConstraint,
 )
 from exqserve.runtime.contracts import (
+    RuntimeConstraintUnsupported,
     RuntimeEvent,
     RuntimeFailed,
     RuntimeFinished,
@@ -391,6 +392,14 @@ class ServingEngine:
         )
         try:
             controlled = await self._controller.submit(runtime_request)
+        except RuntimeConstraintUnsupported as exc:
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INVALID_REQUEST,
+                    "tool_constraint_unsupported",
+                    "Tool schema or policy cannot be represented by the active constrained-generation runtime.",
+                )
+            ) from exc
         except RequestRejected as exc:
             raise ServingRejected(exc.error) from exc
         except Exception as exc:
@@ -442,10 +451,21 @@ class ServingSession:
         self._text_parts: list[str] = []
         self._accepted_call_ids: set[str] = set()
         self._completed_calls: list[ToolCallItem] = []
+        self._runtime_trace: list[dict[str, object]] | None = None
 
     @property
     def compiled_prompt(self) -> CompiledPrompt:
         return self._compiled_prompt
+
+    def enable_runtime_trace(self) -> None:
+        if self._runtime_trace is None:
+            self._runtime_trace = []
+
+    @property
+    def runtime_trace(self) -> tuple[dict[str, object], ...]:
+        if self._runtime_trace is None:
+            return ()
+        return tuple(dict(entry) for entry in self._runtime_trace)
 
     def __aiter__(self) -> Self:
         return self
@@ -624,6 +644,21 @@ class ServingSession:
         self._terminal = True
 
     async def _process_runtime(self, event: RuntimeEvent) -> None:
+        if self._runtime_trace is not None:
+            if isinstance(event, RuntimeTextDelta):
+                self._runtime_trace.append({"type": "text_delta", "text": event.text, "token_ids": list(event.token_ids)})
+            elif isinstance(event, RuntimeFinished):
+                self._runtime_trace.append(
+                    {
+                        "type": "finished",
+                        "reason": event.reason.value,
+                        "backend_reason": event.backend_reason,
+                        "stop_sequence": event.stop_sequence,
+                        "eos_token_id": event.eos_token_id,
+                        "eos_token_text": event.eos_token_text,
+                    }
+                )
+
         if isinstance(event, RuntimeStarted):
             self._pending.append(GenerationStarted(self._request_id))
             return

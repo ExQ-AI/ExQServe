@@ -78,6 +78,10 @@ _STRING_DELIMITER = '<|"|>'
 _PLAIN_MARKERS = (_THOUGHT_OPEN, _THOUGHT_CLOSE, _TOOL_OPEN)
 
 
+def _valid_gemma_tool_name(name: str) -> bool:
+    return bool(name) and not any(character.isspace() or character in "{}<>" for character in name)
+
+
 def gemma4_tool_constraint(
     tool_policy: ToolPolicy,
     mode: ToolConstraintMode,
@@ -94,7 +98,7 @@ def gemma4_tool_constraint(
     lines = ["%llguidance {}", "start: tool"]
     lines.append("tool: " + " | ".join(f"tool_{index}" for index in range(len(tools))))
     for index, tool in enumerate(tools):
-        if tool.name != tool.name.strip() or "{" in tool.name:
+        if not _valid_gemma_tool_name(tool.name):
             raise ToolConstraintUnsupported(
                 f"Gemma constrained generation cannot represent tool name {tool.name!r}"
             )
@@ -470,7 +474,7 @@ def _parse_tool_body(body: str) -> tuple[str, str]:
     if object_start < 0:
         raise ValueError("Gemma 4 tool call is missing an argument object")
     name = body[len("call:") : object_start].strip()
-    if not name or any(character.isspace() or character in "{}<>" for character in name):
+    if not _valid_gemma_tool_name(name):
         raise ValueError("invalid Gemma 4 tool name")
 
     argument_text = body[object_start:]

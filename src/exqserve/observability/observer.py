@@ -222,6 +222,10 @@ class ObservedServingSession:
         self._captured_events: list[GenerationEvent] | None = (
             [] if capture is not None and capture.mode is CaptureMode.FULL else None
         )
+        if self._captured_events is not None:
+            enable_runtime_trace = getattr(session, "enable_runtime_trace", None)
+            if callable(enable_runtime_trace):
+                enable_runtime_trace()
         self._first_semantic_seen = False
         self._tool_start_seen = False
         self._terminal = False
@@ -324,6 +328,9 @@ class ObservedServingSession:
         assert self._terminal_status is not None
         assert self._elapsed_seconds is not None
         events = tuple(self._captured_events) if self._captured_events is not None else ()
+        runtime_trace = getattr(self._session, "runtime_trace", ())
+        if not isinstance(runtime_trace, tuple):
+            runtime_trace = ()
         try:
             await self._capture.record_terminal(
                 request=self._request,
@@ -334,6 +341,7 @@ class ObservedServingSession:
                 timing=self._timing,
                 error=self._terminal_error,
                 events=events,
+                runtime_trace=runtime_trace,
             )
         except Exception:  # noqa: BLE001 - capture failure must not break serving
             self._metrics.capture_failed()

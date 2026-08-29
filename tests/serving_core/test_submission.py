@@ -16,13 +16,22 @@ from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import GenerationEvent
 from exqserve.core.items import MessageItem, MessageRole, ToolResultItem
 from exqserve.core.request import CanonicalRequest
+from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
     CompiledPrompt,
     TemplateRequest,
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
 )
-from exqserve.runtime.contracts import RuntimeGenerationConstraint, RuntimeGenerationRequest
+from exqserve.runtime.contracts import (
+    RuntimeConstraintUnsupported,
+    RuntimeFinished,
+    RuntimeGenerationConstraint,
+    RuntimeGenerationRequest,
+    RuntimeStopReason,
+    RuntimeTextDelta,
+    RuntimeTiming,
+)
 from exqserve.serving.contracts import ServingRejected, ServingRequest
 from exqserve.serving.engine import ServingEngine
 
@@ -157,6 +166,55 @@ def test_submit_compiles_and_builds_runtime_request_exactly_once() -> None:
     asyncio.run(scenario())
 
 
+def test_full_runtime_trace_preserves_parser_pre_text_and_terminal_metadata() -> None:
+    class TraceControlled(_Controlled):
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                yield RuntimeTextDelta("req-1", "raw </think>", (248069,))
+                yield RuntimeFinished(
+                    request_id="req-1",
+                    reason=RuntimeStopReason.EOS,
+                    usage=TokenUsage(input_tokens=3, output_tokens=1),
+                    timing=RuntimeTiming(),
+                    backend_reason="stop_token",
+                    eos_token_id=248069,
+                    eos_token_text="</think>",
+                )
+
+            return stream()
+
+    class TraceController(_Controller):
+        async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+            self.requests.append(request)
+            return TraceControlled()
+
+    async def scenario() -> None:
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            TraceController(),
+        )
+        session = await engine.submit(_request())
+        assert session.runtime_trace == ()
+
+        session.enable_runtime_trace()
+        _ = [event async for event in session]
+
+        assert session.runtime_trace == (
+            {"type": "text_delta", "text": "raw </think>", "token_ids": [248069]},
+            {
+                "type": "finished",
+                "reason": "eos",
+                "backend_reason": "stop_token",
+                "stop_sequence": None,
+                "eos_token_id": 248069,
+                "eos_token_text": "</think>",
+            },
+        )
+
+    asyncio.run(scenario())
+
+
 def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None:
     async def scenario() -> None:
         structured = StructuredOutputSpec(JsonSchema('{"type":"object"}'))
@@ -258,6 +316,37 @@ def test_unsupported_tool_constraint_rejects_before_runtime_submission() -> None
         assert exc_info.value.error.code == "tool_constraint_unsupported"
         assert "unsupported schema" not in exc_info.value.error.message
         assert controller.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_runtime_reports_unsupported_schema_as_stable_invalid_request() -> None:
+    async def scenario() -> None:
+        class RuntimeRejectingController(_Controller):
+            async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+                self.requests.append(request)
+                raise RuntimeConstraintUnsupported("backend schema keyword is unsupported")
+
+        controller = RuntimeRejectingController()
+        constraint = ToolGenerationConstraint(
+            trigger="<tool_call>",
+            lark_grammar='%llguidance {}\nstart: "ok"',
+            eos_after_completed=False,
+        )
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            lambda policy: constraint,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(_request())
+
+        assert exc_info.value.error.category is ErrorCategory.INVALID_REQUEST
+        assert exc_info.value.error.code == "tool_constraint_unsupported"
+        assert "backend schema keyword" not in exc_info.value.error.message
+        assert len(controller.requests) == 1
 
     asyncio.run(scenario())
 

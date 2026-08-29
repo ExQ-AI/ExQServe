@@ -11,6 +11,7 @@ import pytest
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
     LoRAAdapterConfig,
+    RuntimeConstraintUnsupported,
     RuntimeFinished,
     RuntimeGenerationConstraint,
     RuntimeGenerationRequest,
@@ -1504,6 +1505,52 @@ def test_submit_maps_explicit_generation_constraint_to_strict_llguidance_filter(
     assert "filters" in _FakeAsyncJob.calls[0][3]
 
 
+def test_submit_rejects_inline_json_schema_that_llguidance_cannot_enforce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+
+    class UnsupportedSchemaFilter:
+        def __init__(self, tokenizer: object, **kwargs: object) -> None:
+            del tokenizer, kwargs
+            raise ValueError(
+                'Invalid grammar: failed to compile JSON schema: Unimplemented keys: ["uniqueItems"]'
+            )
+
+    backend.LLGuidanceFilter = UnsupportedSchemaFilter
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    grammar = (
+        "%llguidance {}\n"
+        'start: %json {"type":"array","items":{"type":"integer"},"uniqueItems":true}'
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="cannot enforce"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-tool-constraint",
+                    (1, 2, 3),
+                    8,
+                    generation_constraint=RuntimeGenerationConstraint(
+                        "</think>",
+                        grammar,
+                        False,
+                    ),
+                )
+            )
+
+    asyncio.run(scenario())
+
+    assert _FakeLLGuidanceFilter.calls == []
+    assert _FakeAsyncJob.calls == []
+
+
 def test_submit_fails_when_explicit_generation_constraint_trigger_is_not_one_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1784,6 +1831,7 @@ def test_runtime_session_drains_ready_exllamav3_results_and_preserves_terminal_r
                 {
                     "stage": "streaming",
                     "text": "hello ",
+                    "token_ids": [[1]],
                     "eos": False,
                     "prompt_tokens": 3,
                     "new_tokens": 1,
@@ -1794,6 +1842,7 @@ def test_runtime_session_drains_ready_exllamav3_results_and_preserves_terminal_r
                 {
                     "stage": "streaming",
                     "text": "world",
+                    "token_ids": [[2]],
                     "eos": True,
                     "eos_reason": "stop_token",
                     "prompt_tokens": 3,
@@ -1821,7 +1870,7 @@ def test_runtime_session_drains_ready_exllamav3_results_and_preserves_terminal_r
         session = module.RuntimeSession(request, QueuedJob())
         events = [event async for event in session]
         assert len(events) == 2
-        assert events[0] == RuntimeTextDelta("req-drain", "hello world")
+        assert events[0] == RuntimeTextDelta("req-drain", "hello world", (1, 2))
         assert isinstance(events[-1], RuntimeFinished)
         assert events[-1].usage.input_tokens == 3
         assert events[-1].usage.output_tokens == 2

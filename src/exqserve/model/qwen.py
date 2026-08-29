@@ -380,6 +380,56 @@ _FUNCTION_CLOSE = "</function>"
 _PARAMETER_OPEN = "<parameter="
 _PARAMETER_CLOSE = "</parameter>"
 _TOOL_CLOSE = "</tool_call>"
+_LITERAL_MARKER_QUOTES = frozenset({"'", '"', "`"})
+
+
+@dataclass(slots=True)
+class _MarkdownCodeContext:
+    """Track Qwen backtick-delimited source spans across runtime chunks."""
+
+    delimiter_width: int | None = None
+    pending_backticks: int = 0
+
+    def _commit_pending_backticks(self) -> None:
+        width = self.pending_backticks
+        if width == 0:
+            return
+        self.pending_backticks = 0
+        if self.delimiter_width is None:
+            self.delimiter_width = width
+        elif width == self.delimiter_width:
+            self.delimiter_width = None
+
+    def classify_marker(self, text: str, marker: str, *, final: bool = False) -> tuple[bool, bool]:
+        self._commit_pending_backticks()
+        if self.delimiter_width is None:
+            return False, False
+
+        delimiter = "`" * self.delimiter_width
+        if text.find(delimiter, len(marker)) >= 0:
+            return True, False
+        return (False, False) if final else (False, True)
+
+    def observe(self, text: str) -> None:
+        for character in text:
+            if character == "`":
+                self.pending_backticks += 1
+                continue
+            self._commit_pending_backticks()
+
+
+def _marker_is_directly_quoted(
+    text: str,
+    marker: str,
+    previous_content_character: str | None,
+) -> tuple[bool, bool]:
+    left = previous_content_character
+    if left not in _LITERAL_MARKER_QUOTES:
+        return False, False
+    right_at = len(marker)
+    if right_at >= len(text):
+        return False, True
+    return text[right_at] == left, False
 
 
 def _is_pending_tool_candidate(text: str) -> bool:
@@ -389,25 +439,6 @@ def _is_pending_tool_candidate(text: str) -> bool:
         return False
     candidate = text[len("<tool_call>") :].lstrip()
     return not candidate or _FUNCTION_OPEN.startswith(candidate)
-
-
-_LITERAL_MARKER_QUOTES = frozenset({"'", '"', "`"})
-
-
-def _marker_is_quoted_literal(
-    text: str,
-    position: int,
-    marker: str,
-    previous_content_character: str | None,
-) -> tuple[bool, bool]:
-    """Return (is_literal, needs_more_text) for directly quoted protocol markers."""
-    left = text[position - 1] if position > 0 else previous_content_character
-    if left not in _LITERAL_MARKER_QUOTES:
-        return False, False
-    right_at = position + len(marker)
-    if right_at >= len(text):
-        return False, True
-    return text[right_at] == left, False
 
 
 def _longest_partial_marker_suffix(text: str) -> int:
@@ -438,6 +469,33 @@ def _parameter_value_json(value_text: str) -> str:
     return canonical_json_dumps(value)
 
 
+def _find_parameter_close(text: str, value_start: int) -> int:
+    """Find an envelope close outside a double-quoted JSON/string literal."""
+
+    in_string = False
+    escaped = False
+    position = value_start
+    while position < len(text):
+        character = text[position]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            position += 1
+            continue
+        if character == '"':
+            in_string = True
+            position += 1
+            continue
+        if text.startswith(_PARAMETER_CLOSE, position):
+            return position
+        position += 1
+    return -1
+
+
 class QwenIncrementalParser:
     """Incrementally convert Qwen model-native text into canonical semantic events."""
 
@@ -465,11 +523,13 @@ class QwenIncrementalParser:
         self._tool_arguments_json: str | None = None
         self._had_incomplete_tool = False
         self._last_content_character: str | None = None
+        self._literal_context = _MarkdownCodeContext()
         self._finished = False
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
             return
+        self._literal_context.observe(text)
         self._last_content_character = text[-1]
         if self._mode == "reasoning":
             if not self._reasoning_open:
@@ -517,7 +577,7 @@ class QwenIncrementalParser:
         self._tool_argument_parts = []
         self._tool_arguments_json = None
 
-    def _process_plain(self, events: list[GenerationEvent]) -> bool:
+    def _process_plain(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
         match: tuple[int, str] | None = None
         for marker in _PLAIN_MARKERS:
             position = self._buffer.find(marker)
@@ -526,40 +586,49 @@ class QwenIncrementalParser:
 
         if match is not None:
             position, marker = match
-            is_literal, needs_more_text = _marker_is_quoted_literal(
+            if position > 0:
+                self._emit_content(self._buffer[:position], events)
+                self._buffer = self._buffer[position:]
+                return True
+
+            code_literal, code_pending = self._literal_context.classify_marker(
                 self._buffer,
-                position,
+                marker,
+                final=final,
+            )
+            if code_pending:
+                return False
+            if code_literal:
+                self._emit_content(marker, events)
+                self._buffer = self._buffer[len(marker) :]
+                return True
+
+            is_literal, needs_more_text = _marker_is_directly_quoted(
+                self._buffer,
                 marker,
                 self._last_content_character,
             )
-            if needs_more_text:
-                self._emit_content(self._buffer[:position], events)
-                self._buffer = self._buffer[position:]
+            if needs_more_text and not final:
                 return False
             if is_literal:
-                end = position + len(marker)
-                self._emit_content(self._buffer[:end], events)
-                self._buffer = self._buffer[end:]
+                self._emit_content(marker, events)
+                self._buffer = self._buffer[len(marker) :]
                 return True
 
             if marker == "<tool_call>":
-                after_marker = self._buffer[position + len(marker) :]
+                after_marker = self._buffer[len(marker) :]
                 candidate = after_marker.lstrip()
                 if candidate.startswith(_FUNCTION_OPEN):
-                    self._emit_content(self._buffer[:position], events)
                     self._buffer = after_marker
                     self._enter_tool(events)
                     return True
                 if not candidate or _FUNCTION_OPEN.startswith(candidate):
-                    self._emit_content(self._buffer[:position], events)
-                    self._buffer = self._buffer[position:]
                     return False
-                self._emit_content(self._buffer[: position + len(marker)], events)
+                self._emit_content(marker, events)
                 self._buffer = after_marker
                 return True
 
-            self._emit_content(self._buffer[:position], events)
-            self._buffer = self._buffer[position + len(marker) :]
+            self._buffer = self._buffer[len(marker) :]
             if marker == "<think>":
                 if self._mode != "reasoning":
                     self._close_current_channel(events)
@@ -672,7 +741,7 @@ class QwenIncrementalParser:
                 return True
 
             value_start = header_end + 1
-            close_at = self._buffer.find(_PARAMETER_CLOSE, value_start)
+            close_at = _find_parameter_close(self._buffer, value_start)
             if close_at < 0:
                 return False
             value_json = _parameter_value_json(self._buffer[value_start:close_at])
@@ -761,9 +830,11 @@ class QwenIncrementalParser:
             self._buffer = ""
             self._restore_after_tool()
         else:
+            while self._buffer and self._process_plain(events, final=True):
+                pass
             if self._buffer:
                 quoted_partial_marker = (
-                    self._last_content_character in _LITERAL_MARKER_QUOTES
+                    self._last_content_character in {"'", '"', "`"}
                     and any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS)
                 )
                 if quoted_partial_marker:

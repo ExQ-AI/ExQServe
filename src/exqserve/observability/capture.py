@@ -107,6 +107,7 @@ class CaptureManager:
         timing: GenerationTiming,
         error: CanonicalError | None,
         events: tuple[GenerationEvent, ...],
+        runtime_trace: tuple[dict[str, object], ...] = (),
     ) -> None:
         if self.mode is CaptureMode.OFF:
             return
@@ -131,6 +132,8 @@ class CaptureManager:
         if self.mode is CaptureMode.FULL:
             record["request"] = _encode_request(request)
             record["events"] = [_encode_event(event) for event in events]
+            if runtime_trace:
+                record["runtime_trace"] = [dict(entry) for entry in runtime_trace]
         await self._sink.write(record)
 
 

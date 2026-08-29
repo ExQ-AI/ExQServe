@@ -465,11 +465,21 @@ class RuntimeStarted:
 class RuntimeTextDelta:
     request_id: str
     text: str
+    token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
+        if not isinstance(self.text, str):
+            raise TypeError("text must be a string")
         if self.text == "":
             raise ValueError("text delta must not be empty")
+        if not isinstance(self.token_ids, tuple):
+            raise TypeError("token_ids must be a tuple")
+        for token_id in self.token_ids:
+            if not isinstance(token_id, int) or isinstance(token_id, bool):
+                raise TypeError("token_ids must contain only integers")
+            if token_id < 0:
+                raise ValueError("token_ids must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +489,9 @@ class RuntimeFinished:
     usage: TokenUsage
     timing: RuntimeTiming
     stop_sequence: str | None = None
+    backend_reason: str | None = None
+    eos_token_id: int | None = None
+    eos_token_text: str | None = None
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -495,6 +508,21 @@ class RuntimeFinished:
                 raise ValueError("stop_sequence must not be empty")
             if self.reason is not RuntimeStopReason.STOP_STRING:
                 raise ValueError("stop_sequence is valid only for stop-string completions")
+        if self.backend_reason is not None:
+            if not isinstance(self.backend_reason, str):
+                raise TypeError("backend_reason must be a string or None")
+            if not self.backend_reason:
+                raise ValueError("backend_reason must not be empty")
+        if self.eos_token_id is not None:
+            if not isinstance(self.eos_token_id, int) or isinstance(self.eos_token_id, bool):
+                raise TypeError("eos_token_id must be an integer or None")
+            if self.eos_token_id < 0:
+                raise ValueError("eos_token_id must be non-negative")
+        if self.eos_token_text is not None:
+            if not isinstance(self.eos_token_text, str):
+                raise TypeError("eos_token_text must be a string or None")
+            if not self.eos_token_text:
+                raise ValueError("eos_token_text must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +545,10 @@ class RuntimeFailed:
 
 
 RuntimeEvent = RuntimeStarted | RuntimeTextDelta | RuntimeFinished | RuntimeCancelled | RuntimeFailed
+
+
+class RuntimeConstraintUnsupported(ValueError):
+    """Raised when the active runtime cannot soundly enforce a generation constraint."""
 
 
 class RuntimeInjectionUnavailable(RuntimeError):

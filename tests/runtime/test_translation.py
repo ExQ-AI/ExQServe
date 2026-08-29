@@ -51,6 +51,31 @@ def test_eos_reason_mapping_is_stable(backend_reason: str | None, expected: Runt
     assert events[-1].reason is expected
 
 
+def test_runtime_diagnostics_preserve_token_ids_and_stop_token_metadata() -> None:
+    events = translate_exllamav3_result(
+        _request(),
+        {
+            "stage": "streaming",
+            "text": "hello",
+            "token_ids": [[100, 101]],
+            "eos": True,
+            "eos_reason": "stop_token",
+            "eos_triggering_token_id": 248069,
+            "eos_triggering_token_str": "</think>",
+            "prompt_tokens": 3,
+            "new_tokens": 2,
+        },
+    )
+
+    assert events[0] == RuntimeTextDelta("req-1", "hello", (100, 101))
+    finished = events[1]
+    assert isinstance(finished, RuntimeFinished)
+    assert finished.reason is RuntimeStopReason.EOS
+    assert finished.backend_reason == "stop_token"
+    assert finished.eos_token_id == 248069
+    assert finished.eos_token_text == "</think>"
+
+
 def test_final_text_is_emitted_before_finished_event() -> None:
     events = translate_exllamav3_result(
         _request(),

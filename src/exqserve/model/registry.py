@@ -303,6 +303,10 @@ class ModelDialectRegistry:
         dialect_ids = [dialect.dialect_id for dialect in dialects]
         if any(not isinstance(dialect_id, str) or not dialect_id.strip() for dialect_id in dialect_ids):
             raise ValueError("dialect ids must be non-empty strings")
+        if any(dialect_id != dialect_id.strip() for dialect_id in dialect_ids):
+            raise ModelDialectSelectionError("model dialect ids must not contain leading or trailing whitespace")
+        if "auto" in dialect_ids:
+            raise ModelDialectSelectionError("model dialect id 'auto' is reserved selector syntax")
         duplicates = sorted({dialect_id for dialect_id in dialect_ids if dialect_ids.count(dialect_id) > 1})
         if duplicates:
             raise ModelDialectSelectionError(

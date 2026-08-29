@@ -44,9 +44,15 @@ class _Clock:
 
 
 class _Session:
-    def __init__(self, events: list[GenerationEvent]) -> None:
+    def __init__(
+        self,
+        events: list[GenerationEvent],
+        runtime_trace: tuple[dict[str, object], ...] = (),
+    ) -> None:
         self._events = iter(events)
         self.cancel_calls = 0
+        self.runtime_trace = runtime_trace
+        self.runtime_trace_enabled = False
         self.compiled_prompt = CompiledPrompt(
             "prompt",
             (1,),
@@ -54,6 +60,9 @@ class _Session:
             (),
             TemplateRequest((), (), ()),
         )
+
+    def enable_runtime_trace(self) -> None:
+        self.runtime_trace_enabled = True
 
     def __aiter__(self) -> AsyncIterator[GenerationEvent]:
         return self
@@ -177,10 +186,22 @@ def test_observer_full_capture_records_terminal_trace_for_replay() -> None:
             TextDelta("r", "ok"),
             GenerationCompleted("r", CompletionReason.STOP),
         ]
+        runtime_trace = (
+            {"type": "text_delta", "text": "raw </think>", "token_ids": [1, 2]},
+            {
+                "type": "finished",
+                "reason": "eos",
+                "backend_reason": "stop_token",
+                "stop_sequence": None,
+                "eos_token_id": 2,
+                "eos_token_text": "</think>",
+            },
+        )
+        session = _Session(events, runtime_trace)
         sink = MemoryCaptureSink()
         metrics = MetricsRegistry()
         observer = ObservedServingEngine(
-            _Engine(_Session(events)),
+            _Engine(session),
             metrics,
             clock=_Clock([0.0, 0.1, 0.5]),
             capture=CaptureManager(CaptureMode.FULL, sink),
@@ -190,8 +211,10 @@ def test_observer_full_capture_records_terminal_trace_for_replay() -> None:
         seen = [event async for event in observed]
 
         assert seen == events
+        assert session.runtime_trace_enabled is True
         assert len(sink.records) == 1
         assert sink.records[0]["status"] == "completed"
+        assert sink.records[0]["runtime_trace"] == list(runtime_trace)
         assert replay_events(sink.records[0]) == tuple(events)
 
     asyncio.run(scenario())

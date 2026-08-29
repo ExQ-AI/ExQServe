@@ -29,6 +29,7 @@ from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
     RuntimeCancelled,
     RuntimeCapabilities,
+    RuntimeConstraintUnsupported,
     RuntimeEvent,
     RuntimeFailed,
     RuntimeFinished,
@@ -446,6 +447,31 @@ def _translate_stop_reason(reason: object) -> RuntimeStopReason:
     return RuntimeStopReason.OTHER
 
 
+def _stream_token_ids(value: object) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        row = value
+    elif isinstance(value, list):
+        if value and isinstance(value[0], list):
+            if len(value) != 1:
+                raise ValueError("stream token_ids must contain exactly one sequence")
+            row = tuple(value[0])
+        else:
+            row = tuple(value)
+    else:
+        tolist = getattr(value, "tolist", None)
+        if not callable(tolist):
+            raise TypeError("stream token_ids must be a token sequence or provide tolist()")
+        nested = tolist()
+        if not isinstance(nested, list) or len(nested) != 1 or not isinstance(nested[0], list):
+            raise ValueError("stream token_ids must contain exactly one sequence")
+        row = tuple(nested[0])
+    if not all(isinstance(token_id, int) and not isinstance(token_id, bool) and token_id >= 0 for token_id in row):
+        raise TypeError("stream token_ids must contain only non-negative integers")
+    return tuple(row)
+
+
 def translate_exllamav3_result(
     request: RuntimeGenerationRequest,
     result: Mapping[str, object],
@@ -463,18 +489,40 @@ def translate_exllamav3_result(
     events: list[RuntimeEvent] = []
     text = result.get("text")
     if isinstance(text, str) and text:
-        events.append(RuntimeTextDelta(request.request_id, text))
+        events.append(
+            RuntimeTextDelta(
+                request.request_id,
+                text,
+                _stream_token_ids(result.get("token_ids")),
+            )
+        )
 
     if result.get("eos") is True:
+        backend_reason = result.get("eos_reason")
         stop_sequence = result.get("eos_triggering_string")
+        eos_token_id = result.get("eos_triggering_token_id")
+        eos_token_text = result.get("eos_triggering_token_str")
         events.append(
             RuntimeFinished(
                 request_id=request.request_id,
-                reason=_translate_stop_reason(result.get("eos_reason")),
+                reason=_translate_stop_reason(backend_reason),
+                backend_reason=backend_reason if isinstance(backend_reason, str) else None,
                 usage=_translate_usage(request, result),
                 timing=_translate_timing(result),
                 stop_sequence=(
                     stop_sequence if isinstance(stop_sequence, str) and stop_sequence else None
+                ),
+                eos_token_id=(
+                    eos_token_id
+                    if isinstance(eos_token_id, int)
+                    and not isinstance(eos_token_id, bool)
+                    and eos_token_id >= 0
+                    else None
+                ),
+                eos_token_text=(
+                    eos_token_text
+                    if isinstance(eos_token_text, str) and eos_token_text
+                    else None
                 ),
             )
         )
@@ -524,6 +572,11 @@ def _merge_ready_stream_results(
     merged["text"] = "".join(
         text for result in ready if isinstance((text := result.get("text")), str)
     )
+    stream_ids: list[int] = []
+    for result in ready:
+        stream_ids.extend(_stream_token_ids(result.get("token_ids")))
+    if stream_ids:
+        merged["token_ids"] = tuple(stream_ids)
     return merged
 
 
@@ -872,6 +925,11 @@ def _build_sampler(backend: Any, sampling: RuntimeSamplingConfig | None) -> obje
     )
 
 
+def _llguidance_reports_unsupported_schema(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "failed to compile json schema" in message or "unimplemented keys" in message
+
+
 def _build_output_filters(
     backend: Any,
     tokenizer: Any,
@@ -904,6 +962,10 @@ def _build_output_filters(
                 lark_grammar=constraint.lark_grammar,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
+            if _llguidance_reports_unsupported_schema(exc):
+                raise RuntimeConstraintUnsupported(
+                    "Tool JSON Schema uses semantics that the active LLGuidance runtime cannot enforce."
+                ) from exc
             raise RuntimeError(
                 "Constrained tool generation grammar could not be initialized by the runtime."
             ) from exc

@@ -195,10 +195,11 @@ def test_qwen_constraint_rejects_names_that_native_tag_parser_cannot_accept() ->
         qwen_tool_constraint(_policy(invalid_parameter), ToolConstraintMode.SCHEMA)
 
 
-def test_gemma_constraint_rejects_name_that_conflicts_with_json_body_delimiter() -> None:
+@pytest.mark.parametrize("name", ("bad name", "bad{name", "bad}name", "bad<name", "bad>name"))
+def test_gemma_constraint_rejects_every_name_the_native_parser_rejects(name: str) -> None:
     with pytest.raises(ToolConstraintUnsupported, match="tool name"):
         gemma4_tool_constraint(
-            _policy(_tool("bad{name", _schema())),
+            _policy(_tool(name, _schema())),
             ToolConstraintMode.FORMAT,
         )
 
