@@ -91,7 +91,7 @@ def gemma4_tool_constraint(
     if not tools:
         return None
 
-    lines = ["%llguidance {}", "start: WS? tool WS?"]
+    lines = ["%llguidance {}", "start: tool"]
     lines.append("tool: " + " | ".join(f"tool_{index}" for index in range(len(tools))))
     for index, tool in enumerate(tools):
         if tool.name != tool.name.strip() or "{" in tool.name:
@@ -104,10 +104,9 @@ def gemma4_tool_constraint(
             else constraint_schema(tool.parameters)
         )
         lines.append(
-            f"tool_{index}: {lark_literal(f'call:{tool.name}')} WS? "
-            f'{schema_lark(schema)} WS? "<tool_call|>"'
+            f"tool_{index}: {lark_literal(f'call:{tool.name}')} "
+            f"{schema_lark(schema)} <tool_call|>"
         )
-    lines.append("WS: /[ \\t\\r\\n]+/")
     return ToolGenerationConstraint(
         trigger=_TOOL_OPEN,
         lark_grammar="\n".join(lines),

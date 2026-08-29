@@ -81,7 +81,8 @@ def test_gemma_schema_constraint_uses_complete_standard_json_schema() -> None:
     assert constraint.eos_after_completed is True
     assert '"call:save"' in constraint.lark_grammar
     assert "%json" in constraint.lark_grammar
-    assert '"<tool_call|>"' in constraint.lark_grammar
+    assert "<tool_call|>" in constraint.lark_grammar
+    assert '"<tool_call|>"' not in constraint.lark_grammar
     assert '"enum":["fast","safe"]' in constraint.lark_grammar
     assert '"minimum":1' in constraint.lark_grammar
     assert '"pattern":"^[a-z]+$"' in constraint.lark_grammar
@@ -96,6 +97,19 @@ def test_gemma_format_constraint_requires_json_object_only() -> None:
     assert constraint is not None
     assert '%json {"type":"object"}' in constraint.lark_grammar
     assert '"count"' not in constraint.lark_grammar
+
+
+def test_gemma_constraint_has_no_unbounded_whitespace_path_before_close() -> None:
+    constraint = gemma4_tool_constraint(
+        _policy(_tool("save", _schema()), parallel=False),
+        ToolConstraintMode.SCHEMA,
+    )
+
+    assert constraint is not None
+    assert "start: tool" in constraint.lark_grammar
+    assert "WS" not in constraint.lark_grammar
+    assert '%json ' in constraint.lark_grammar
+    assert " <tool_call|>" in constraint.lark_grammar
 
 
 def test_named_choice_exposes_only_selected_tool() -> None:
