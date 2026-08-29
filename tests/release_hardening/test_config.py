@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from exqserve.model.contracts import ToolConstraintMode
 from exqserve.observability.capture import CaptureMode
 from exqserve.server.config import ServerConfig
 
@@ -24,6 +25,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.max_request_body_bytes == 16 * 1024 * 1024
     assert config.max_injection_body_bytes == 64 * 1024
     assert config.vision_cache_mb == 256
+    assert config.tool_constraint_mode is ToolConstraintMode.OFF
     assert config.api_keys == ()
     assert config.protect_metrics is True
     assert config.capture_mode is CaptureMode.OFF
@@ -243,3 +245,12 @@ def test_server_config_delegates_runtime_and_control_invariants(tmp_path: Path) 
         ServerConfig(tmp_path, port=0)
     with pytest.raises(ValueError, match="default_api_output_tokens"):
         ServerConfig(tmp_path, default_api_output_tokens=0)
+
+
+def test_server_config_accepts_only_tool_constraint_enum_values(tmp_path: Path) -> None:
+    assert (
+        ServerConfig(tmp_path, tool_constraint_mode=ToolConstraintMode.SCHEMA).tool_constraint_mode
+        is ToolConstraintMode.SCHEMA
+    )
+    with pytest.raises(TypeError, match="tool_constraint_mode"):
+        ServerConfig(tmp_path, tool_constraint_mode="schema")  # type: ignore[arg-type]

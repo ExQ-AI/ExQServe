@@ -30,6 +30,9 @@ from exqserve.plugin_api import (
     TextStarted,
     ToolChoice,
     ToolChoiceMode,
+    ToolConstraintMode,
+    ToolConstraintProvider,
+    ToolGenerationConstraint,
     ToolPolicy,
 )
 
@@ -123,6 +126,19 @@ class _Dialect:
         return _Parser(request_id)
 
 
+@dataclass(frozen=True)
+class _ConstrainedDialect(_Dialect):
+    def create_tool_constraint(
+        self,
+        tool_policy: ToolPolicy,
+        mode: ToolConstraintMode,
+    ) -> ToolGenerationConstraint | None:
+        del tool_policy
+        if mode is ToolConstraintMode.OFF:
+            return None
+        return ToolGenerationConstraint("<tool>", 'start: "ok"', False)
+
+
 class _EntryPoint:
     def __init__(self, name: str, loaded: object, *, error: Exception | None = None) -> None:
         self.name = name
@@ -166,6 +182,14 @@ def test_plugin_api_v1_is_protocol_neutral_and_sufficient_for_compiler_parser() 
         TextDelta("req-plugin", "answer"),
         TextCompleted("req-plugin", "answer"),
     )
+
+
+def test_tool_constraint_provider_is_additive_to_plugin_api_v1() -> None:
+    assert not isinstance(_Dialect(), ToolConstraintProvider)
+    dialect = _ConstrainedDialect()
+    assert isinstance(dialect, ToolConstraintProvider)
+    constraint = dialect.create_tool_constraint(_POLICY, ToolConstraintMode.FORMAT)
+    assert constraint == ToolGenerationConstraint("<tool>", 'start: "ok"', False)
 
 
 def test_plugin_entry_point_discovery_and_explicit_selection() -> None:

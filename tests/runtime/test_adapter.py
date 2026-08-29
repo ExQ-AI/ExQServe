@@ -12,6 +12,7 @@ from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
     LoRAAdapterConfig,
     RuntimeFinished,
+    RuntimeGenerationConstraint,
     RuntimeGenerationRequest,
     RuntimeRenderedPrompt,
     RuntimeSamplingConfig,
@@ -1462,6 +1463,120 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
     assert second_args[4] == 123
     assert second_kwargs["stop_conditions"] == (7,)
     assert "max_rq_tokens" not in second_kwargs
+
+
+def test_submit_maps_explicit_generation_constraint_to_strict_llguidance_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    grammar = '%llguidance {}\nstart: "ok"'
+
+    async def scenario() -> None:
+        runtime.submit(
+            RuntimeGenerationRequest(
+                "req-tool-constraint",
+                (1, 2, 3),
+                8,
+                generation_constraint=RuntimeGenerationConstraint(
+                    "</think>",
+                    grammar,
+                    False,
+                ),
+            )
+        )
+
+    asyncio.run(scenario())
+
+    tokenizer, filter_kwargs = _FakeLLGuidanceFilter.calls[0]
+    assert tokenizer is backend._state["tokenizer"]
+    assert filter_kwargs == {
+        "trigger_token": 248069,
+        "eos_after_completed": False,
+        "lark_grammar": grammar,
+    }
+    assert "filters" in _FakeAsyncJob.calls[0][3]
+
+
+def test_submit_fails_when_explicit_generation_constraint_trigger_is_not_one_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    grammar = "%llguidance {}" + chr(10) + 'start: "ok"'
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="single-token"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-tool-constraint",
+                    (1, 2, 3),
+                    8,
+                    generation_constraint=RuntimeGenerationConstraint(
+                        "not-a-single-token",
+                        grammar,
+                        False,
+                    ),
+                )
+            )
+
+    asyncio.run(scenario())
+
+    assert _FakeLLGuidanceFilter.calls == []
+    assert _FakeAsyncJob.calls == []
+
+
+def test_submit_fails_when_runtime_rejects_explicit_generation_constraint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+
+    class RejectingFilter:
+        def __init__(self, tokenizer: object, **kwargs: object) -> None:
+            raise ValueError("constraint unavailable")
+
+    backend.LLGuidanceFilter = RejectingFilter
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    grammar = "%llguidance {}" + chr(10) + 'start: "ok"'
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="grammar could not be initialized"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-tool-constraint",
+                    (1, 2, 3),
+                    8,
+                    generation_constraint=RuntimeGenerationConstraint(
+                        "</think>",
+                        grammar,
+                        False,
+                    ),
+                )
+            )
+
+    asyncio.run(scenario())
+
+    assert _FakeAsyncJob.calls == []
 
 
 def test_submit_maps_json_schema_constraint_to_fresh_llguidance_filter(

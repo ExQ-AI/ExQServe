@@ -47,8 +47,17 @@ from exqserve.model.contracts import (
     TemplateTool,
     TemplateToolCall,
     TemplateToolResponse,
+    ToolConstraintMode,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
+from exqserve.model.tool_constraints import (
+    constraint_schema,
+    exposed_tools,
+    lark_literal,
+    schema_lark,
+)
 
 GEMMA4_CAPABILITIES = ModelCapabilities(
     reasoning=True,
@@ -67,6 +76,43 @@ _TOOL_OPEN = "<|tool_call>"
 _TOOL_CLOSE = "<tool_call|>"
 _STRING_DELIMITER = '<|"|>'
 _PLAIN_MARKERS = (_THOUGHT_OPEN, _THOUGHT_CLOSE, _TOOL_OPEN)
+
+
+def gemma4_tool_constraint(
+    tool_policy: ToolPolicy,
+    mode: ToolConstraintMode,
+) -> ToolGenerationConstraint | None:
+    if not isinstance(mode, ToolConstraintMode):
+        raise TypeError("mode must be a ToolConstraintMode")
+    if mode is ToolConstraintMode.OFF:
+        return None
+
+    tools = tuple(sorted(exposed_tools(tool_policy), key=lambda item: item.name))
+    if not tools:
+        return None
+
+    lines = ["%llguidance {}", "start: WS? tool WS?"]
+    lines.append("tool: " + " | ".join(f"tool_{index}" for index in range(len(tools))))
+    for index, tool in enumerate(tools):
+        if tool.name != tool.name.strip() or "{" in tool.name:
+            raise ToolConstraintUnsupported(
+                f"Gemma constrained generation cannot represent tool name {tool.name!r}"
+            )
+        schema: dict[str, JsonValue] = (
+            {"type": "object"}
+            if mode is ToolConstraintMode.FORMAT
+            else constraint_schema(tool.parameters)
+        )
+        lines.append(
+            f"tool_{index}: {lark_literal(f'call:{tool.name}')} WS? "
+            f'{schema_lark(schema)} WS? "<tool_call|>"'
+        )
+    lines.append("WS: /[ \\t\\r\\n]+/")
+    return ToolGenerationConstraint(
+        trigger=_TOOL_OPEN,
+        lark_grammar="\n".join(lines),
+        eos_after_completed=not tool_policy.allow_parallel,
+    )
 
 
 def _reasoning_kwargs(

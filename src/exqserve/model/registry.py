@@ -15,6 +15,8 @@ from exqserve.model.contracts import (
     ModelCapabilities,
     ModelDialect,
     ModelDialectPluginRegistration,
+    ToolConstraintMode,
+    ToolGenerationConstraint,
 )
 from exqserve.model.deepseek_v4 import (
     DEEPSEEK_V4_CAPABILITIES,
@@ -22,7 +24,12 @@ from exqserve.model.deepseek_v4 import (
     DeepSeekV4PromptCompiler,
     deepseek_v4_parser_context,
 )
-from exqserve.model.gemma4 import GEMMA4_CAPABILITIES, Gemma4IncrementalParser, Gemma4PromptCompiler
+from exqserve.model.gemma4 import (
+    GEMMA4_CAPABILITIES,
+    Gemma4IncrementalParser,
+    Gemma4PromptCompiler,
+    gemma4_tool_constraint,
+)
 from exqserve.model.generic_hf import (
     GENERIC_HF_CAPABILITIES,
     GenericHFIncrementalParser,
@@ -39,7 +46,12 @@ from exqserve.model.muse_glimmer import (
     MuseGlimmerIncrementalParser,
     MuseGlimmerPromptCompiler,
 )
-from exqserve.model.qwen import QWEN38_CAPABILITIES, QwenIncrementalParser, QwenPromptCompiler
+from exqserve.model.qwen import (
+    QWEN38_CAPABILITIES,
+    QwenIncrementalParser,
+    QwenPromptCompiler,
+    qwen_tool_constraint,
+)
 
 _GLM5_ARCHITECTURES = frozenset(
     {
@@ -97,6 +109,13 @@ class QwenDialect:
             start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
         )
 
+    def create_tool_constraint(
+        self,
+        tool_policy: ToolPolicy,
+        mode: ToolConstraintMode,
+    ) -> ToolGenerationConstraint | None:
+        return qwen_tool_constraint(tool_policy, mode)
+
 
 @dataclass(frozen=True, slots=True)
 class Gemma4Dialect:
@@ -123,6 +142,13 @@ class Gemma4Dialect:
             request_id,
             start_in_reasoning=reasoning.mode is ReasoningMode.ENABLED,
         )
+
+    def create_tool_constraint(
+        self,
+        tool_policy: ToolPolicy,
+        mode: ToolConstraintMode,
+    ) -> ToolGenerationConstraint | None:
+        return gemma4_tool_constraint(tool_policy, mode)
 
 
 @dataclass(frozen=True, slots=True)

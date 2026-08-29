@@ -56,6 +56,10 @@ from exqserve.model.contracts import (
     TemplateTool,
     TemplateToolCall,
     TemplateToolResponse,
+    ToolConstraintMode,
+    ToolConstraintProvider,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
 )
 
 __all__ = [
@@ -110,6 +114,10 @@ __all__ = [
     "ToolCallStarted",
     "ToolChoice",
     "ToolChoiceMode",
+    "ToolConstraintMode",
+    "ToolConstraintProvider",
+    "ToolConstraintUnsupported",
+    "ToolGenerationConstraint",
     "ToolPolicy",
     "ToolResultItem",
     "UsageUpdated",

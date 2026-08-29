@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import string
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from exqserve.agent.reasoning import ReasoningPolicy
@@ -300,6 +301,44 @@ class IncrementalParserLike(Protocol):
         ...
 
     def finish(self) -> ParserFinishLike:
+        ...
+
+
+class ToolConstraintMode(str, Enum):
+    OFF = "off"
+    FORMAT = "format"
+    SCHEMA = "schema"
+
+
+class ToolConstraintUnsupported(ValueError):
+    """Raised when an explicit constrained-tool policy cannot be represented safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolGenerationConstraint:
+    """Backend-neutral grammar activated after a model-native tool opener token."""
+
+    trigger: str
+    lark_grammar: str
+    eos_after_completed: bool
+
+    def __post_init__(self) -> None:
+        for name in ("trigger", "lark_grammar"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f"{name} must be a string")
+            if not value.strip():
+                raise ValueError(f"{name} must not be empty")
+        _validate_bool("eos_after_completed", self.eos_after_completed)
+
+
+@runtime_checkable
+class ToolConstraintProvider(Protocol):
+    def create_tool_constraint(
+        self,
+        tool_policy: ToolPolicy,
+        mode: ToolConstraintMode,
+    ) -> ToolGenerationConstraint | None:
         ...
 
 

@@ -16,8 +16,13 @@ from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import GenerationEvent
 from exqserve.core.items import MessageItem, MessageRole, ToolResultItem
 from exqserve.core.request import CanonicalRequest
-from exqserve.model.contracts import CompiledPrompt, TemplateRequest
-from exqserve.runtime.contracts import RuntimeGenerationRequest
+from exqserve.model.contracts import (
+    CompiledPrompt,
+    TemplateRequest,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
+)
+from exqserve.runtime.contracts import RuntimeGenerationConstraint, RuntimeGenerationRequest
 from exqserve.serving.contracts import ServingRejected, ServingRequest
 from exqserve.serving.engine import ServingEngine
 
@@ -194,6 +199,100 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         await framed_engine.submit(constrained)
         assert framed_controller.requests[0].output_json_schema is None
         assert framed_controller.requests[0].output_json_trigger is None
+
+    asyncio.run(scenario())
+
+
+def test_tool_constraint_descriptor_is_forwarded_to_runtime_request() -> None:
+    async def scenario() -> None:
+        controller = _Controller()
+        constraint = ToolGenerationConstraint(
+            trigger="<tool_call>",
+            lark_grammar='%llguidance {}\nstart: "ok"',
+            eos_after_completed=False,
+        )
+        factory_calls: list[ToolPolicy] = []
+
+        def constraint_factory(policy: ToolPolicy) -> ToolGenerationConstraint:
+            factory_calls.append(policy)
+            return constraint
+
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            constraint_factory,
+        )
+        request = _request()
+        await engine.submit(request)
+
+        assert factory_calls == [request.tools]
+        assert controller.requests[0].generation_constraint == RuntimeGenerationConstraint(
+            constraint.trigger,
+            constraint.lark_grammar,
+            constraint.eos_after_completed,
+        )
+
+    asyncio.run(scenario())
+
+
+def test_unsupported_tool_constraint_rejects_before_runtime_submission() -> None:
+    async def scenario() -> None:
+        controller = _Controller()
+
+        def constraint_factory(policy: ToolPolicy) -> ToolGenerationConstraint | None:
+            del policy
+            raise ToolConstraintUnsupported("unsupported schema")
+
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            constraint_factory,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(_request())
+
+        assert exc_info.value.error.category is ErrorCategory.INVALID_REQUEST
+        assert exc_info.value.error.code == "tool_constraint_unsupported"
+        assert "unsupported schema" not in exc_info.value.error.message
+        assert controller.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_tool_constraint_conflicts_with_structured_output_before_runtime_submission() -> None:
+    async def scenario() -> None:
+        controller = _Controller()
+        structured = StructuredOutputSpec(JsonSchema('{"type":"object"}'))
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            structured_output=structured,
+            seed=base.seed,
+        )
+        constraint = ToolGenerationConstraint(
+            trigger="<tool_call>",
+            lark_grammar='%llguidance {}\nstart: "ok"',
+            eos_after_completed=False,
+        )
+        engine = ServingEngine(
+            _Compiler(raw_output_is_text_only=True),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            lambda policy: constraint,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(request)
+
+        assert exc_info.value.error.category is ErrorCategory.INVALID_REQUEST
+        assert exc_info.value.error.code == "tool_constraint_conflict"
+        assert controller.requests == []
 
     asyncio.run(scenario())
 

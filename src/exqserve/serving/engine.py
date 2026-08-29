@@ -45,11 +45,14 @@ from exqserve.model.contracts import (
     TemplateTool,
     TemplateToolCall,
     TemplateToolResponse,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
 )
 from exqserve.runtime.contracts import (
     RuntimeEvent,
     RuntimeFailed,
     RuntimeFinished,
+    RuntimeGenerationConstraint,
     RuntimeGenerationRequest,
     RuntimeRenderedPrompt,
     RuntimeStarted,
@@ -215,6 +218,7 @@ class RequestControllerLike(Protocol):
 
 
 type ParserFactory = Callable[[str, ReasoningPolicy, ToolPolicy], IncrementalParserLike]
+type ToolConstraintFactory = Callable[[ToolPolicy], ToolGenerationConstraint | None]
 
 
 def _safe_error(
@@ -233,10 +237,12 @@ class ServingEngine:
         compiler: PromptCompilerLike,
         parser_factory: ParserFactory,
         controller: RequestControllerLike,
+        tool_constraint_factory: ToolConstraintFactory | None = None,
     ) -> None:
         self._compiler = compiler
         self._parser_factory = parser_factory
         self._controller = controller
+        self._tool_constraint_factory = tool_constraint_factory
         self._compile_lock = asyncio.Lock()
 
     def _compile_request(self, request: ServingRequest) -> CompiledPrompt:
@@ -311,6 +317,40 @@ class ServingEngine:
                 )
             ) from exc
 
+        tool_constraint = None
+        if self._tool_constraint_factory is not None:
+            try:
+                tool_constraint = self._tool_constraint_factory(request.tools)
+            except ToolConstraintUnsupported as exc:
+                logger.warning(
+                    "Tool constraint compilation rejected for request %s: %s",
+                    request.input.request_id,
+                    exc,
+                )
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INVALID_REQUEST,
+                        "tool_constraint_unsupported",
+                        "Tool schema or policy cannot be represented by the configured constrained-generation mode.",
+                    )
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INVALID_REQUEST,
+                        "tool_constraint_invalid",
+                        "Tool constraint configuration is invalid for this request.",
+                    )
+                ) from exc
+            except Exception as exc:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INTERNAL,
+                        "serving_internal_error",
+                        "Tool constraint initialization failed internally.",
+                    )
+                ) from exc
+
         schema_hint = None
         schema_trigger = None
         if request.structured_output is not None:
@@ -319,6 +359,15 @@ class ServingEngine:
             elif compiled.structured_output_trigger is not None:
                 schema_hint = request.structured_output.schema.canonical_json
                 schema_trigger = compiled.structured_output_trigger
+
+        if tool_constraint is not None and schema_hint is not None:
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INVALID_REQUEST,
+                    "tool_constraint_conflict",
+                    "Constrained tool generation cannot be combined with structured output in one request.",
+                )
+            )
 
         runtime_request = RuntimeGenerationRequest(
             request_id=request.input.request_id,
@@ -330,6 +379,15 @@ class ServingEngine:
             prompt_attachments=compiled.runtime_attachments,
             output_json_schema=schema_hint,
             output_json_trigger=schema_trigger,
+            generation_constraint=(
+                None
+                if tool_constraint is None
+                else RuntimeGenerationConstraint(
+                    tool_constraint.trigger,
+                    tool_constraint.lark_grammar,
+                    tool_constraint.eos_after_completed,
+                )
+            ),
         )
         try:
             controlled = await self._controller.submit(runtime_request)

@@ -877,6 +877,38 @@ def _build_output_filters(
     tokenizer: Any,
     request: RuntimeGenerationRequest,
 ) -> list[object] | None:
+    if request.generation_constraint is not None:
+        constraint = request.generation_constraint
+        try:
+            trigger_ids = _tensor_to_token_ids(
+                tokenizer.encode(
+                    constraint.trigger,
+                    add_bos=False,
+                    add_eos=False,
+                    encode_special_tokens=True,
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Constrained tool generation trigger could not be tokenized by the loaded model."
+            ) from exc
+        if len(trigger_ids) != 1:
+            raise RuntimeError(
+                "Constrained tool generation requires a single-token model-native tool trigger."
+            )
+        try:
+            output_filter = backend.LLGuidanceFilter(
+                tokenizer,
+                trigger_token=trigger_ids[0],
+                eos_after_completed=constraint.eos_after_completed,
+                lark_grammar=constraint.lark_grammar,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                "Constrained tool generation grammar could not be initialized by the runtime."
+            ) from exc
+        return [output_filter]
+
     if request.output_json_schema is None:
         return None
 

@@ -17,6 +17,11 @@ from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolPolicy
 from exqserve.control.request import RequestController
 from exqserve.core.model import ServedModelInfo
+from exqserve.model.contracts import (
+    ToolConstraintMode,
+    ToolConstraintProvider,
+    ToolGenerationConstraint,
+)
 from exqserve.model.registry import default_model_dialect_registry
 from exqserve.observability.capture import CaptureManager, CaptureMode, JsonlCaptureSink
 from exqserve.observability.http import create_metrics_router
@@ -183,6 +188,22 @@ def _build_model_bundle(
     )
     compiler = dialect.create_compiler(template_adapter)
 
+    tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
+    if config.tool_constraint_mode is not ToolConstraintMode.OFF:
+        if not isinstance(dialect, ToolConstraintProvider):
+            raise ValueError(
+                f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
+            )
+        constraint_provider = dialect
+
+        def create_tool_constraint(tool_policy: ToolPolicy) -> ToolGenerationConstraint | None:
+            return constraint_provider.create_tool_constraint(
+                tool_policy,
+                config.tool_constraint_mode,
+            )
+
+        tool_constraint_factory = create_tool_constraint
+
     def parser_factory(
         request_id: str,
         reasoning: ReasoningPolicy,
@@ -190,7 +211,12 @@ def _build_model_bundle(
     ) -> IncrementalParserLike:
         return _dialect_parser(dialect, request_id, reasoning, tool_policy)
 
-    engine = ServingEngine(compiler, parser_factory, cast(RequestControllerLike, controller))
+    engine = ServingEngine(
+        compiler,
+        parser_factory,
+        cast(RequestControllerLike, controller),
+        tool_constraint_factory,
+    )
     raw_engine = RawServingEngine(runtime_object, cast(RawRequestController, controller))
     observed = ObservedServingEngine(engine, metrics, capture=capture)
     observed_raw = ObservedRawServingEngine(raw_engine, metrics, capture=capture)

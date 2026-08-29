@@ -7,6 +7,7 @@ from pathlib import Path
 
 from exqserve.control.request import RequestControlConfig
 from exqserve.core.sampling import SamplingOverridePolicy
+from exqserve.model.contracts import ToolConstraintMode
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import ExLlamaV3LoadConfig, LoRAAdapterConfig
 
@@ -64,6 +65,7 @@ class ServerConfig:
     max_injection_body_bytes: int = 64 * 1024
     vision_cache_mb: int = 256
     model_dialect: str = "auto"
+    tool_constraint_mode: ToolConstraintMode = ToolConstraintMode.OFF
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -109,6 +111,8 @@ class ServerConfig:
         if not normalized_dialect:
             raise ValueError("model_dialect must not be empty")
         object.__setattr__(self, "model_dialect", normalized_dialect)
+        if not isinstance(self.tool_constraint_mode, ToolConstraintMode):
+            raise TypeError("tool_constraint_mode must be a ToolConstraintMode")
         if not isinstance(self.port, int) or isinstance(self.port, bool):
             raise TypeError("port must be an integer")
         if not 1 <= self.port <= 65535:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from exqserve.model.contracts import ToolConstraintMode
 from exqserve.observability.capture import CaptureMode
 from exqserve.server import cli
 from exqserve.server.app import RuntimeUnavailableError
@@ -17,6 +18,8 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
             str(tmp_path),
             "--served-model-id",
             "local-qwen",
+            "--tool-constraint-mode",
+            "schema",
             "--model-root",
             str(tmp_path.parent),
             "--host",
@@ -79,6 +82,7 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
 
     assert config.model_directory == tmp_path
     assert config.served_model_id == "local-qwen"
+    assert config.tool_constraint_mode is ToolConstraintMode.SCHEMA
     assert config.model_root == tmp_path.parent
     assert config.host == "0.0.0.0"
     assert config.port == 9000
@@ -125,6 +129,7 @@ def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path)
                 "kv-cache-bits: fp16",
                 "max-batch-size: 2",
                 "max-chunk-size: 1024",
+                "tool-constraint-mode: format",
                 "reserve-per-device-gb: [1.25, 2.5]",
                 "device-ids: [0, 1]",
                 "tensor-parallel: true",
@@ -160,6 +165,7 @@ def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path)
     assert config.cache_value_bits is None
     assert config.max_batch_size == 2
     assert config.max_chunk_size == 1024
+    assert config.tool_constraint_mode is ToolConstraintMode.FORMAT
     assert config.reserve_per_device_gb == (1.25, 2.5)
     assert config.device_ids == (0, 1)
     assert config.tensor_parallel is True
@@ -219,6 +225,7 @@ def test_cli_explicit_values_override_yaml_including_lists_and_booleans(tmp_path
                 f"model-directory: {yaml_model}",
                 "port: 9000",
                 "reserve-per-device-gb: [1.0, 2.0]",
+                "tool-constraint-mode: format",
                 "mtp: true",
                 "vision: true",
                 "cuda-malloc-async: false",
@@ -237,6 +244,8 @@ def test_cli_explicit_values_override_yaml_including_lists_and_booleans(tmp_path
             "9200",
             "--reserve-per-device-gb",
             "0.5",
+            "--tool-constraint-mode",
+            "schema",
             "--no-mtp",
             "--no-vision",
             "--cuda-malloc-async",
@@ -247,6 +256,7 @@ def test_cli_explicit_values_override_yaml_including_lists_and_booleans(tmp_path
     assert config.model_directory == cli_model
     assert config.port == 9200
     assert config.reserve_per_device_gb == (0.5,)
+    assert config.tool_constraint_mode is ToolConstraintMode.SCHEMA
     assert config.mtp_enabled is False
     assert config.vision_enabled is False
     assert config.cuda_malloc_async is True

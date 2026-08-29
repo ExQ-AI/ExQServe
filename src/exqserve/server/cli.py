@@ -15,6 +15,7 @@ import yaml  # type: ignore[import-untyped]
 
 from exqserve.core.sampling import SamplingOverridePolicy
 from exqserve.downloader import main as _download_main
+from exqserve.model.contracts import ToolConstraintMode
 from exqserve.observability.capture import CaptureMode
 from exqserve.server.app import RuntimeUnavailableError, compose_server
 from exqserve.server.config import ServerConfig
@@ -26,6 +27,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "served_model_id": None,
     "model_root": None,
     "model_dialect": "auto",
+    "tool_constraint_mode": ToolConstraintMode.OFF.value,
     "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,
@@ -138,6 +140,11 @@ def _build_parser(
     parser.add_argument(
         "--model-dialect",
         help="Select a model Agent dialect by id; default 'auto' discovers installed dialect plugins.",
+    )
+    parser.add_argument(
+        "--tool-constraint-mode",
+        choices=tuple(mode.value for mode in ToolConstraintMode),
+        help="Generation-time tool constraints: off (default), format, or schema.",
     )
     parser.add_argument(
         "--chat-template",
@@ -549,6 +556,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.max_injection_body_bytes,
         args.vision_cache_mb,
         args.model_dialect,
+        ToolConstraintMode(args.tool_constraint_mode),
     )
 
 

@@ -40,8 +40,18 @@ from exqserve.model.contracts import (
     TemplateTextPart,
     TemplateTool,
     TemplateToolCall,
+    ToolConstraintMode,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
+from exqserve.model.tool_constraints import (
+    exposed_tools,
+    lark_literal,
+    qwen_parameter_schema,
+    qwen_property_schema,
+    schema_lark,
+)
 
 QWEN38_CAPABILITIES = ModelCapabilities(
     reasoning=True,
@@ -54,6 +64,78 @@ QWEN38_CAPABILITIES = ModelCapabilities(
 )
 
 _QWEN_STOP_CONDITIONS = ("<|im_end|>",)
+_QWEN_TOOL_TRIGGER = "<tool_call>"
+
+
+def qwen_tool_constraint(
+    tool_policy: ToolPolicy,
+    mode: ToolConstraintMode,
+) -> ToolGenerationConstraint | None:
+    if not isinstance(mode, ToolConstraintMode):
+        raise TypeError("mode must be a ToolConstraintMode")
+    if mode is ToolConstraintMode.OFF:
+        return None
+
+    tools = tuple(sorted(exposed_tools(tool_policy), key=lambda item: item.name))
+    if not tools:
+        return None
+
+    lines = ["%llguidance {}", 'start: WS? function WS? "</tool_call>"']
+    lines.append("function: " + " | ".join(f"function_{index}" for index in range(len(tools))))
+
+    if mode is ToolConstraintMode.FORMAT:
+        lines.extend(
+            [
+                'parameter: "<parameter=" NAME ">" value "</parameter>" WS?',
+                "value: VALUE_CHAR*",
+                "NAME: /[^\\s<>]+/",
+                "VALUE_CHAR: /[^<]/",
+            ]
+        )
+
+    for index, tool in enumerate(tools):
+        if not _valid_tag_name(tool.name):
+            raise ToolConstraintUnsupported(
+                f"Qwen constrained generation cannot represent tool name {tool.name!r}"
+            )
+        open_tag = lark_literal(f"<function={tool.name}>")
+        if mode is ToolConstraintMode.FORMAT:
+            lines.append(f'function_{index}: {open_tag} WS? parameter* "</function>"')
+            continue
+
+        schema = qwen_parameter_schema(tool.parameters)
+        properties = schema.get("properties", {})
+        assert isinstance(properties, dict)
+        required = schema.get("required", [])
+        assert isinstance(required, list)
+        required_names = set(required)
+        parameter_rules: list[str] = []
+        for parameter_index, name in enumerate(sorted(properties)):
+            if not _valid_tag_name(name):
+                raise ToolConstraintUnsupported(
+                    f"Qwen constrained generation cannot represent parameter name {name!r}"
+                )
+            property_schema = properties[name]
+            assert isinstance(property_schema, dict)
+            property_schema = qwen_property_schema(schema, property_schema)
+            rule_name = f"function_{index}_parameter_{parameter_index}"
+            suffix = "" if name in required_names else "?"
+            parameter_rules.append(rule_name + suffix)
+            lines.append(
+                f"{rule_name}: {lark_literal(f'<parameter={name}>')} WS? "
+                f'{schema_lark(property_schema)} WS? "</parameter>" WS?'
+            )
+        parameter_body = " ".join(parameter_rules)
+        if parameter_body:
+            parameter_body += " "
+        lines.append(f'function_{index}: {open_tag} WS? {parameter_body}"</function>"')
+
+    lines.append("WS: /[ \\t\\r\\n]+/")
+    return ToolGenerationConstraint(
+        trigger=_QWEN_TOOL_TRIGGER,
+        lark_grammar="\n".join(lines),
+        eos_after_completed=not tool_policy.allow_parallel,
+    )
 
 
 def _reasoning_kwargs(

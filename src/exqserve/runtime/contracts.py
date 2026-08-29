@@ -342,6 +342,22 @@ class RuntimeSamplingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeGenerationConstraint:
+    trigger: str
+    lark_grammar: str
+    eos_after_completed: bool
+
+    def __post_init__(self) -> None:
+        for name in ("trigger", "lark_grammar"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f"{name} must be a string")
+            if not value.strip():
+                raise ValueError(f"{name} must not be empty")
+        _validate_bool("eos_after_completed", self.eos_after_completed)
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeGenerationRequest:
     request_id: str
     input_ids: tuple[int, ...]
@@ -352,6 +368,7 @@ class RuntimeGenerationRequest:
     prompt_attachments: tuple[object, ...] = ()
     output_json_schema: str | None = None
     output_json_trigger: str | None = None
+    generation_constraint: RuntimeGenerationConstraint | None = None
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -389,6 +406,12 @@ class RuntimeGenerationRequest:
                 raise TypeError("output_json_trigger must be a string or None")
             if not self.output_json_trigger.strip():
                 raise ValueError("output_json_trigger must not be empty")
+        if self.generation_constraint is not None and not isinstance(
+            self.generation_constraint, RuntimeGenerationConstraint
+        ):
+            raise TypeError("generation_constraint must be a RuntimeGenerationConstraint or None")
+        if self.generation_constraint is not None and self.output_json_schema is not None:
+            raise ValueError("generation_constraint cannot be combined with output_json_schema")
 
 
 class RuntimeStopReason(str, Enum):
