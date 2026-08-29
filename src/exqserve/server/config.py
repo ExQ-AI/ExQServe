@@ -68,6 +68,10 @@ class ServerConfig:
     tool_constraint_mode: ToolConstraintMode = ToolConstraintMode.OFF
     sysmem_kv_cache_mb: int = 0
     sysmem_recurrent_cache_mb: int = 4096
+    ngram_match_min: int = 0
+    ngram_draft_size: int = 4
+    moe_cpu_offload_layers: int = 0
+    moe_cpu_threads: int | None = None
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -167,16 +171,29 @@ class ServerConfig:
             "vision_cache_mb",
             "sysmem_kv_cache_mb",
             "sysmem_recurrent_cache_mb",
+            "ngram_match_min",
+            "ngram_draft_size",
+            "moe_cpu_offload_layers",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{name} must be an integer")
-            if name in {"vision_cache_mb", "sysmem_kv_cache_mb"}:
+            if name in {
+                "vision_cache_mb",
+                "sysmem_kv_cache_mb",
+                "ngram_match_min",
+                "moe_cpu_offload_layers",
+            }:
                 if value < 0:
                     raise ValueError(f"{name} must be non-negative")
                 continue
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.moe_cpu_threads is not None:
+            if not isinstance(self.moe_cpu_threads, int) or isinstance(self.moe_cpu_threads, bool):
+                raise TypeError("moe_cpu_threads must be an integer or None")
+            if self.moe_cpu_threads <= 0:
+                raise ValueError("moe_cpu_threads must be positive or None")
         if not isinstance(self.response_store_ttl_seconds, int | float) or isinstance(
             self.response_store_ttl_seconds, bool
         ):
@@ -245,6 +262,10 @@ class ServerConfig:
             vision_cache_mb=self.vision_cache_mb,
             sysmem_kv_cache_mb=self.sysmem_kv_cache_mb,
             sysmem_recurrent_cache_mb=self.sysmem_recurrent_cache_mb,
+            ngram_match_min=self.ngram_match_min,
+            ngram_draft_size=self.ngram_draft_size,
+            moe_cpu_offload_layers=self.moe_cpu_offload_layers,
+            moe_cpu_threads=self.moe_cpu_threads,
             lora_adapters=tuple(
                 LoRAAdapterConfig(
                     str(path),

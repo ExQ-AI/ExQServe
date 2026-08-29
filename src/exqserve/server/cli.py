@@ -61,6 +61,10 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "vision_cache_mb": 256,
     "sysmem_kv_cache_mb": 0,
     "sysmem_recurrent_cache_mb": 4096,
+    "ngram_match_min": 0,
+    "ngram_draft_size": 4,
+    "moe_cpu_offload_layers": 0,
+    "moe_cpu_threads": None,
     "max_in_flight": 8,
     "max_prompt_tokens": None,
     "max_output_tokens": None,
@@ -187,6 +191,17 @@ def _build_parser(
         help="Target acceptance probability for ExLlamaV3 dynamic draft sizing.",
     )
     parser.add_argument(
+        "--ngram-match-min",
+        type=int,
+        help="Minimum prompt-history match length for ExLlamaV3 n-gram drafting; 0 disables it.",
+    )
+    parser.add_argument(
+        "--ngram-draft-tokens",
+        dest="ngram_draft_size",
+        type=int,
+        help="Maximum number of speculative tokens proposed by n-gram drafting.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=Path,
         help="Load a separate ExLlamaV3 draft model for speculative decoding.",
@@ -225,6 +240,19 @@ def _build_parser(
         "--device-ids",
         metavar="ID[,ID...]",
         help="Comma-separated process-visible CUDA device indices to allow, e.g. 0,2.",
+    )
+    parser.add_argument(
+        "--moe-cpu-offload-layers",
+        type=int,
+        help=(
+            "Run the first N eligible block-sparse MoE layers on CPU through ExLlamaV3; "
+            "0 disables offload."
+        ),
+    )
+    parser.add_argument(
+        "--moe-cpu-threads",
+        type=int,
+        help="Worker thread count for ExLlamaV3 MoE CPU offload; leave unset for upstream default.",
     )
     parser.add_argument(
         "--tensor-parallel",
@@ -352,6 +380,8 @@ def _config_tokens(raw: Mapping[object, object]) -> list[str]:
         for dest in _PARSER_DEFAULTS
         if dest not in {"config"}
     }
+    allowed_keys.discard("ngram-draft-size")
+    allowed_keys.add("ngram-draft-tokens")
     tokens: list[str] = []
 
     model_value = raw.get("model-directory")
@@ -574,6 +604,10 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         ToolConstraintMode(args.tool_constraint_mode),
         args.sysmem_kv_cache_mb,
         args.sysmem_recurrent_cache_mb,
+        args.ngram_match_min,
+        args.ngram_draft_size,
+        args.moe_cpu_offload_layers,
+        args.moe_cpu_threads,
     )
 
 

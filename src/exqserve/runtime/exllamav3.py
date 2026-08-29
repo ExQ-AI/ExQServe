@@ -1156,6 +1156,21 @@ class ExLlamaV3Runtime:
                 config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
                 **generator_options,
             )
+        elif config.ngram_match_min:
+            self._generator = backend.AsyncGenerator(
+                self._model,
+                self._cache,
+                text_codec,
+                config.max_batch_size,
+                config.max_chunk_size,
+                8,
+                None,
+                None,
+                config.ngram_draft_size,
+                cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
+                recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
+                ngram_match_min=config.ngram_match_min,
+            )
         else:
             self._generator = backend.AsyncGenerator(
                 self._model,
@@ -1187,6 +1202,9 @@ class ExLlamaV3Runtime:
         model_metadata = RuntimeModelMetadata()
         try:
             backend_config = backend.Config.from_directory(config.model_directory)
+            backend_config.infer_params.moe_cpu_offload = config.moe_cpu_offload_layers
+            if config.moe_cpu_threads is not None:
+                backend_config.infer_params.moe_cpu_threads = config.moe_cpu_threads
             model_metadata = RuntimeModelMetadata(
                 _backend_context_limit(backend_config),
                 _backend_architecture(backend_config),

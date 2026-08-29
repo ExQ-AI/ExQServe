@@ -121,6 +121,53 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
     assert config.capture_path == capture
 
 
+def test_cli_and_yaml_parse_ngram_and_moe_cpu_options(tmp_path: Path) -> None:
+    cli_config = cli.parse_config(
+        [
+            str(tmp_path / "model"),
+            "--ngram-match-min",
+            "3",
+            "--ngram-draft-tokens",
+            "7",
+            "--moe-cpu-offload-layers",
+            "12",
+            "--moe-cpu-threads",
+            "6",
+        ]
+    )
+    assert cli_config.ngram_match_min == 3
+    assert cli_config.ngram_draft_size == 7
+    assert cli_config.moe_cpu_offload_layers == 12
+    assert cli_config.moe_cpu_threads == 6
+
+    config_path = tmp_path / "ngram-moe.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"model-directory: {tmp_path / 'model'}",
+                "ngram-match-min: 4",
+                "ngram-draft-tokens: 9",
+                "moe-cpu-offload-layers: 16",
+                "moe-cpu-threads: 8",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    assert yaml_config.ngram_match_min == 4
+    assert yaml_config.ngram_draft_size == 9
+    assert yaml_config.moe_cpu_offload_layers == 16
+    assert yaml_config.moe_cpu_threads == 8
+
+    invalid_key = tmp_path / "invalid-ngram-key.yaml"
+    invalid_key.write_text(
+        f"model-directory: {tmp_path / 'model'}\nngram-draft-size: 9\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown configuration key: ngram-draft-size"):
+        cli.parse_config(["--config", str(invalid_key)])
+
+
 def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path) -> None:
     model = tmp_path / "Qwen3.8-27B"
     capture = tmp_path / "capture.jsonl"

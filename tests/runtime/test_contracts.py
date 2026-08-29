@@ -93,6 +93,10 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
     assert q8.chat_template is None
     assert q8.sysmem_kv_cache_mb == 0
     assert q8.sysmem_recurrent_cache_mb == 4096
+    assert q8.ngram_match_min == 0
+    assert q8.ngram_draft_size == 4
+    assert q8.moe_cpu_offload_layers == 0
+    assert q8.moe_cpu_threads is None
     selected = ExLlamaV3LoadConfig("/m", 256, device_ids=(0, 2), tp_output_device=2)
     assert selected.device_ids == (0, 2)
 
@@ -150,6 +154,30 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
         ExLlamaV3LoadConfig("/m", 256, sysmem_recurrent_cache_mb=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="sysmem_recurrent_cache_mb"):
         ExLlamaV3LoadConfig("/m", 256, sysmem_recurrent_cache_mb=0)
+    with pytest.raises(TypeError, match="ngram_match_min"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_match_min=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ngram_match_min"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_match_min=-1)
+    with pytest.raises(TypeError, match="ngram_draft_size"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_draft_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ngram_draft_size"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_draft_size=0)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_match_min=2, mtp_enabled=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_match_min=2, draft_model_directory="/draft")
+    with pytest.raises(ValueError, match="not supported with n-gram"):
+        ExLlamaV3LoadConfig("/m", 256, ngram_match_min=2, dynamic_draft_tokens=True)
+    with pytest.raises(TypeError, match="moe_cpu_offload_layers"):
+        ExLlamaV3LoadConfig("/m", 256, moe_cpu_offload_layers=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="moe_cpu_offload_layers"):
+        ExLlamaV3LoadConfig("/m", 256, moe_cpu_offload_layers=-1)
+    with pytest.raises(TypeError, match="moe_cpu_threads"):
+        ExLlamaV3LoadConfig("/m", 256, moe_cpu_threads=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="moe_cpu_threads"):
+        ExLlamaV3LoadConfig("/m", 256, moe_cpu_threads=0)
+    with pytest.raises(ValueError, match="layer-split"):
+        ExLlamaV3LoadConfig("/m", 256, moe_cpu_offload_layers=4, tensor_parallel=True)
     with pytest.raises(ValueError, match="must not be empty"):
         ExLlamaV3LoadConfig("/m", 256, device_ids=())
     with pytest.raises(ValueError, match="non-negative"):

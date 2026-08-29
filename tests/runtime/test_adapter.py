@@ -252,6 +252,7 @@ def _backend(
         "cache_calls": [],
         "cache_objects": [],
         "model_from_config_calls": [],
+        "model_infer_params_at_from_config": [],
         "load_order": load_order,
     }
 
@@ -274,6 +275,7 @@ def _backend(
                 config_dict=config_dict,
                 model_classes=model_classes,
                 max_position_embeddings=max_position_embeddings,
+                infer_params=SimpleNamespace(moe_cpu_offload=0, moe_cpu_threads=None),
                 rope_settings=SimpleNamespace(
                     max_position_embeddings=rope_max_position_embeddings,
                 ),
@@ -289,6 +291,15 @@ def _backend(
         @staticmethod
         def from_config(config: object, *, component: str = "text") -> _FakeModel:
             state["model_from_config_calls"].append(component)
+            infer_params = getattr(config, "infer_params", None)
+            state["model_infer_params_at_from_config"].append(
+                (
+                    getattr(config, "directory", None),
+                    component,
+                    None if infer_params is None else getattr(infer_params, "moe_cpu_offload", None),
+                    None if infer_params is None else getattr(infer_params, "moe_cpu_threads", None),
+                )
+            )
             if component == "mtp":
                 state["mtp_config"] = config
                 return mtp_model
@@ -673,6 +684,74 @@ def test_mtp_load_builds_draft_component_cache_history_and_lazy_generator(
     asyncio.run(scenario())
     assert state["model"].unload_calls == 1
     assert state["mtp_model"].unload_calls == 1
+
+
+def test_ngram_drafting_builds_generator_without_draft_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=4096,
+            max_batch_size=2,
+            max_chunk_size=512,
+            ngram_match_min=3,
+            ngram_draft_size=7,
+            sysmem_kv_cache_mb=2048,
+            sysmem_recurrent_cache_mb=1024,
+        )
+    )
+
+    state = backend._state
+    assert state["model_from_config_calls"] == ["text"]
+    assert len(state["cache_calls"]) == 1
+    assert "generator" not in state
+
+    async def scenario() -> None:
+        runtime.submit(RuntimeGenerationRequest("req", (1, 2, 3), 4))
+        generator = state["generator"]
+        assert generator.args[:3] == (state["model"], state["cache_objects"][0], state["tokenizer"])
+        assert generator.args[3:6] == (2, 512, 8)
+        assert generator.args[6] is None
+        assert generator.args[7] is None
+        assert generator.args[8] == 7
+        assert generator.kwargs["ngram_match_min"] == 3
+        assert generator.kwargs["cpu_cache_size"] == 2048 * 1024**2
+        assert generator.kwargs["recurrent_cache_size"] == 1024 * 1024**2
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_load_applies_main_moe_cpu_settings_before_model_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            moe_cpu_offload_layers=12,
+            moe_cpu_threads=6,
+        )
+    )
+
+    state = backend._state
+    assert state["model_infer_params_at_from_config"] == [
+        ("/models/qwen", "text", 12, 6),
+    ]
+    model_config = state["model_config"]
+    assert model_config.infer_params.moe_cpu_offload == 12
+    assert model_config.infer_params.moe_cpu_threads == 6
 
 
 def test_mtp_fp16_draft_cache_omits_quantization_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:

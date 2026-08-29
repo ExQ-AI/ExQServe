@@ -139,6 +139,10 @@ class ExLlamaV3LoadConfig:
     vision_cache_mb: int = 256
     sysmem_kv_cache_mb: int = 0
     sysmem_recurrent_cache_mb: int = 4096
+    ngram_match_min: int = 0
+    ngram_draft_size: int = 4
+    moe_cpu_offload_layers: int = 0
+    moe_cpu_threads: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_directory, str):
@@ -240,6 +244,25 @@ class ExLlamaV3LoadConfig:
             raise TypeError("sysmem_recurrent_cache_mb must be an integer")
         if self.sysmem_recurrent_cache_mb <= 0:
             raise ValueError("sysmem_recurrent_cache_mb must be positive")
+        if not isinstance(self.ngram_match_min, int) or isinstance(self.ngram_match_min, bool):
+            raise TypeError("ngram_match_min must be an integer")
+        if self.ngram_match_min < 0:
+            raise ValueError("ngram_match_min must be non-negative")
+        if not isinstance(self.ngram_draft_size, int) or isinstance(self.ngram_draft_size, bool):
+            raise TypeError("ngram_draft_size must be an integer")
+        if self.ngram_draft_size <= 0:
+            raise ValueError("ngram_draft_size must be positive")
+        if not isinstance(self.moe_cpu_offload_layers, int) or isinstance(
+            self.moe_cpu_offload_layers, bool
+        ):
+            raise TypeError("moe_cpu_offload_layers must be an integer")
+        if self.moe_cpu_offload_layers < 0:
+            raise ValueError("moe_cpu_offload_layers must be non-negative")
+        if self.moe_cpu_threads is not None:
+            if not isinstance(self.moe_cpu_threads, int) or isinstance(self.moe_cpu_threads, bool):
+                raise TypeError("moe_cpu_threads must be an integer or None")
+            if self.moe_cpu_threads <= 0:
+                raise ValueError("moe_cpu_threads must be positive or None")
         if self.draft_model_directory is not None:
             if not isinstance(self.draft_model_directory, str):
                 raise TypeError("draft_model_directory must be a string or None")
@@ -249,8 +272,14 @@ class ExLlamaV3LoadConfig:
             object.__setattr__(self, "draft_model_directory", normalized_draft)
         if self.mtp_enabled and self.draft_model_directory is not None:
             raise ValueError("mtp_enabled and draft_model_directory are mutually exclusive")
+        if self.ngram_match_min and (self.mtp_enabled or self.draft_model_directory is not None):
+            raise ValueError("n-gram drafting cannot be combined with MTP or an external draft model")
+        if self.ngram_match_min and self.dynamic_draft_tokens:
+            raise ValueError("dynamic_draft_tokens is not supported with n-gram drafting")
         if self.dynamic_draft_tokens and not (self.mtp_enabled or self.draft_model_directory is not None):
             raise ValueError("dynamic_draft_tokens requires MTP or an external draft model")
+        if self.moe_cpu_offload_layers and self.tensor_parallel:
+            raise ValueError("moe_cpu_offload_layers requires layer-split mode, not tensor parallel")
         if not isinstance(self.draft_tokens, int) or isinstance(self.draft_tokens, bool):
             raise TypeError("draft_tokens must be an integer")
         if self.draft_tokens <= 0:
