@@ -31,6 +31,7 @@ class _ActiveResponse:
     response: dict[str, object]
     session: CancellableResponseSession
     retain: bool
+    terminal_response: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -166,6 +167,7 @@ class InMemoryResponseLifecycleStore:
             self._purge_expired_locked(now)
             active = self._active.pop(response_id, None)
             if active is not None:
+                active.terminal_response = copy.deepcopy(response)
                 if active.retain:
                     self._retain_locked(response, now)
                 return
@@ -223,6 +225,9 @@ class InMemoryResponseLifecycleStore:
                 self._active.pop(response_id, None)
                 if retain:
                     self._retain_locked(cancelled, self._clock())
+                return cancelled
+            if active.terminal_response is not None:
+                return copy.deepcopy(active.terminal_response)
         return cancelled
 
     async def stats(self) -> ResponseLifecycleStats:

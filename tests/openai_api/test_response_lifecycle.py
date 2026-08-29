@@ -39,6 +39,18 @@ class _Session:
         self.cancel_calls += 1
 
 
+class _DelayedCancelSession(_Session):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_started = asyncio.Event()
+        self.release_cancel = asyncio.Event()
+
+    async def cancel(self) -> None:
+        self.cancel_calls += 1
+        self.cancel_started.set()
+        await self.release_cancel.wait()
+
+
 class _BlockingSession:
     def __init__(self, request_id: str) -> None:
         self._request_id = request_id
@@ -158,6 +170,29 @@ def test_lifecycle_cancel_isolated_and_retained_when_requested() -> None:
 
         await store.abandon("resp_b")
         assert (await store.stats()).active == 0
+
+    asyncio.run(scenario())
+
+
+def test_lifecycle_cancel_returns_completed_when_finish_wins_during_cancel() -> None:
+    async def scenario() -> None:
+        store = InMemoryResponseLifecycleStore()
+        session = _DelayedCancelSession()
+        initial = _initial("resp_race")
+        await store.register_active(initial, session, retain=True)
+
+        cancel_task = asyncio.create_task(store.cancel("resp_race"))
+        await session.cancel_started.wait()
+        completed = dict(initial)
+        completed["status"] = "completed"
+        await store.finish("resp_race", completed)
+        session.release_cancel.set()
+
+        cancelled = await cancel_task
+        assert cancelled["status"] == "completed"
+        retrieved = await store.retrieve("resp_race")
+        assert retrieved is not None
+        assert retrieved["status"] == "completed"
 
     asyncio.run(scenario())
 

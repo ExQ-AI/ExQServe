@@ -687,6 +687,7 @@ class _ResponseState:
             "summary": [],
             "content": [{"type": "reasoning_text", "text": text}],
         }
+        self.reasoning = None
         return state
 
     def finish_message(self, text: str) -> _OutputState:

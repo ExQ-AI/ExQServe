@@ -95,6 +95,42 @@ def test_responses_stream_is_item_native_and_sequence_numbers_are_strictly_incre
     }
 
 
+def test_responses_preserves_distinct_reasoning_blocks_across_text() -> None:
+    events = [
+        GenerationStarted("req"),
+        ReasoningStarted("req"),
+        ReasoningDelta("req", "think1"),
+        ReasoningCompleted("req", "think1"),
+        TextStarted("req"),
+        TextDelta("req", "answer"),
+        TextCompleted("req", "answer"),
+        ReasoningStarted("req"),
+        ReasoningDelta("req", "think2"),
+        ReasoningCompleted("req", "think2"),
+        GenerationCompleted("req", CompletionReason.STOP, _usage()),
+    ]
+
+    serializer = ResponsesStreamSerializer("qwen", response_id="resp_reason_stream", created_at=1)
+    wire = [item for event in events for item in serializer.feed(event)]
+    added = [item for item in wire if item["type"] == "response.output_item.added"]
+    assert [item["item"]["type"] for item in added] == ["reasoning", "message", "reasoning"]  # type: ignore[index]
+    assert [item["output_index"] for item in added] == [0, 1, 2]
+    reasoning_added = [item for item in added if item["item"]["type"] == "reasoning"]  # type: ignore[index]
+    assert reasoning_added[0]["item"]["id"] != reasoning_added[1]["item"]["id"]  # type: ignore[index]
+    stream_output = wire[-1]["response"]["output"]  # type: ignore[index]
+    assert stream_output[0]["content"][0]["text"] == "think1"
+    assert stream_output[2]["content"][0]["text"] == "think2"
+
+    accumulator = ResponsesAccumulator("qwen", response_id="resp_reason_nonstream", created_at=1)
+    for event in events:
+        accumulator.consume(event)
+    output = accumulator.result()["output"]
+    assert [item["type"] for item in output] == ["reasoning", "message", "reasoning"]
+    assert output[0]["content"][0]["text"] == "think1"
+    assert output[2]["content"][0]["text"] == "think2"
+    assert output[0]["id"] != output[2]["id"]
+
+
 def test_responses_preserves_distinct_text_blocks_around_tool_calls() -> None:
     call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
     events = [

@@ -189,6 +189,25 @@ def test_assistant_text_items_merge_across_tool_call_block_order() -> None:
     ]
 
 
+def test_whitespace_only_assistant_fragment_does_not_block_retry_reasoning() -> None:
+    compiler = QwenPromptCompiler(_FakeTemplateAdapter())
+    prepared = compiler.prepare(
+        _request(
+            MessageItem(MessageRole.USER, "inspect"),
+            ReasoningItem("first reasoning"),
+            MessageItem(MessageRole.ASSISTANT, "\n\n"),
+            ReasoningItem("retry reasoning"),
+        ),
+        ReasoningPolicy(),
+        _policy(),
+    )
+
+    assistant = prepared.messages[1]
+    assert assistant.role == "assistant"
+    assert assistant.content == ""
+    assert assistant.reasoning_content == "first reasoningretry reasoning"
+
+
 def test_unknown_tool_result_and_ambiguous_assistant_order_are_rejected() -> None:
     compiler = QwenPromptCompiler(_FakeTemplateAdapter())
 

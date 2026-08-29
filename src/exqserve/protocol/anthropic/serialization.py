@@ -114,6 +114,7 @@ class AnthropicMessageAccumulator:
             index = self._ensure_reasoning()
             if not self._omit_thinking:
                 self._content[index]["thinking"] = event.text
+            self._reasoning_index = None
         elif isinstance(event, TextStarted):
             self._ensure_text()
         elif isinstance(event, TextDelta):
@@ -122,6 +123,7 @@ class AnthropicMessageAccumulator:
         elif isinstance(event, TextCompleted):
             index = self._ensure_text()
             self._content[index]["text"] = event.text
+            self._text_index = None
         elif isinstance(event, ToolCallStarted):
             new_block_index = len(self._content)
             self._tool_blocks[event.index] = new_block_index

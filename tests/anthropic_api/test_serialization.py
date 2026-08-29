@@ -82,6 +82,56 @@ def test_nonstream_accumulator_builds_anthropic_content_and_usage() -> None:
     }
 
 
+def test_nonstream_accumulator_preserves_repeated_text_and_reasoning_blocks() -> None:
+    call = ToolCallItem("toolu_1", "lookup", '{"id":1}', 0)
+    events = (
+        TextStarted("req_1"),
+        TextDelta("req_1", "before"),
+        TextCompleted("req_1", "before"),
+        ToolCallStarted("req_1", "toolu_1", "lookup", 0),
+        ToolCallArgumentsDelta("req_1", "toolu_1", '{"id":1}', 0),
+        ToolCallCompleted("req_1", call),
+        TextStarted("req_1"),
+        TextDelta("req_1", "after"),
+        TextCompleted("req_1", "after"),
+        ReasoningStarted("req_1"),
+        ReasoningDelta("req_1", "think1"),
+        ReasoningCompleted("req_1", "think1"),
+        TextStarted("req_1"),
+        TextDelta("req_1", "middle"),
+        TextCompleted("req_1", "middle"),
+        ReasoningStarted("req_1"),
+        ReasoningDelta("req_1", "think2"),
+        ReasoningCompleted("req_1", "think2"),
+        GenerationCompleted("req_1", CompletionReason.STOP),
+    )
+    accumulator = AnthropicMessageAccumulator("local-qwen", message_id="msg_segments")
+    for event in events:
+        accumulator.consume(event)
+
+    content = accumulator.result()["content"]
+    assert content[0] == {"type": "text", "text": "before"}
+    assert content[1] == {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"id": 1}}
+    assert content[2] == {"type": "text", "text": "after"}
+    assert content[3]["type"] == "thinking"
+    assert content[3]["thinking"] == "think1"
+    assert content[4] == {"type": "text", "text": "middle"}
+    assert content[5]["type"] == "thinking"
+    assert content[5]["thinking"] == "think2"
+
+    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_segments_stream")
+    payloads = [payload for event in events for payload in serializer.feed(event)]
+    starts = [payload for name, payload in payloads if name == "content_block_start"]
+    assert [payload["content_block"]["type"] for payload in starts] == [  # type: ignore[index]
+        "text",
+        "tool_use",
+        "text",
+        "thinking",
+        "text",
+        "thinking",
+    ]
+
+
 def test_stream_serializer_emits_anthropic_event_flow_and_tool_json_delta() -> None:
     serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_stream")
     payloads: list[tuple[str, dict[str, object]]] = []

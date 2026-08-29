@@ -270,8 +270,12 @@ class QwenPromptCompiler(HFTemplatePromptCompiler):
                 continue
 
             if isinstance(item, ReasoningItem):
-                if assistant_text is not None or assistant_calls:
+                if assistant_calls:
                     raise ValueError("assistant reasoning must precede assistant text and tool calls")
+                if assistant_text is not None:
+                    if assistant_text.strip():
+                        raise ValueError("assistant reasoning must precede assistant text and tool calls")
+                    assistant_text = None
                 reasoning_parts.append(item.text)
                 continue
 
