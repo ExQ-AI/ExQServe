@@ -173,7 +173,9 @@ class ControlledSession:
         if text == "":
             raise ValueError("text must not be empty")
         if not self._injection_allowed:
-            raise RequestInjectionConflict("Text injection is unavailable for structured-output requests.")
+            raise RequestInjectionConflict(
+                "Text injection is unavailable while a generation constraint is active."
+            )
         if self._iteration_terminal or self._cancel_called or self._released:
             raise RequestInjectionConflict("The requested generation is already terminating.")
         try:
@@ -381,7 +383,9 @@ class RequestController:
                 controlled = ControlledSession(
                     runtime_session,
                     request_id=request.request_id,
-                    injection_allowed=request.output_json_schema is None,
+                    injection_allowed=(
+                        request.output_json_schema is None and request.generation_constraint is None
+                    ),
                     timeout_seconds=self._config.timeout_seconds,
                     release=self._release,
                 )

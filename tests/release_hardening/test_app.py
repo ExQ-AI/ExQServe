@@ -9,6 +9,7 @@ import httpx
 
 from exqserve.core.sampling import SamplingOverride, SamplingOverridePolicy
 from exqserve.core.usage import TokenUsage
+from exqserve.model.contracts import ToolConstraintMode
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
@@ -317,6 +318,65 @@ def test_composition_selects_qwen_dialect_and_generic_fallback_from_runtime_arch
         )
         assert qwen_response.status_code == 200
         assert len(qwen_runtime.submit_calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_composition_requires_constraint_provider_only_when_mode_is_enabled(tmp_path: Path) -> None:
+    generic_runtime = _FakeRuntime()
+    generic_runtime.model_metadata = RuntimeModelMetadata(131072, "LlamaForCausalLM")
+
+    compose_server(ServerConfig(tmp_path), runtime=generic_runtime)
+
+    try:
+        compose_server(
+            ServerConfig(tmp_path, tool_constraint_mode=ToolConstraintMode.FORMAT),
+            runtime=generic_runtime,
+        )
+    except ValueError as exc:
+        assert "does not support constrained tool generation" in str(exc)
+    else:
+        raise AssertionError("unsupported dialect accepted explicit constrained generation")
+
+
+def test_qwen_composition_forwards_enabled_tool_constraint(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
+        composed = compose_server(
+            ServerConfig(
+                tmp_path,
+                served_model_id="qwen",
+                tool_constraint_mode=ToolConstraintMode.FORMAT,
+            ),
+            runtime=runtime,
+        )
+        response = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "reasoning_effort": "disabled",
+            },
+        )
+
+        assert response.status_code == 200
+        assert len(runtime.submit_calls) == 1
+        constraint = runtime.submit_calls[0].generation_constraint
+        assert constraint is not None
+        assert constraint.trigger == "<tool_call>"
+        assert '"<function=lookup>"' in constraint.lark_grammar
 
     asyncio.run(scenario())
 

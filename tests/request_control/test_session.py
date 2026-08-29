@@ -17,6 +17,7 @@ from exqserve.runtime.contracts import (
     RuntimeEvent,
     RuntimeFailed,
     RuntimeFinished,
+    RuntimeGenerationConstraint,
     RuntimeGenerationRequest,
     RuntimeInjectionUnavailable,
     RuntimeStarted,
@@ -312,9 +313,37 @@ def test_structured_output_request_rejects_midstream_injection() -> None:
         try:
             await controller.inject_text("structured", "forced")
         except RequestInjectionConflict as exc:
-            assert "structured-output" in str(exc)
+            assert "generation constraint" in str(exc)
         else:
             raise AssertionError("structured-output request accepted text injection")
+
+        await session.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_generation_constraint_request_rejects_midstream_injection() -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime(lambda request: _FakeSession(request.request_id, []))
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        request = RuntimeGenerationRequest(
+            "tool-constrained",
+            (1, 2, 3),
+            4,
+            generation_constraint=RuntimeGenerationConstraint(
+                "<tool_call>",
+                '%llguidance {}\nstart: "ok"',
+                False,
+            ),
+        )
+        session = await controller.submit(request)
+
+        try:
+            await controller.inject_text("tool-constrained", "forced")
+        except RequestInjectionConflict as exc:
+            assert "generation constraint" in str(exc)
+        else:
+            raise AssertionError("generation-constrained request accepted text injection")
 
         await session.cancel()
 

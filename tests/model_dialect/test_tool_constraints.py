@@ -149,6 +149,16 @@ def test_qwen_schema_mode_rejects_cross_property_top_level_assertions() -> None:
         qwen_parameter_schema(schema)
 
 
+def test_qwen_schema_mode_rejects_root_ref_that_changes_meaning_when_detached() -> None:
+    schema = (
+        '{"type":"object","properties":{"value":{"anyOf":['
+        '{"type":"string"},{"$ref":"#"}]}}}'
+    )
+
+    with pytest.raises(ToolConstraintUnsupported, match="target \\$defs or definitions"):
+        qwen_tool_constraint(_policy(_tool("save", schema)), ToolConstraintMode.SCHEMA)
+
+
 def test_qwen_schema_mode_rejects_required_property_without_declared_schema() -> None:
     schema = JsonSchema(
         '{"type":"object","properties":{},"required":["missing"],"additionalProperties":true}'

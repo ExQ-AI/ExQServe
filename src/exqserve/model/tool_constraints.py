@@ -125,11 +125,8 @@ def _validate_detached_refs(value: JsonValue) -> None:
                 raise ToolConstraintUnsupported(
                     "$dynamicRef is not supported in detached Qwen property schemas"
                 )
-            if (
-                key == "$ref"
-                and isinstance(child, str)
-                and child != "#"
-                and not child.startswith(("#/$defs/", "#/definitions/"))
+            if key == "$ref" and isinstance(child, str) and not child.startswith(
+                ("#/$defs/", "#/definitions/")
             ):
                 raise ToolConstraintUnsupported(
                     "Qwen constrained property refs must target $defs or definitions"
