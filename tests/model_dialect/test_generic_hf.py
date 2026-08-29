@@ -6,9 +6,22 @@ from exqserve.agent.reasoning import ReasoningMode, ReasoningPolicy
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.events import TextCompleted, TextDelta, TextStarted
-from exqserve.core.items import MessageItem, MessageRole, ReasoningItem, ToolCallItem
+from exqserve.core.items import (
+    ImageContentPart,
+    MessageItem,
+    MessageRole,
+    MultimodalMessageItem,
+    ReasoningItem,
+    TextContentPart,
+    ToolCallItem,
+)
 from exqserve.core.request import CanonicalRequest
-from exqserve.model.contracts import RenderedPrompt, TemplateRequest
+from exqserve.model.contracts import (
+    RenderedPrompt,
+    TemplateImagePart,
+    TemplateRequest,
+    TemplateTextPart,
+)
 from exqserve.model.generic_hf import (
     GENERIC_HF_CAPABILITIES,
     GenericHFIncrementalParser,
@@ -45,7 +58,7 @@ def test_generic_capabilities_are_conservative() -> None:
     assert GENERIC_HF_CAPABILITIES.reasoning is False
     assert GENERIC_HF_CAPABILITIES.tool_calling is False
     assert GENERIC_HF_CAPABILITIES.parallel_tool_calls is False
-    assert GENERIC_HF_CAPABILITIES.vision is False
+    assert GENERIC_HF_CAPABILITIES.vision is True
 
 
 def test_generic_compiler_merges_leading_instructions_and_preserves_text_history() -> None:
@@ -78,6 +91,40 @@ def test_generic_compiler_merges_leading_instructions_and_preserves_text_history
     assert adapter.requests == [compiled.template_request]
 
 
+def test_generic_compiler_preserves_multimodal_user_history() -> None:
+    compiler = GenericHFPromptCompiler(_FakeTemplateAdapter())
+
+    prepared = compiler.prepare(
+        _request(
+            MessageItem(MessageRole.SYSTEM, "system"),
+            MultimodalMessageItem(
+                MessageRole.USER,
+                (
+                    TextContentPart("before"),
+                    ImageContentPart("data:image/png;base64,AA==", "high"),
+                    TextContentPart("after"),
+                ),
+            ),
+            MessageItem(MessageRole.ASSISTANT, "seen"),
+            MessageItem(MessageRole.USER, "continue"),
+        ),
+        ReasoningPolicy(),
+        _policy(),
+    )
+
+    assert len(prepared.messages) == 4
+    assert prepared.messages[0].role == "system"
+    assert prepared.messages[0].content == "system"
+    assert prepared.messages[1].role == "user"
+    assert prepared.messages[1].content == (
+        TemplateTextPart("before"),
+        TemplateImagePart("data:image/png;base64,AA==", "high"),
+        TemplateTextPart("after"),
+    )
+    assert (prepared.messages[2].role, prepared.messages[2].content) == ("assistant", "seen")
+    assert (prepared.messages[3].role, prepared.messages[3].content) == ("user", "continue")
+
+
 def test_generic_compiler_rejects_non_leading_instructions() -> None:
     compiler = GenericHFPromptCompiler(_FakeTemplateAdapter())
     with pytest.raises(ValueError, match="beginning"):
@@ -108,7 +155,7 @@ def test_generic_compiler_rejects_reasoning_tools_and_agent_history() -> None:
             _policy(_tool()),
         )
 
-    with pytest.raises(TypeError, match="text message history only"):
+    with pytest.raises(TypeError, match="text/multimodal message history only"):
         compiler.prepare(
             _request(
                 MessageItem(MessageRole.USER, "hello"),
@@ -118,7 +165,7 @@ def test_generic_compiler_rejects_reasoning_tools_and_agent_history() -> None:
             _policy(),
         )
 
-    with pytest.raises(TypeError, match="text message history only"):
+    with pytest.raises(TypeError, match="text/multimodal message history only"):
         compiler.prepare(
             _request(
                 MessageItem(MessageRole.USER, "hello"),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import http.client
 import importlib
 import io
@@ -32,6 +33,7 @@ from exqserve.runtime.contracts import (
     RuntimeFailed,
     RuntimeFinished,
     RuntimeGenerationRequest,
+    RuntimeInjectionUnavailable,
     RuntimeModelMetadata,
     RuntimeRenderedPrompt,
     RuntimeSamplingConfig,
@@ -40,12 +42,107 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
     RuntimeTiming,
 )
+from exqserve.runtime.vision_cache import VisionEmbeddingCache, VisionEmbeddingCacheStats
 
 logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class _VisionAttachment:
     embedding: object
+
+
+def _image_placeholder(text_codec: object) -> str:
+    hf_tokenizer = getattr(text_codec, "hf_tokenizer", None)
+    placeholder = getattr(hf_tokenizer, "image_token", None)
+    if isinstance(placeholder, str) and placeholder:
+        return placeholder
+    special_tokens_map = getattr(hf_tokenizer, "special_tokens_map", None)
+    if isinstance(special_tokens_map, Mapping):
+        placeholder = special_tokens_map.get("image_token")
+        if isinstance(placeholder, str) and placeholder:
+            return placeholder
+
+    config = getattr(text_codec, "config", None)
+    placeholder_id = getattr(config, "image_token_id", None)
+    id_to_piece = getattr(text_codec, "id_to_piece", None)
+    if (
+        isinstance(placeholder_id, int)
+        and isinstance(id_to_piece, list)
+        and 0 <= placeholder_id < len(id_to_piece)
+    ):
+        placeholder = id_to_piece[placeholder_id]
+        if isinstance(placeholder, str) and placeholder:
+            return placeholder
+    raise ValueError("backend tokenizer does not expose an image placeholder token")
+
+
+def _regular_embedding_wrapper(text_codec: object, embedding: object) -> tuple[str, str]:
+    token_list = getattr(embedding, "token_list", None)
+    id_to_piece = getattr(text_codec, "id_to_piece", None)
+    if not isinstance(token_list, list) or not isinstance(id_to_piece, list):
+        return "", ""
+
+    vocab_size = len(id_to_piece)
+    prefix_ids: list[int] = []
+    for token_id in token_list:
+        if not isinstance(token_id, int) or not 0 <= token_id < vocab_size:
+            break
+        prefix_ids.append(token_id)
+
+    suffix_ids: list[int] = []
+    for token_id in reversed(token_list[len(prefix_ids) :]):
+        if not isinstance(token_id, int) or not 0 <= token_id < vocab_size:
+            break
+        suffix_ids.append(token_id)
+    suffix_ids.reverse()
+
+    prefix = "".join(id_to_piece[token_id] for token_id in prefix_ids)
+    suffix = "".join(id_to_piece[token_id] for token_id in suffix_ids)
+    return prefix, suffix
+
+
+def _rendered_with_embedding_aliases(
+    text_codec: object,
+    rendered_text: str,
+    embeddings: list[object],
+) -> str:
+    placeholder = _image_placeholder(text_codec)
+    if rendered_text.count(placeholder) != len(embeddings):
+        raise ValueError(
+            f"HF chat template rendered {rendered_text.count(placeholder)} image placeholders but got "
+            f"{len(embeddings)} embedding(s)"
+        )
+
+    parts: list[str] = []
+    cursor = 0
+    for embedding in embeddings:
+        alias = getattr(embedding, "text_alias", None)
+        if not isinstance(alias, str) or not alias:
+            raise TypeError("backend image embedding must expose a non-empty text_alias")
+        placeholder_at = rendered_text.find(placeholder, cursor)
+        if placeholder_at < 0:
+            raise ValueError("HF chat template image placeholder ordering is inconsistent")
+
+        replace_start = placeholder_at
+        replace_end = placeholder_at + len(placeholder)
+        prefix, suffix = _regular_embedding_wrapper(text_codec, embedding)
+        if prefix and suffix:
+            prefix_at = placeholder_at - len(prefix)
+            suffix_end = replace_end + len(suffix)
+            if (
+                prefix_at >= cursor
+                and rendered_text[prefix_at:placeholder_at] == prefix
+                and rendered_text[replace_end:suffix_end] == suffix
+            ):
+                replace_start = prefix_at
+                replace_end = suffix_end
+
+        parts.append(rendered_text[cursor:replace_start])
+        parts.append(alias)
+        cursor = replace_end
+
+    parts.append(rendered_text[cursor:])
+    return "".join(parts)
 
 
 def _image_sources(messages: list[dict[str, object]]) -> tuple[str, ...]:
@@ -252,22 +349,26 @@ def _remote_image_bytes(source: str, max_bytes: int) -> bytes:
         return data
 
 
-def _load_image_source(source: str, *, allow_remote: bool, max_bytes: int) -> object:
+def _load_image_bytes(source: str, *, allow_remote: bool, max_bytes: int) -> bytes:
     if source.startswith("data:"):
-        data = _data_url_bytes(source, max_bytes)
-    else:
-        parsed = urllib.parse.urlsplit(source)
-        if parsed.scheme.lower() not in {"http", "https"}:
-            raise ValueError("image source must be a data URL or an explicitly enabled HTTP(S) URL")
-        if not allow_remote:
-            raise ValueError("remote HTTP(S) image fetching is disabled")
-        try:
-            data = _remote_image_bytes(source, max_bytes)
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError("remote image could not be fetched") from exc
+        return _data_url_bytes(source, max_bytes)
 
+    parsed = urllib.parse.urlsplit(source)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("image source must be a data URL or an explicitly enabled HTTP(S) URL")
+    if not allow_remote:
+        raise ValueError("remote HTTP(S) image fetching is disabled")
+    try:
+        return _remote_image_bytes(source, max_bytes)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("remote image could not be fetched") from exc
+
+
+def _decode_image_bytes(data: bytes) -> object:
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
     try:
         from PIL import Image
 
@@ -276,6 +377,12 @@ def _load_image_source(source: str, *, allow_remote: bool, max_bytes: int) -> ob
             return image.convert("RGB")
     except Exception as exc:
         raise ValueError("image payload could not be decoded") from exc
+
+
+def _load_image_source(source: str, *, allow_remote: bool, max_bytes: int) -> object:
+    return _decode_image_bytes(
+        _load_image_bytes(source, allow_remote=allow_remote, max_bytes=max_bytes)
+    )
 
 
 def _measured_non_negative_int(value: object) -> int | None:
@@ -424,6 +531,9 @@ class _BackendJob(Protocol):
     def __aiter__(self) -> AsyncIterator[Mapping[str, object]]:
         ...
 
+    def constrain_output_now(self, output: str) -> None:
+        ...
+
     async def cancel(self) -> None:
         ...
 
@@ -450,6 +560,22 @@ class RuntimeSession:
 
     def __aiter__(self) -> RuntimeSession:
         return self
+
+    def inject_text(self, text: str) -> None:
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        if text == "":
+            raise ValueError("text must not be empty")
+        backend_job = getattr(self._job, "job", None)
+        backend_generator = getattr(self._job, "generator", None)
+        if (
+            self._terminal
+            or self._cancel_requested
+            or getattr(backend_job, "is_finished", False) is True
+            or getattr(backend_generator, "error", None) is not None
+        ):
+            raise RuntimeInjectionUnavailable("generation is no longer active")
+        self._job.constrain_output_now(text)
 
     async def cancel(self) -> None:
         if self._terminal or self._cancel_requested:
@@ -657,6 +783,21 @@ def _backend_context_limit(config: object) -> int | None:
     rope_limit = _positive_int_attr(rope_settings, "max_position_embeddings")
     if rope_limit is not None:
         return rope_limit
+
+    # ExLlamaV3 1.4.4 exposes the generic 8192-token fallback for a small set
+    # of multimodal wrappers whose real text limit lives under text_config.
+    # Prefer source metadata only for these verified nested-config shapes.
+    architecture = _backend_architecture(config)
+    config_dict = getattr(config, "config_dict", None)
+    normalized_architecture = architecture.lower() if architecture is not None else ""
+    nested_text_architecture = normalized_architecture.startswith(("gemma4", "museglimmer"))
+    if nested_text_architecture and isinstance(config_dict, Mapping):
+        text_config = config_dict.get("text_config")
+        if isinstance(text_config, Mapping):
+            nested_limit = text_config.get("max_position_embeddings")
+            if isinstance(nested_limit, int) and not isinstance(nested_limit, bool) and nested_limit > 0:
+                return nested_limit
+
     return _positive_int_attr(config, "max_position_embeddings")
 
 
@@ -666,6 +807,16 @@ def _backend_architecture(config: object) -> str | None:
         return None
     normalized = raw.strip()
     return normalized or None
+
+
+def _backend_component_available(config: object, component: str) -> bool | None:
+    model_classes = getattr(config, "model_classes", None)
+    if model_classes is None:
+        return None
+    try:
+        return component in model_classes
+    except TypeError:
+        return None
 
 
 def _draft_history_size(draft_model: object, configured_size: int) -> int:
@@ -823,6 +974,7 @@ class ExLlamaV3Runtime:
         self._model: Any | None = None
         self._cache: Any | None = None
         self._vision_model: Any | None = None
+        self._vision_cache: VisionEmbeddingCache | None = None
         self._draft_model: Any | None = None
         self._draft_cache: Any | None = None
         self._loras: list[Any] = []
@@ -833,6 +985,11 @@ class ExLlamaV3Runtime:
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
         return self._model_metadata
+
+    @property
+    def vision_cache_stats(self) -> VisionEmbeddingCacheStats | None:
+        cache = self._vision_cache
+        return None if cache is None else cache.stats()
 
     @property
     def is_ready(self) -> bool:
@@ -883,6 +1040,11 @@ class ExLlamaV3Runtime:
         if draft_enabled:
             if self._draft_model is None or self._draft_cache is None:
                 raise RuntimeError("ExLlamaV3 draft runtime is not ready")
+            dynamic_draft = config.dynamic_draft_tokens
+            generator_options = {
+                "dynamic_draft_tokens": dynamic_draft,
+                "draft_confidence": config.draft_confidence,
+            }
             # Supported ExLlamaV3 Generator contract keeps draft construction positional through
             # the draft-token count: model, cache, tokenizer, batch/chunk limits, queue size,
             # draft model, draft cache, draft-token count.
@@ -896,6 +1058,7 @@ class ExLlamaV3Runtime:
                 self._draft_model,
                 self._draft_cache,
                 config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
+                **generator_options,
             )
         else:
             self._generator = backend.AsyncGenerator(
@@ -933,7 +1096,18 @@ class ExLlamaV3Runtime:
             text_codec = backend.Tokenizer.from_config(backend_config)
             model = backend.Model.from_config(backend_config)
             if config.vision_enabled:
-                vision_model = backend.Model.from_config(backend_config, component="vision")
+                if _backend_component_available(backend_config, "vision") is False:
+                    raise RuntimeError(
+                        "Vision was requested, but the selected model/backend does not expose "
+                        "a supported vision component"
+                    )
+                try:
+                    vision_model = backend.Model.from_config(backend_config, component="vision")
+                except AssertionError as exc:
+                    raise RuntimeError(
+                        "Vision was requested, but the selected model/backend does not expose "
+                        "a supported vision component"
+                    ) from exc
             if config.mtp_enabled:
                 draft_model = backend.Model.from_config(backend_config, component="mtp")
             elif config.draft_model_directory is not None:
@@ -1044,6 +1218,7 @@ class ExLlamaV3Runtime:
             self._model = None
             self._cache = None
             self._vision_model = None
+            self._vision_cache = None
             self._draft_model = None
             self._draft_cache = None
             self._loras = []
@@ -1057,6 +1232,11 @@ class ExLlamaV3Runtime:
         self._model = model
         self._cache = cache_object
         self._vision_model = vision_model
+        self._vision_cache = (
+            VisionEmbeddingCache(config.vision_cache_mb * 1024 * 1024)
+            if vision_model is not None
+            else None
+        )
         self._draft_model = draft_model
         self._draft_cache = draft_cache_object
         self._loras = loras
@@ -1100,6 +1280,9 @@ class ExLlamaV3Runtime:
             raise TypeError("add_generation_prompt must be a bool")
 
         kwargs = dict(template_kwargs)
+        config = self._load_config
+        if config is not None and config.chat_template is not None:
+            kwargs["chat_template"] = config.chat_template
         if tools is not None:
             kwargs["tools"] = tools
         rendered_text = text_codec.hf_render_chat_template(
@@ -1113,23 +1296,31 @@ class ExLlamaV3Runtime:
         sources = _image_sources(messages)
         attachments: tuple[object, ...] = ()
         if sources:
-            config = self._load_config
             vision_model = self._vision_model
             if config is None or not config.vision_enabled or vision_model is None:
                 raise ValueError("vision input requires a vision-enabled runtime")
             embeddings: list[object] = []
             for source in sources:
-                image = _load_image_source(
+                data = _load_image_bytes(
                     source,
                     allow_remote=config.allow_remote_images,
                     max_bytes=config.max_image_bytes,
                 )
-                embeddings.append(vision_model.get_image_embeddings(tokenizer=text_codec, image=image))
-            encoded = text_codec.hf_chat_template(
-                messages,
-                add_generation_prompt=add_generation_prompt,
+                cache_key = hashlib.sha256(data).hexdigest()
+                embedding = None if self._vision_cache is None else self._vision_cache.get(cache_key)
+                if embedding is None:
+                    image = _decode_image_bytes(data)
+                    embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
+                    if self._vision_cache is not None:
+                        self._vision_cache.put(cache_key, embedding)
+                embeddings.append(embedding)
+            encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
+            encoded = text_codec.encode(
+                encoded_text,
+                add_bos=False,
+                add_eos=False,
+                encode_special_tokens=True,
                 embeddings=embeddings,
-                **kwargs,
             )
             attachments = tuple(_VisionAttachment(embedding) for embedding in embeddings)
         else:
@@ -1221,6 +1412,9 @@ class ExLlamaV3Runtime:
         self._model = None
         self._cache = None
         self._vision_model = None
+        if self._vision_cache is not None:
+            self._vision_cache.clear()
+        self._vision_cache = None
         self._draft_model = None
         self._draft_cache = None
         self._loras = []

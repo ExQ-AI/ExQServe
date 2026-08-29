@@ -33,8 +33,6 @@ from exqserve.core.items import (
 )
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
-    ChatTemplateAdapter,
-    CompiledPrompt,
     ModelCapabilities,
     TemplateImagePart,
     TemplateMessage,
@@ -43,6 +41,7 @@ from exqserve.model.contracts import (
     TemplateTool,
     TemplateToolCall,
 )
+from exqserve.model.hf_template import HFTemplatePromptCompiler
 
 QWEN38_CAPABILITIES = ModelCapabilities(
     reasoning=True,
@@ -55,15 +54,6 @@ QWEN38_CAPABILITIES = ModelCapabilities(
 )
 
 _QWEN_STOP_CONDITIONS = ("<|im_end|>",)
-
-
-def _prompt_hash(input_ids: tuple[int, ...]) -> str:
-    digest = hashlib.sha256()
-    for token_id in input_ids:
-        encoded = str(token_id).encode("ascii")
-        digest.update(len(encoded).to_bytes(4, "big"))
-        digest.update(encoded)
-    return digest.hexdigest()
 
 
 def _reasoning_kwargs(
@@ -111,11 +101,9 @@ def _exposed_tools(policy: ToolPolicy) -> tuple[TemplateTool, ...]:
     )
 
 
-class QwenPromptCompiler:
+class QwenPromptCompiler(HFTemplatePromptCompiler):
     capabilities = QWEN38_CAPABILITIES
-
-    def __init__(self, template_adapter: ChatTemplateAdapter) -> None:
-        self._template_adapter = template_adapter
+    stop_conditions = _QWEN_STOP_CONDITIONS
 
     def prepare(
         self,
@@ -266,30 +254,25 @@ class QwenPromptCompiler:
             ),
         )
 
-    def compile(
+    def _raw_output_is_text_only(
         self,
-        request: CanonicalRequest,
+        template_request: TemplateRequest,
         reasoning: ReasoningPolicy,
         tool_policy: ToolPolicy,
-    ) -> CompiledPrompt:
-        template_request = self.prepare(request, reasoning, tool_policy)
-        rendered = self._template_adapter.render_and_tokenize(template_request)
-        return CompiledPrompt(
-            text=rendered.text,
-            input_ids=rendered.input_ids,
-            prompt_hash=_prompt_hash(rendered.input_ids),
-            stop_conditions=_QWEN_STOP_CONDITIONS,
-            template_request=template_request,
-            runtime_attachments=rendered.runtime_attachments,
-            raw_output_is_text_only=(
-                reasoning.mode is ReasoningMode.DISABLED and not template_request.tools
-            ),
-            structured_output_trigger=(
-                "</think>"
-                if reasoning.mode is not ReasoningMode.DISABLED and not template_request.tools
-                else None
-            ),
-        )
+    ) -> bool:
+        del tool_policy
+        return reasoning.mode is ReasoningMode.DISABLED and not template_request.tools
+
+    def _structured_output_trigger(
+        self,
+        template_request: TemplateRequest,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> str | None:
+        del tool_policy
+        if reasoning.mode is not ReasoningMode.DISABLED and not template_request.tools:
+            return "</think>"
+        return None
 
 
 @dataclass(frozen=True, slots=True)

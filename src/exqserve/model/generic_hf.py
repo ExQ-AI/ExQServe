@@ -1,22 +1,28 @@
-"""Conservative text-only fallback for unrecognized HF-style chat templates."""
+"""Conservative text/image fallback for unrecognized HF-style chat templates."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 
 from exqserve.agent.reasoning import ReasoningMode, ReasoningPolicy
 from exqserve.agent.tools import ToolChoiceMode, ToolPolicy
 from exqserve.core.events import GenerationEvent, TextCompleted, TextDelta, TextStarted
-from exqserve.core.items import MessageItem, MessageRole
+from exqserve.core.items import (
+    ImageContentPart,
+    MessageItem,
+    MessageRole,
+    MultimodalMessageItem,
+    TextContentPart,
+)
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
-    ChatTemplateAdapter,
-    CompiledPrompt,
     ModelCapabilities,
+    TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
+    TemplateTextPart,
 )
+from exqserve.model.hf_template import HFTemplatePromptCompiler
 
 GENERIC_HF_CAPABILITIES = ModelCapabilities(
     reasoning=False,
@@ -25,26 +31,16 @@ GENERIC_HF_CAPABILITIES = ModelCapabilities(
     system_role=True,
     developer_role=False,
     reasoning_history=False,
-    vision=False,
+    # Compiler capability only: the loaded ExLlamaV3 model must still expose a
+    # vision component and the server must be started with vision enabled.
+    vision=True,
 )
 
 
-def _prompt_hash(input_ids: tuple[int, ...]) -> str:
-    digest = hashlib.sha256()
-    for token_id in input_ids:
-        encoded = str(token_id).encode("ascii")
-        digest.update(len(encoded).to_bytes(4, "big"))
-        digest.update(encoded)
-    return digest.hexdigest()
-
-
-class GenericHFPromptCompiler:
-    """Compile only portable text-chat semantics through the loaded model template."""
+class GenericHFPromptCompiler(HFTemplatePromptCompiler):
+    """Compile portable text/image chat semantics through the loaded model template."""
 
     capabilities = GENERIC_HF_CAPABILITIES
-
-    def __init__(self, template_adapter: ChatTemplateAdapter) -> None:
-        self._template_adapter = template_adapter
 
     def prepare(
         self,
@@ -81,9 +77,21 @@ class GenericHFPromptCompiler:
             messages.append(TemplateMessage("system", "\n\n".join(leading_instructions)))
 
         for item in items[position:]:
+            if isinstance(item, MultimodalMessageItem):
+                content_parts: list[TemplateTextPart | TemplateImagePart] = []
+                for part in item.parts:
+                    if isinstance(part, TextContentPart):
+                        content_parts.append(TemplateTextPart(part.text))
+                    elif isinstance(part, ImageContentPart):
+                        content_parts.append(TemplateImagePart(part.source, part.detail))
+                    else:  # pragma: no cover - canonical validation prevents this
+                        raise TypeError(f"unsupported multimodal part: {type(part).__name__}")
+                messages.append(TemplateMessage("user", tuple(content_parts)))
+                continue
+
             if not isinstance(item, MessageItem):
                 raise TypeError(
-                    "generic HF fallback supports text message history only; "
+                    "generic HF fallback supports text/multimodal message history only; "
                     f"unsupported item: {type(item).__name__}"
                 )
             if item.role in {MessageRole.SYSTEM, MessageRole.DEVELOPER}:
@@ -104,23 +112,14 @@ class GenericHFPromptCompiler:
 
         return TemplateRequest(tuple(messages), (), ())
 
-    def compile(
+    def _raw_output_is_text_only(
         self,
-        request: CanonicalRequest,
+        template_request: TemplateRequest,
         reasoning: ReasoningPolicy,
         tool_policy: ToolPolicy,
-    ) -> CompiledPrompt:
-        template_request = self.prepare(request, reasoning, tool_policy)
-        rendered = self._template_adapter.render_and_tokenize(template_request)
-        return CompiledPrompt(
-            text=rendered.text,
-            input_ids=rendered.input_ids,
-            prompt_hash=_prompt_hash(rendered.input_ids),
-            stop_conditions=(),
-            template_request=template_request,
-            runtime_attachments=rendered.runtime_attachments,
-            raw_output_is_text_only=True,
-        )
+    ) -> bool:
+        del template_request, reasoning, tool_policy
+        return True
 
 
 @dataclass(frozen=True, slots=True)

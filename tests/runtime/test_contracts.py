@@ -79,6 +79,8 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
     assert q8.mtp_enabled is False
     assert q8.mtp_draft_tokens == 4
     assert q8.mtp_cache_bits == 4
+    assert q8.dynamic_draft_tokens is False
+    assert q8.draft_confidence == 0.4
     assert q8.draft_model_directory is None
     assert q8.draft_tokens == 4
     assert q8.draft_cache_bits == 4
@@ -88,6 +90,7 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
     assert q8.qc_staging is None
     assert q8.max_requeue_tokens is None
     assert q8.device_ids is None
+    assert q8.chat_template is None
     selected = ExLlamaV3LoadConfig("/m", 256, device_ids=(0, 2), tp_output_device=2)
     assert selected.device_ids == (0, 2)
 
@@ -103,6 +106,18 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
         ExLlamaV3LoadConfig("/m", 256, mtp_draft_tokens=0)
     with pytest.raises(ValueError, match="mtp_cache_bits"):
         ExLlamaV3LoadConfig("/m", 256, mtp_cache_bits=1)
+    with pytest.raises(TypeError, match="dynamic_draft_tokens"):
+        ExLlamaV3LoadConfig("/m", 256, dynamic_draft_tokens=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="draft_confidence"):
+        ExLlamaV3LoadConfig("/m", 256, draft_confidence=0.0)
+    with pytest.raises(ValueError, match="draft_confidence"):
+        ExLlamaV3LoadConfig("/m", 256, draft_confidence=1.0)
+    with pytest.raises(ValueError, match="requires MTP"):
+        ExLlamaV3LoadConfig("/m", 256, dynamic_draft_tokens=True)
+    with pytest.raises(TypeError, match="chat_template"):
+        ExLlamaV3LoadConfig("/m", 256, chat_template=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="chat_template"):
+        ExLlamaV3LoadConfig("/m", 256, chat_template="   ")
     with pytest.raises(ValueError, match="mutually exclusive"):
         ExLlamaV3LoadConfig("/m", 256, mtp_enabled=True, draft_model_directory="/draft")
     with pytest.raises(ValueError, match="draft_tokens"):

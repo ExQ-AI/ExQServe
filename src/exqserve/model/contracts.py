@@ -94,6 +94,17 @@ class TemplateTool:
 
 
 @dataclass(frozen=True, slots=True)
+class TemplateToolResponse:
+    name: str
+    response_json: str
+
+    def __post_init__(self) -> None:
+        _validate_non_empty("name", self.name)
+        if not isinstance(self.response_json, str):
+            raise TypeError("response_json must be a string")
+
+
+@dataclass(frozen=True, slots=True)
 class TemplateTextPart:
     text: str
 
@@ -125,6 +136,7 @@ class TemplateMessage:
     content: str | tuple[TemplateContentPart, ...]
     reasoning_content: str | None = None
     tool_calls: tuple[TemplateToolCall, ...] = ()
+    tool_responses: tuple[TemplateToolResponse, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
 
@@ -149,6 +161,12 @@ class TemplateMessage:
             raise TypeError("tool_calls must be a tuple")
         if not all(isinstance(call, TemplateToolCall) for call in self.tool_calls):
             raise TypeError("tool_calls must contain only TemplateToolCall values")
+        if not isinstance(self.tool_responses, tuple):
+            raise TypeError("tool_responses must be a tuple")
+        if not all(isinstance(response, TemplateToolResponse) for response in self.tool_responses):
+            raise TypeError("tool_responses must contain only TemplateToolResponse values")
+        if self.tool_responses and self.role not in {"assistant", "tool"}:
+            raise ValueError("tool_responses are supported only for assistant/tool messages")
         for field_name in ("tool_call_id", "name"):
             value = getattr(self, field_name)
             if value is not None:

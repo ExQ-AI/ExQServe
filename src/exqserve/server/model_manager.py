@@ -46,6 +46,9 @@ class ManagedControllerLike(Protocol):
     def in_flight(self) -> int:
         ...
 
+    async def inject_text(self, request_id: str, text: str) -> None:
+        ...
+
     async def close(self) -> None:
         ...
 

@@ -58,6 +58,12 @@ class ServerConfig:
     tp_backend: str = "native"
     tp_output_device: int | None = None
     device_ids: tuple[int, ...] | None = None
+    dynamic_draft_tokens: bool = False
+    draft_confidence: float = 0.4
+    chat_template: Path | None = None
+    max_injection_body_bytes: int = 64 * 1024
+    vision_cache_mb: int = 256
+    _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_directory, Path):
@@ -66,6 +72,16 @@ class ServerConfig:
             raise TypeError("model_root must be pathlib.Path or None")
         if self.draft_model is not None and not isinstance(self.draft_model, Path):
             raise TypeError("draft_model must be pathlib.Path or None")
+        if self.chat_template is not None:
+            if not isinstance(self.chat_template, Path):
+                raise TypeError("chat_template must be pathlib.Path or None")
+            try:
+                template_text = self.chat_template.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f"chat_template could not be read: {self.chat_template}") from exc
+            if not template_text.strip():
+                raise ValueError("chat_template must not be empty")
+            object.__setattr__(self, "_chat_template_text", template_text)
         if not isinstance(self.loras, tuple) or not all(isinstance(path, Path) for path in self.loras):
             raise TypeError("loras must be a tuple of pathlib.Path values")
         if not isinstance(self.lora_scalings, tuple):
@@ -131,10 +147,19 @@ class ServerConfig:
         object.__setattr__(self, "api_keys", tuple(normalized_keys))
         if not isinstance(self.protect_metrics, bool):
             raise TypeError("protect_metrics must be a boolean")
-        for name in ("max_request_body_bytes", "response_store_max_bytes"):
+        for name in (
+            "max_request_body_bytes",
+            "response_store_max_bytes",
+            "max_injection_body_bytes",
+            "vision_cache_mb",
+        ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{name} must be an integer")
+            if name == "vision_cache_mb":
+                if value < 0:
+                    raise ValueError("vision_cache_mb must be non-negative")
+                continue
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         if not isinstance(self.response_store_ttl_seconds, int | float) or isinstance(
@@ -177,21 +202,23 @@ class ServerConfig:
         return ExLlamaV3LoadConfig(
             str(directory),
             self.cache_tokens,
-            self.cache_key_bits,
-            self.cache_value_bits,
-            self.max_batch_size,
-            self.max_chunk_size,
-            self.reserve_per_device_gb,
-            self.mtp_enabled,
-            self.mtp_draft_tokens,
-            self.mtp_cache_bits,
-            self.autosplit_no_forward,
-            self.cuda_malloc_async,
-            self.qc_staging,
-            self.max_requeue_tokens,
-            self.vision_enabled,
-            self.allow_remote_images,
-            self.max_image_bytes,
+            cache_key_bits=self.cache_key_bits,
+            cache_value_bits=self.cache_value_bits,
+            max_batch_size=self.max_batch_size,
+            max_chunk_size=self.max_chunk_size,
+            reserve_per_device_gb=self.reserve_per_device_gb,
+            mtp_enabled=self.mtp_enabled,
+            mtp_draft_tokens=self.mtp_draft_tokens,
+            mtp_cache_bits=self.mtp_cache_bits,
+            autosplit_no_forward=self.autosplit_no_forward,
+            cuda_malloc_async=self.cuda_malloc_async,
+            qc_staging=self.qc_staging,
+            max_requeue_tokens=self.max_requeue_tokens,
+            vision_enabled=self.vision_enabled,
+            allow_remote_images=self.allow_remote_images,
+            max_image_bytes=self.max_image_bytes,
+            dynamic_draft_tokens=self.dynamic_draft_tokens,
+            draft_confidence=self.draft_confidence,
             draft_model_directory=None if self.draft_model is None else str(self.draft_model),
             draft_tokens=self.draft_tokens,
             draft_cache_bits=self.draft_cache_bits,
@@ -199,6 +226,8 @@ class ServerConfig:
             tp_backend=self.tp_backend,
             tp_output_device=self.tp_output_device,
             device_ids=self.device_ids,
+            chat_template=self._chat_template_text,
+            vision_cache_mb=self.vision_cache_mb,
             lora_adapters=tuple(
                 LoRAAdapterConfig(
                     str(path),

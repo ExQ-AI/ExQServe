@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 
 from exqserve.model.contracts import (
+    TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
+    TemplateTextPart,
     TemplateTool,
     TemplateToolCall,
+    TemplateToolResponse,
 )
 from exqserve.runtime.contracts import RuntimeRenderedPrompt
 from exqserve.serving.engine import RuntimeTemplateAdapter
@@ -96,6 +99,43 @@ def test_runtime_template_bridge_converts_model_contracts_without_reordering() -
     assert add_prompt is True
 
 
+def test_runtime_template_bridge_preserves_multimodal_content_order() -> None:
+    renderer = _Renderer()
+    adapter = RuntimeTemplateAdapter(renderer)
+    adapter.render_and_tokenize(
+        TemplateRequest(
+            messages=(
+                TemplateMessage(
+                    "user",
+                    (
+                        TemplateTextPart("before"),
+                        TemplateImagePart("data:image/png;base64,AA==", "low"),
+                        TemplateTextPart("after"),
+                    ),
+                ),
+            ),
+            tools=(),
+            template_kwargs=(),
+        )
+    )
+
+    messages = renderer.calls[0][0]
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {
+                    "type": "image",
+                    "image": "data:image/png;base64,AA==",
+                    "detail": "low",
+                },
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+
+
 def test_runtime_template_bridge_rejects_invalid_or_non_object_tool_json() -> None:
     adapter = RuntimeTemplateAdapter(_Renderer())
 
@@ -137,3 +177,32 @@ def test_runtime_template_bridge_does_not_leak_canonical_call_id_into_model_prom
 
     messages = renderer.calls[0][0]
     assert messages == [{"role": "tool", "content": "ok", "name": "f"}]
+
+
+def test_runtime_template_bridge_forwards_structured_tool_responses() -> None:
+    renderer = _Renderer()
+    adapter = RuntimeTemplateAdapter(renderer)
+    adapter.render_and_tokenize(
+        TemplateRequest(
+            messages=(
+                TemplateMessage(
+                    "tool",
+                    "",
+                    tool_responses=(TemplateToolResponse("lookup", '{"ok":true}'),),
+                    name="lookup",
+                ),
+            ),
+            tools=(),
+            template_kwargs=(),
+        )
+    )
+
+    messages = renderer.calls[0][0]
+    assert messages == [
+        {
+            "role": "tool",
+            "content": "",
+            "tool_responses": [{"name": "lookup", "response": {"ok": True}}],
+            "name": "lookup",
+        }
+    ]

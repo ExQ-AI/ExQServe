@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 from exqserve.core.errors import ErrorCategory
 from exqserve.runtime.contracts import (
@@ -19,6 +20,9 @@ class _FakeJob:
     def __init__(self, results: list[Mapping[str, object] | BaseException]) -> None:
         self.results = list(results)
         self.cancel_calls = 0
+        self.injected: list[str] = []
+        self.job = SimpleNamespace(is_finished=False)
+        self.generator = SimpleNamespace(error=None)
 
     def __aiter__(self) -> _FakeJob:
         return self
@@ -31,6 +35,9 @@ class _FakeJob:
             raise value
         await asyncio.sleep(0)
         return value
+
+    def constrain_output_now(self, output: str) -> None:
+        self.injected.append(output)
 
     async def cancel(self) -> None:
         self.cancel_calls += 1
@@ -222,3 +229,50 @@ def test_unexpected_backend_exhaustion_is_failure_not_silent_success() -> None:
         assert failure.error.code == "backend_ended_early"
 
     asyncio.run(scenario())
+
+
+def test_midstream_text_injection_forwards_to_active_backend_job_only() -> None:
+    async def scenario() -> None:
+        job = _FakeJob(
+            [
+                {"stage": "started", "eos": False},
+                {
+                    "stage": "streaming",
+                    "text": "done",
+                    "eos": True,
+                    "prompt_tokens": 3,
+                    "new_tokens": 1,
+                    "cached_tokens": 0,
+                },
+            ]
+        )
+        session = RuntimeSession(_request(), job)
+
+        session.inject_text("\nSTEER")
+        session.inject_text(" ")
+        assert job.injected == ["\nSTEER", " "]
+
+        await _collect(session)
+        try:
+            session.inject_text("too late")
+        except RuntimeError as exc:
+            assert "no longer active" in str(exc)
+        else:
+            raise AssertionError("terminal generation accepted text injection")
+
+    asyncio.run(scenario())
+
+
+def test_midstream_injection_rejects_backend_eos_before_consumer_reads_terminal_event() -> None:
+    job = _FakeJob([])
+    session = RuntimeSession(_request(), job)
+    job.job.is_finished = True
+
+    try:
+        session.inject_text("too late")
+    except RuntimeError as exc:
+        assert "no longer active" in str(exc)
+    else:
+        raise AssertionError("finished backend job accepted text injection")
+
+    assert job.injected == []

@@ -94,7 +94,15 @@ async def _request(app: object, method: str, path: str, **kwargs: object) -> htt
 def test_composition_loads_runtime_and_serves_health_metrics_and_chat(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = _FakeRuntime()
-        composed = compose_server(ServerConfig(tmp_path, served_model_id="local"), runtime=runtime)
+        composed = compose_server(
+            ServerConfig(
+                tmp_path,
+                served_model_id="local",
+                max_request_body_bytes=1024,
+                max_injection_body_bytes=32,
+            ),
+            runtime=runtime,
+        )
         assert len(runtime.load_calls) == 1
         assert runtime.submit_calls == []
 
@@ -111,6 +119,25 @@ def test_composition_loads_runtime_and_serves_health_metrics_and_chat(tmp_path: 
             assert models.status_code == 200
             assert models.json()["data"][0]["id"] == "local"
             assert models.json()["data"][0]["context_length"] == 32768
+
+            inactive_injection = await _request(
+                composed.app,
+                "POST",
+                "/v1/requests/not-active/inject",
+                json={"text": "steer"},
+            )
+            assert inactive_injection.status_code == 404
+            assert inactive_injection.json()["error"]["code"] == "request_not_active"
+
+            oversized_injection = await _request(
+                composed.app,
+                "POST",
+                "/v1/requests/not-active/inject",
+                content=b'{"text":"abcdefghijklmnopqrstuvwxyz0123456789"}',
+                headers={"content-type": "application/json"},
+            )
+            assert oversized_injection.status_code == 413
+            assert oversized_injection.json()["error"]["code"] == "request_body_too_large"
 
             missing = await _request(
                 composed.app,

@@ -25,6 +25,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "config": None,
     "served_model_id": None,
     "model_root": None,
+    "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,
     "cache_tokens": 32768,
@@ -34,6 +35,8 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "mtp": False,
     "mtp_draft_tokens": 4,
     "mtp_cache_bits": "4",
+    "dynamic_draft_tokens": False,
+    "draft_confidence": 0.4,
     "draft_model": None,
     "draft_tokens": 4,
     "draft_cache_bits": "4",
@@ -52,6 +55,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "vision": False,
     "allow_remote_images": False,
     "max_image_bytes": 20 * 1024 * 1024,
+    "vision_cache_mb": 256,
     "max_in_flight": 8,
     "max_prompt_tokens": None,
     "max_output_tokens": None,
@@ -62,6 +66,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "response_store_ttl_seconds": 3600.0,
     "response_store_max_bytes": 64 * 1024 * 1024,
     "max_request_body_bytes": 16 * 1024 * 1024,
+    "max_injection_body_bytes": 64 * 1024,
     "api_key": None,
     "api_key_file": None,
     "public_metrics": False,
@@ -72,6 +77,8 @@ _PARSER_DEFAULTS: dict[str, object] = {
 _BOOLEAN_CONFIG_KEYS = frozenset(
     {
         "mtp",
+        "dynamic-draft",
+        "dynamic-draft-tokens",
         "autosplit-no-forward",
         "tensor-parallel",
         "cuda-malloc-async",
@@ -84,6 +91,7 @@ _PATH_CONFIG_KEYS = frozenset(
     {
         "model-directory",
         "model-root",
+        "chat-template",
         "draft-model",
         "sampler-preset",
         "api-key-file",
@@ -126,6 +134,11 @@ def _build_parser(
         type=Path,
         help="Discover switchable models as immediate children of this directory.",
     )
+    parser.add_argument(
+        "--chat-template",
+        type=Path,
+        help="Override the model's Hugging Face chat template with a UTF-8 Jinja template file.",
+    )
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--cache-tokens", type=int)
@@ -146,6 +159,18 @@ def _build_parser(
         "--mtp-cache-bits",
         choices=("fp16", "2", "3", "4", "5", "6", "7", "8"),
         help="MTP draft-cache precision; fp16 disables draft-cache quantization.",
+    )
+    parser.add_argument(
+        "--dynamic-draft",
+        "--dynamic-draft-tokens",
+        dest="dynamic_draft_tokens",
+        action=argparse.BooleanOptionalAction,
+        help="Enable ExLlamaV3 confidence-calibrated dynamic draft sizing.",
+    )
+    parser.add_argument(
+        "--draft-confidence",
+        type=float,
+        help="Target acceptance probability for ExLlamaV3 dynamic draft sizing.",
     )
     parser.add_argument(
         "--draft-model",
@@ -242,6 +267,11 @@ def _build_parser(
         type=int,
         help="Maximum encoded image payload size accepted per image.",
     )
+    parser.add_argument(
+        "--vision-cache-mb",
+        type=int,
+        help="CPU tensor budget for cached vision embeddings in MiB; 0 disables the cache.",
+    )
     parser.add_argument("--max-in-flight", type=int)
     parser.add_argument("--max-prompt-tokens", type=int)
     parser.add_argument("--max-output-tokens", type=int)
@@ -252,6 +282,11 @@ def _build_parser(
     parser.add_argument("--response-store-ttl-seconds", type=float)
     parser.add_argument("--response-store-max-bytes", type=int)
     parser.add_argument("--max-request-body-bytes", type=int)
+    parser.add_argument(
+        "--max-injection-body-bytes",
+        type=int,
+        help="Maximum JSON body size for active-generation text injection.",
+    )
     parser.add_argument(
         "--api-key",
         action="append",
@@ -503,6 +538,11 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.tp_backend,
         args.tp_output_device,
         device_ids,
+        args.dynamic_draft_tokens,
+        args.draft_confidence,
+        args.chat_template,
+        args.max_injection_body_bytes,
+        args.vision_cache_mb,
     )
 
 

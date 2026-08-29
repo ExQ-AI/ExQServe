@@ -39,6 +39,7 @@ from exqserve.model.contracts import (
     TemplateTextPart,
     TemplateTool,
     TemplateToolCall,
+    TemplateToolResponse,
 )
 from exqserve.runtime.contracts import (
     RuntimeEvent,
@@ -85,6 +86,14 @@ def _tool_call_dict(call: TemplateToolCall) -> dict[str, object]:
     return {"type": "function", "function": {"name": call.name, "arguments": arguments}}
 
 
+def _tool_response_dict(response: TemplateToolResponse) -> dict[str, object]:
+    try:
+        value = parse_json_strict(response.response_json)
+    except InvalidJsonError as exc:
+        raise ValueError("tool-response payload must contain strict JSON") from exc
+    return {"name": response.name, "response": value}
+
+
 def _message_dict(message: TemplateMessage) -> dict[str, object]:
     content: object
     if isinstance(message.content, tuple):
@@ -108,6 +117,10 @@ def _message_dict(message: TemplateMessage) -> dict[str, object]:
         result["reasoning_content"] = message.reasoning_content
     if message.tool_calls:
         result["tool_calls"] = [_tool_call_dict(call) for call in message.tool_calls]
+    if message.tool_responses:
+        result["tool_responses"] = [
+            _tool_response_dict(response) for response in message.tool_responses
+        ]
     if message.name is not None:
         result["name"] = message.name
     return result

@@ -34,6 +34,7 @@ from exqserve.runtime.contracts import (
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime
 from exqserve.server.admin import create_admin_router
 from exqserve.server.config import ServerConfig
+from exqserve.server.injection import create_injection_router
 from exqserve.server.model_manager import (
     ActiveModelBundle,
     ManagedRawServingEngine,
@@ -273,6 +274,12 @@ def compose_server(
     )
     app.include_router(
         create_admin_router(model_manager, max_request_body_bytes=config.max_request_body_bytes)
+    )
+    app.include_router(
+        create_injection_router(
+            lambda: model_manager.current_controller if model_manager.is_ready else None,
+            max_injection_body_bytes=config.max_injection_body_bytes,
+        )
     )
     app.include_router(create_metrics_router(metrics))
     app.add_middleware(

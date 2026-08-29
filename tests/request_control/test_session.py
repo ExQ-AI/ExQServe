@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 from exqserve.control.request import (
     RequestControlConfig,
     RequestController,
+    RequestInjectionConflict,
+    RequestInjectionNotFound,
     RequestTerminalReason,
 )
 from exqserve.core.errors import CanonicalError, ErrorCategory
@@ -16,6 +18,7 @@ from exqserve.runtime.contracts import (
     RuntimeFailed,
     RuntimeFinished,
     RuntimeGenerationRequest,
+    RuntimeInjectionUnavailable,
     RuntimeStarted,
     RuntimeStopReason,
     RuntimeTiming,
@@ -27,6 +30,7 @@ class _FakeSession:
         self.request_id = request_id
         self.events = list(events)
         self.cancel_calls = 0
+        self.injected: list[str] = []
         self._cancelled = False
 
     def __aiter__(self) -> AsyncIterator[RuntimeEvent]:
@@ -40,6 +44,9 @@ class _FakeSession:
             self._cancelled = False
             return RuntimeCancelled(self.request_id)
         raise StopAsyncIteration
+
+    def inject_text(self, text: str) -> None:
+        self.injected.append(text)
 
     async def cancel(self) -> None:
         self.cancel_calls += 1
@@ -238,5 +245,77 @@ def test_external_consumer_task_cancel_cancels_backend_before_releasing_capacity
         assert blocking.cancel_calls == 1
         assert controller.in_flight == 0
         assert session.terminal_reason is RequestTerminalReason.CLIENT_CANCELLED
+
+    asyncio.run(scenario())
+
+
+def test_controller_routes_injection_by_active_request_id_and_forgets_completed_sessions() -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime(
+            lambda request: _FakeSession(
+                request.request_id,
+                [RuntimeStarted(request.request_id), _finished(request.request_id)],
+            )
+        )
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        session = await controller.submit(_request("steerable"))
+
+        await controller.inject_text("steerable", "\nNEW DIRECTION")
+        assert runtime.sessions[0].injected == ["\nNEW DIRECTION"]
+
+        assert [event async for event in session][-1] == _finished("steerable")
+        try:
+            await controller.inject_text("steerable", "too late")
+        except RequestInjectionNotFound:
+            pass
+        else:
+            raise AssertionError("completed request remained injectable")
+
+    asyncio.run(scenario())
+
+
+def test_runtime_injection_unavailable_maps_to_request_conflict() -> None:
+    async def scenario() -> None:
+        class _UnavailableSession(_FakeSession):
+            def inject_text(self, text: str) -> None:
+                del text
+                raise RuntimeInjectionUnavailable("backend job already finished")
+
+        runtime = _FakeRuntime(lambda request: _UnavailableSession(request.request_id, []))
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        session = await controller.submit(_request("ending"))
+
+        try:
+            await controller.inject_text("ending", "forced")
+        except RequestInjectionConflict as exc:
+            assert "terminating" in str(exc)
+        else:
+            raise AssertionError("runtime terminal state was not mapped to an injection conflict")
+
+        await session.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_structured_output_request_rejects_midstream_injection() -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime(lambda request: _FakeSession(request.request_id, []))
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        request = RuntimeGenerationRequest(
+            "structured",
+            (1, 2, 3),
+            4,
+            output_json_schema='{"type":"object"}',
+        )
+        session = await controller.submit(request)
+
+        try:
+            await controller.inject_text("structured", "forced")
+        except RequestInjectionConflict as exc:
+            assert "structured-output" in str(exc)
+        else:
+            raise AssertionError("structured-output request accepted text injection")
+
+        await session.cancel()
 
     asyncio.run(scenario())

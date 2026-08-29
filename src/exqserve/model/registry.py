@@ -12,12 +12,25 @@ from exqserve.model.contracts import (
     ModelCapabilities,
     PromptCompilerLike,
 )
+from exqserve.model.gemma4 import GEMMA4_CAPABILITIES, Gemma4IncrementalParser, Gemma4PromptCompiler
 from exqserve.model.generic_hf import (
     GENERIC_HF_CAPABILITIES,
     GenericHFIncrementalParser,
     GenericHFPromptCompiler,
 )
+from exqserve.model.muse_glimmer import (
+    MUSE_GLIMMER_CAPABILITIES,
+    MuseGlimmerIncrementalParser,
+    MuseGlimmerPromptCompiler,
+)
 from exqserve.model.qwen import QWEN38_CAPABILITIES, QwenIncrementalParser, QwenPromptCompiler
+
+_MUSE_GLIMMER_ARCHITECTURES = frozenset(
+    {
+        "museglimmerforconditionalgeneration",
+        "muse_glimmer_for_conditional_generation",
+    }
+)
 
 
 class ModelDialect(Protocol):
@@ -62,6 +75,51 @@ class QwenDialect:
             request_id,
             start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Gemma4Dialect:
+    dialect_id: str = "gemma4"
+    capabilities: ModelCapabilities = GEMMA4_CAPABILITIES
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        normalized = architecture.replace(".", "_").lower()
+        return normalized.startswith("gemma4")
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> Gemma4PromptCompiler:
+        return Gemma4PromptCompiler(template_adapter)
+
+    def create_parser(self, request_id: str, reasoning: ReasoningPolicy) -> Gemma4IncrementalParser:
+        return Gemma4IncrementalParser(
+            request_id,
+            start_in_reasoning=reasoning.mode is ReasoningMode.ENABLED,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MuseGlimmerDialect:
+    dialect_id: str = "muse-glimmer"
+    capabilities: ModelCapabilities = MUSE_GLIMMER_CAPABILITIES
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        normalized = architecture.replace(".", "_").lower()
+        return normalized in _MUSE_GLIMMER_ARCHITECTURES
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> MuseGlimmerPromptCompiler:
+        return MuseGlimmerPromptCompiler(template_adapter)
+
+    def create_parser(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+    ) -> MuseGlimmerIncrementalParser:
+        if reasoning.mode is ReasoningMode.DISABLED:
+            raise ValueError("Muse Glimmer does not support disabling reasoning; use low effort instead")
+        return MuseGlimmerIncrementalParser(request_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,4 +169,7 @@ class ModelDialectRegistry:
 
 
 def default_model_dialect_registry() -> ModelDialectRegistry:
-    return ModelDialectRegistry((QwenDialect(),), GenericHFDialect())
+    return ModelDialectRegistry(
+        (QwenDialect(), Gemma4Dialect(), MuseGlimmerDialect()),
+        GenericHFDialect(),
+    )

@@ -101,10 +101,23 @@ class BearerAuthMiddleware:
 
         path = str(scope.get("path", ""))
         bearer_matches = _matches_any(_bearer_token(authorization), self._api_keys)
-        if path == "/v1/messages" or path.startswith("/v1/messages/"):
+        anthropic_path = path == "/v1/messages" or path.startswith("/v1/messages/")
+        path_parts = path.split("/")
+        injection_path = (
+            len(path_parts) == 5
+            and path_parts[1:3] == ["v1", "requests"]
+            and bool(path_parts[3])
+            and path_parts[4] == "inject"
+        )
+        if anthropic_path:
             api_key_matches = _matches_any(x_api_key, self._api_keys)
             if not (bearer_matches or api_key_matches):
                 await _anthropic_unauthorized()(scope, receive, send)
+                return
+        elif injection_path:
+            api_key_matches = _matches_any(x_api_key, self._api_keys)
+            if not (bearer_matches or api_key_matches):
+                await _unauthorized()(scope, receive, send)
                 return
         elif not bearer_matches:
             await _unauthorized()(scope, receive, send)

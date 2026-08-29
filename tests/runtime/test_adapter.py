@@ -29,11 +29,32 @@ class _FakeTensor:
         return self.values
 
 
+class _FakeEmbeddingTensor:
+    def __init__(self, numel: int = 16, element_size: int = 2, device_type: str = "cpu") -> None:
+        self._numel = numel
+        self._element_size = element_size
+        self.device = SimpleNamespace(type=device_type)
+
+    def numel(self) -> int:
+        return self._numel
+
+    def element_size(self) -> int:
+        return self._element_size
+
+
 class _FakeTokenizer:
     def __init__(self) -> None:
         self.render_calls: list[tuple[list[dict[str, object]], bool, dict[str, object]]] = []
         self.encode_calls: list[tuple[str, bool, bool, bool]] = []
         self.multimodal_calls: list[tuple[list[dict[str, object]], bool, list[object], dict[str, object]]] = []
+        self.multimodal_encode_calls: list[tuple[str, list[object]]] = []
+        self.rendered_text = "rendered prompt"
+        self.hf_tokenizer = SimpleNamespace(
+            image_token="<|image|>",
+            special_tokens_map={"image_token": "<|image|>"},
+        )
+        self.id_to_piece = ["<zero>", "<one>", "<|image_start|>", "<|image_end|>"]
+        self.config = SimpleNamespace(image_token_id=None)
 
     def hf_render_chat_template(
         self,
@@ -42,7 +63,7 @@ class _FakeTokenizer:
         **kwargs: object,
     ) -> str:
         self.render_calls.append((messages, add_generation_prompt, dict(kwargs)))
-        return "rendered prompt"
+        return self.rendered_text
 
     def hf_chat_template(
         self,
@@ -62,8 +83,12 @@ class _FakeTokenizer:
         add_bos: bool,
         add_eos: bool,
         encode_special_tokens: bool,
+        embeddings: list[object] | None = None,
     ) -> _FakeTensor:
         self.encode_calls.append((text, add_bos, add_eos, encode_special_tokens))
+        if embeddings is not None:
+            self.multimodal_encode_calls.append((text, embeddings))
+            return _FakeTensor([[10, 11, 12, 13]])
         if text == "</think>":
             return _FakeTensor([[248069]])
         return _FakeTensor([[1, 2, 3]])
@@ -86,7 +111,15 @@ class _FakeModel:
 
     def get_image_embeddings(self, tokenizer: object, image: object) -> object:
         self.image_embedding_calls.append((tokenizer, image))
-        return (self.label, "embedding", len(self.image_embedding_calls))
+        index = len(self.image_embedding_calls)
+        return SimpleNamespace(
+            label=self.label,
+            index=index,
+            text_alias=f"<$EMB_{index}$>",
+            token_list=[2, 1_000_000_000 + index, 3],
+            embeddings=_FakeEmbeddingTensor(),
+            deepstack_embeddings=[],
+        )
 
     def load(self, **kwargs: object) -> None:
         self.load_calls.append(dict(kwargs))
@@ -198,6 +231,8 @@ def _backend(
     max_position_embeddings: object = 8192,
     rope_max_position_embeddings: object = 131072,
     architecture: object = "Qwen3_5ForConditionalGeneration",
+    text_max_position_embeddings: object = None,
+    supports_vision: bool = True,
 ) -> SimpleNamespace:
     tokenizer = _FakeTokenizer()
     load_order: list[str] = []
@@ -223,9 +258,19 @@ def _backend(
         def from_directory(directory: str) -> object:
             state["directory"] = directory
             state["config_directories"].append(directory)
+            config_dict: dict[str, object] = {}
+            if text_max_position_embeddings is not None:
+                config_dict["text_config"] = {
+                    "max_position_embeddings": text_max_position_embeddings,
+                }
+            model_classes = {"text": object, "mtp": object}
+            if supports_vision:
+                model_classes["vision"] = object
             return SimpleNamespace(
                 directory=directory,
                 architecture=architecture,
+                config_dict=config_dict,
+                model_classes=model_classes,
                 max_position_embeddings=max_position_embeddings,
                 rope_settings=SimpleNamespace(
                     max_position_embeddings=rope_max_position_embeddings,
@@ -332,6 +377,58 @@ def test_load_uses_official_q8_cache_and_normal_autosplit_arguments(monkeypatch:
     assert runtime.model_metadata.max_context_tokens == 131072
     assert runtime.model_metadata.architecture == "Qwen3_5ForConditionalGeneration"
     assert "autosplit_no_forward" not in state["model"].load_calls[0]
+
+
+def test_load_prefers_nested_gemma4_context_limit_over_backend_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(
+        max_position_embeddings=8192,
+        rope_max_position_embeddings=None,
+        architecture="Gemma4ForConditionalGeneration",
+        text_max_position_embeddings=262144,
+    )
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/gemma4",
+            cache_tokens=4096,
+            max_batch_size=1,
+        )
+    )
+
+    assert runtime.model_metadata.max_context_tokens == 262144
+    assert runtime.model_metadata.architecture == "Gemma4ForConditionalGeneration"
+
+
+def test_load_prefers_nested_muse_glimmer_context_limit_over_backend_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(
+        max_position_embeddings=8192,
+        rope_max_position_embeddings=None,
+        architecture="MuseGlimmerForConditionalGeneration",
+        text_max_position_embeddings=131072,
+    )
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/muse-glimmer",
+            cache_tokens=4096,
+            max_batch_size=1,
+        )
+    )
+
+    assert runtime.model_metadata.max_context_tokens == 131072
+    assert runtime.model_metadata.architecture == "MuseGlimmerForConditionalGeneration"
 
 
 def test_tensor_parallel_arguments_reach_target_model_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -523,6 +620,8 @@ def test_mtp_load_builds_draft_component_cache_history_and_lazy_generator(
         mtp_enabled=True,
         mtp_draft_tokens=2,
         mtp_cache_bits=4,
+        dynamic_draft_tokens=True,
+        draft_confidence=0.55,
     )
 
     runtime.load(config)
@@ -561,6 +660,8 @@ def test_mtp_load_builds_draft_component_cache_history_and_lazy_generator(
         assert generator.args[6] is state["mtp_model"]
         assert generator.args[7] is state["cache_objects"][1]
         assert generator.args[8] == 2
+        assert generator.kwargs["dynamic_draft_tokens"] is True
+        assert generator.kwargs["draft_confidence"] == 0.55
         await runtime.close()
 
     asyncio.run(scenario())
@@ -813,6 +914,38 @@ def test_render_chat_template_renders_once_then_encodes_special_tokens(
     assert tokenizer.encode_calls == [("rendered prompt", False, False, True)]
 
 
+def test_render_chat_template_forwards_operator_override_to_hf_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            chat_template="CUSTOM {{ messages }}",
+        )
+    )
+    messages = [{"role": "user", "content": "hello"}]
+
+    runtime.render_chat_template(messages, None, {"enable_thinking": False})
+
+    tokenizer = backend._state["tokenizer"]
+    assert tokenizer.render_calls == [
+        (
+            messages,
+            True,
+            {
+                "enable_thinking": False,
+                "chat_template": "CUSTOM {{ messages }}",
+            },
+        )
+    ]
+
+
 def test_tokenize_text_is_raw_document_encoding_with_bos(monkeypatch: pytest.MonkeyPatch) -> None:
     from exqserve.runtime import exllamav3 as module
 
@@ -829,6 +962,73 @@ def test_tokenize_text_is_raw_document_encoding_with_bos(monkeypatch: pytest.Mon
     assert tokenizer.encode_calls == [("raw document", True, False, True)]
 
 
+def test_text_only_load_does_not_probe_vision_when_backend_lacks_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=False)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+
+    runtime.load(ExLlamaV3LoadConfig("/models/text", cache_tokens=1024))
+
+    assert runtime.is_ready is True
+    assert backend._state["model_from_config_calls"] == ["text"]
+    assert backend._state["vision_model"].load_calls == []
+    assert runtime.vision_cache_stats is None
+
+
+def test_vision_load_fails_clearly_when_backend_lacks_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=False)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Vision was requested, but the selected model/backend does not expose a supported vision component",
+    ):
+        runtime.load(
+            ExLlamaV3LoadConfig(
+                "/models/text",
+                cache_tokens=1024,
+                vision_enabled=True,
+            )
+        )
+
+    assert runtime.is_ready is False
+    assert backend._state["model_from_config_calls"] == ["text"]
+    assert backend._state["vision_model"].load_calls == []
+    assert runtime.vision_cache_stats is None
+
+
+def test_vision_render_rejects_image_when_runtime_vision_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/text", cache_tokens=1024))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "data:image/png;base64,AA=="},
+                {"type": "text", "text": "describe"},
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="vision-enabled runtime"):
+        runtime.render_chat_template(messages, None, {})
+
+
 def test_vision_render_builds_embeddings_and_submit_forwards_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -839,12 +1039,18 @@ def test_vision_render_builds_embeddings_and_submit_forwards_them(
     monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
     monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
     loaded_sources: list[tuple[str, bool, int]] = []
+    decoded_images: list[bytes] = []
 
-    def load_image(source: str, *, allow_remote: bool, max_bytes: int) -> object:
+    def load_image_bytes(source: str, *, allow_remote: bool, max_bytes: int) -> bytes:
         loaded_sources.append((source, allow_remote, max_bytes))
-        return ("decoded-image", source)
+        return source.encode("utf-8")
 
-    monkeypatch.setattr(module, "_load_image_source", load_image)
+    def decode_image(data: bytes) -> object:
+        decoded_images.append(data)
+        return ("decoded-image", data.decode("utf-8"))
+
+    monkeypatch.setattr(module, "_load_image_bytes", load_image_bytes)
+    monkeypatch.setattr(module, "_decode_image_bytes", decode_image)
     runtime = ExLlamaV3Runtime()
     runtime.load(
         ExLlamaV3LoadConfig(
@@ -864,24 +1070,23 @@ def test_vision_render_builds_embeddings_and_submit_forwards_them(
         }
     ]
 
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "before <|image|> after"
     rendered = runtime.render_chat_template(messages, None, {"enable_thinking": False})
 
     assert rendered.input_ids == (10, 11, 12, 13)
     assert len(rendered.runtime_attachments) == 1
     assert loaded_sources == [("data:image/png;base64,AA==", False, 1234)]
+    assert decoded_images == [b"data:image/png;base64,AA=="]
     vision_model = backend._state["vision_model"]
-    tokenizer = backend._state["tokenizer"]
     assert vision_model.image_embedding_calls == [
         (tokenizer, ("decoded-image", "data:image/png;base64,AA=="))
     ]
-    assert tokenizer.multimodal_calls == [
-        (
-            messages,
-            True,
-            [("vision", "embedding", 1)],
-            {"enable_thinking": False},
-        )
-    ]
+    assert tokenizer.multimodal_calls == []
+    assert len(tokenizer.multimodal_encode_calls) == 1
+    encoded_text, embeddings = tokenizer.multimodal_encode_calls[0]
+    assert encoded_text == "before <$EMB_1$> after"
+    assert len(embeddings) == 1
 
     async def scenario() -> None:
         runtime.submit(
@@ -895,7 +1100,277 @@ def test_vision_render_builds_embeddings_and_submit_forwards_them(
 
     asyncio.run(scenario())
     _, _, _, kwargs = _FakeAsyncJob.calls[-1]
-    assert kwargs["embeddings"] == [("vision", "embedding", 1)]
+    assert kwargs["embeddings"] == embeddings
+
+
+def test_vision_cache_reuses_embedding_across_requests_and_skips_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    decoded: list[bytes] = []
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+
+    def decode_image(data: bytes) -> object:
+        decoded.append(data)
+        return ("decoded-image", data.decode("utf-8"))
+
+    monkeypatch.setattr(module, "_decode_image_bytes", decode_image)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "before <|image|> after"
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image", "image": "image-a"}],
+        }
+    ]
+
+    runtime.render_chat_template(messages, None, {})
+    runtime.render_chat_template(messages, None, {})
+
+    vision_model = backend._state["vision_model"]
+    assert len(vision_model.image_embedding_calls) == 1
+    assert decoded == [b"image-a"]
+    first_embeddings = tokenizer.multimodal_encode_calls[0][1]
+    second_embeddings = tokenizer.multimodal_encode_calls[1][1]
+    assert first_embeddings[0] is second_embeddings[0]
+    stats = runtime.vision_cache_stats
+    assert stats is not None
+    assert (stats.queries, stats.hits, stats.misses, stats.entries) == (2, 1, 1, 1)
+    assert stats.retained_tensor_bytes == 32
+
+
+def test_vision_cache_reuses_same_embedding_for_a_b_a_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data.decode("utf-8")))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "<|image|> then <|image|> then <|image|>"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "image-a"},
+                {"type": "image", "image": "image-b"},
+                {"type": "image", "image": "image-a"},
+            ],
+        }
+    ]
+
+    runtime.render_chat_template(messages, None, {})
+
+    vision_model = backend._state["vision_model"]
+    assert len(vision_model.image_embedding_calls) == 2
+    encoded_text, embeddings = tokenizer.multimodal_encode_calls[0]
+    assert encoded_text == "<$EMB_1$> then <$EMB_2$> then <$EMB_1$>"
+    assert embeddings[0] is embeddings[2]
+    assert embeddings[0] is not embeddings[1]
+    stats = runtime.vision_cache_stats
+    assert stats is not None
+    assert (stats.queries, stats.hits, stats.misses, stats.entries) == (3, 1, 2, 2)
+
+
+def test_vision_cache_key_uses_media_bytes_not_source_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    payloads = iter((b"first", b"second"))
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: next(payloads))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "<|image|>"
+    messages = [{"role": "user", "content": [{"type": "image", "image": "same-url"}]}]
+
+    runtime.render_chat_template(messages, None, {})
+    runtime.render_chat_template(messages, None, {})
+
+    vision_model = backend._state["vision_model"]
+    assert len(vision_model.image_embedding_calls) == 2
+    stats = runtime.vision_cache_stats
+    assert stats is not None
+    assert (stats.hits, stats.misses, stats.entries) == (0, 2, 2)
+
+
+def test_vision_cache_zero_budget_disables_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=0,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "<|image|>"
+    messages = [{"role": "user", "content": [{"type": "image", "image": "image-a"}]}]
+
+    runtime.render_chat_template(messages, None, {})
+    runtime.render_chat_template(messages, None, {})
+
+    assert len(backend._state["vision_model"].image_embedding_calls) == 2
+    stats = runtime.vision_cache_stats
+    assert stats is not None
+    assert stats.entries == 0
+    assert (stats.queries, stats.hits, stats.misses) == (2, 0, 2)
+
+
+def test_vision_cache_is_released_on_runtime_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "<|image|>"
+    runtime.render_chat_template(
+        [{"role": "user", "content": [{"type": "image", "image": "image-a"}]}],
+        None,
+        {},
+    )
+    stats = runtime.vision_cache_stats
+    assert stats is not None and stats.entries == 1
+
+    asyncio.run(runtime.close())
+
+    assert runtime.vision_cache_stats is None
+    assert backend._state["vision_model"].unload_calls == 1
+
+
+def test_vision_render_removes_template_wrapper_already_owned_by_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data.decode("utf-8")))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.id_to_piece = ["<zero>", "<one>", "<|vision_start|>", "<|vision_end|>"]
+    tokenizer.rendered_text = "Picture 1: <|vision_start|><|image|><|vision_end|> describe"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "image-a"},
+                {"type": "text", "text": "describe"},
+            ],
+        }
+    ]
+
+    rendered = runtime.render_chat_template(messages, None, {})
+
+    assert rendered.text == tokenizer.rendered_text
+    encoded_text, embeddings = tokenizer.multimodal_encode_calls[0]
+    assert encoded_text == "Picture 1: <$EMB_1$> describe"
+    assert "<|vision_start|>" not in encoded_text
+    assert "<|vision_end|>" not in encoded_text
+    assert "<|image|>" not in encoded_text
+    assert len(embeddings) == 1
+
+
+def test_vision_render_removes_two_template_wrappers_in_embedding_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data.decode("utf-8")))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.id_to_piece = ["<zero>", "<one>", "<|vision_start|>", "<|vision_end|>"]
+    tokenizer.rendered_text = (
+        "A<|vision_start|><|image|><|vision_end|> between "
+        "<|vision_start|><|image|><|vision_end|>Z"
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "image-a"},
+                {"type": "text", "text": "between"},
+                {"type": "image", "image": "image-b"},
+            ],
+        }
+    ]
+
+    runtime.render_chat_template(messages, None, {})
+
+    encoded_text, embeddings = tokenizer.multimodal_encode_calls[0]
+    assert encoded_text == "A<$EMB_1$> between <$EMB_2$>Z"
+    assert [embedding.index for embedding in embeddings] == [1, 2]
+    assert "<|image|>" not in encoded_text
 
 
 def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(

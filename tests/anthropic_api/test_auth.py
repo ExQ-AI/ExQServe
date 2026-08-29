@@ -29,6 +29,10 @@ def _app() -> FastAPI:
     async def openai_route() -> dict[str, bool]:
         return {"ok": True}
 
+    @app.get("/v1/requests/req-1/inject")
+    async def injection_route() -> dict[str, bool]:
+        return {"ok": True}
+
     app.add_middleware(BearerAuthMiddleware, api_keys=("secret",), protect_metrics=True)
     return app
 
@@ -51,6 +55,24 @@ def test_anthropic_messages_accepts_x_api_key_and_bearer_but_openai_stays_bearer
 
         openai_bearer = await _request(app, "/v1/models", {"Authorization": "Bearer secret"})
         assert openai_bearer.status_code == 200
+
+        injection_key = await _request(
+            app,
+            "/v1/requests/req-1/inject",
+            {"x-api-key": "secret"},
+        )
+        assert injection_key.status_code == 200
+
+        injection_bearer = await _request(
+            app,
+            "/v1/requests/req-1/inject",
+            {"Authorization": "Bearer secret"},
+        )
+        assert injection_bearer.status_code == 200
+
+        injection_denied = await _request(app, "/v1/requests/req-1/inject")
+        assert injection_denied.status_code == 401
+        assert injection_denied.json()["error"]["code"] == "invalid_api_key"
 
     asyncio.run(scenario())
 

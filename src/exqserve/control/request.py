@@ -16,6 +16,7 @@ from exqserve.runtime.contracts import (
     RuntimeFailed,
     RuntimeFinished,
     RuntimeGenerationRequest,
+    RuntimeInjectionUnavailable,
     RuntimeSessionLike,
 )
 
@@ -72,6 +73,14 @@ class RequestRejected(Exception):
         super().__init__(error.message)
 
 
+class RequestInjectionNotFound(LookupError):
+    """Raised when no active generation owns the requested request id."""
+
+
+class RequestInjectionConflict(RuntimeError):
+    """Raised when a known generation is already terminating."""
+
+
 class RuntimeSubmitter(Protocol):
     def submit(self, request: RuntimeGenerationRequest) -> RuntimeSessionLike:
         ...
@@ -104,10 +113,20 @@ class ControlledSession:
         self,
         runtime_session: RuntimeSessionLike,
         *,
+        request_id: str,
+        injection_allowed: bool,
         timeout_seconds: float | None,
         release: _ReleaseCallback,
     ) -> None:
+        if not isinstance(request_id, str):
+            raise TypeError("request_id must be a string")
+        if not request_id.strip():
+            raise ValueError("request_id must not be empty")
+        if not isinstance(injection_allowed, bool):
+            raise TypeError("injection_allowed must be a bool")
         self._runtime_session = runtime_session
+        self._request_id = request_id
+        self._injection_allowed = injection_allowed
         self._iterator = runtime_session.__aiter__()
         self._release = release
         self._released = False
@@ -120,6 +139,10 @@ class ControlledSession:
     @property
     def terminal_reason(self) -> RequestTerminalReason | None:
         return self._terminal_reason
+
+    @property
+    def request_id(self) -> str:
+        return self._request_id
 
     def __aiter__(self) -> ControlledSession:
         return self
@@ -143,6 +166,20 @@ class ControlledSession:
             return
         self._cancel_called = True
         await self._runtime_session.cancel()
+
+    def inject_text(self, text: str) -> None:
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        if text == "":
+            raise ValueError("text must not be empty")
+        if not self._injection_allowed:
+            raise RequestInjectionConflict("Text injection is unavailable for structured-output requests.")
+        if self._iteration_terminal or self._cancel_called or self._released:
+            raise RequestInjectionConflict("The requested generation is already terminating.")
+        try:
+            self._runtime_session.inject_text(text)
+        except RuntimeInjectionUnavailable as exc:
+            raise RequestInjectionConflict("The requested generation is already terminating.") from exc
 
     async def cancel(
         self,
@@ -258,6 +295,7 @@ class RequestController:
         self._in_flight = 0
         self._closed = False
         self._sessions: set[ControlledSession] = set()
+        self._sessions_by_request_id: dict[str, ControlledSession] = {}
 
     @property
     def in_flight(self) -> int:
@@ -303,6 +341,8 @@ class RequestController:
             if session not in self._sessions:
                 return
             self._sessions.remove(session)
+            if self._sessions_by_request_id.get(session.request_id) is session:
+                del self._sessions_by_request_id[session.request_id]
             self._in_flight -= 1
             if self._in_flight < 0:  # pragma: no cover - defensive invariant
                 raise RuntimeError("request-control in-flight count became negative")
@@ -320,6 +360,13 @@ class RequestController:
                     "Server is shutting down.",
                     retryable=True,
                 )
+            if request.request_id in self._sessions_by_request_id:
+                raise _rejection(
+                    ErrorCategory.INVALID_REQUEST,
+                    "duplicate_request_id",
+                    "An active request already uses this request id.",
+                    retryable=False,
+                )
             if self._in_flight >= self._config.max_in_flight:
                 raise _rejection(
                     ErrorCategory.OVERLOADED,
@@ -333,6 +380,8 @@ class RequestController:
                 runtime_session = self._runtime.submit(request)
                 controlled = ControlledSession(
                     runtime_session,
+                    request_id=request.request_id,
+                    injection_allowed=request.output_json_schema is None,
                     timeout_seconds=self._config.timeout_seconds,
                     release=self._release,
                 )
@@ -340,7 +389,24 @@ class RequestController:
                 self._in_flight -= 1
                 raise
             self._sessions.add(controlled)
+            self._sessions_by_request_id[request.request_id] = controlled
             return controlled
+
+    async def inject_text(self, request_id: str, text: str) -> None:
+        if not isinstance(request_id, str):
+            raise TypeError("request_id must be a string")
+        if not request_id.strip():
+            raise ValueError("request_id must not be empty")
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        if text == "":
+            raise ValueError("text must not be empty")
+
+        async with self._lock:
+            session = self._sessions_by_request_id.get(request_id)
+        if session is None:
+            raise RequestInjectionNotFound(request_id)
+        session.inject_text(text)
 
     async def close(self) -> None:
         async with self._lock:

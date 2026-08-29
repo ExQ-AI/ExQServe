@@ -125,6 +125,8 @@ class ExLlamaV3LoadConfig:
     vision_enabled: bool = False
     allow_remote_images: bool = False
     max_image_bytes: int = 20 * 1024 * 1024
+    dynamic_draft_tokens: bool = False
+    draft_confidence: float = 0.4
     draft_model_directory: str | None = None
     draft_tokens: int = 4
     draft_cache_bits: int | None = 4
@@ -133,6 +135,8 @@ class ExLlamaV3LoadConfig:
     tp_backend: str = "native"
     tp_output_device: int | None = None
     device_ids: tuple[int, ...] | None = None
+    chat_template: str | None = None
+    vision_cache_mb: int = 256
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_directory, str):
@@ -195,6 +199,16 @@ class ExLlamaV3LoadConfig:
         _validate_bool("vision_enabled", self.vision_enabled)
         _validate_bool("allow_remote_images", self.allow_remote_images)
         _validate_bool("tensor_parallel", self.tensor_parallel)
+        _validate_bool("dynamic_draft_tokens", self.dynamic_draft_tokens)
+        if self.chat_template is not None:
+            if not isinstance(self.chat_template, str):
+                raise TypeError("chat_template must be a string or None")
+            if not self.chat_template.strip():
+                raise ValueError("chat_template must not be empty")
+        _validate_finite("draft_confidence", self.draft_confidence)
+        if not 0.0 < float(self.draft_confidence) < 1.0:
+            raise ValueError("draft_confidence must be in the range (0, 1)")
+        object.__setattr__(self, "draft_confidence", float(self.draft_confidence))
         if self.tp_backend not in {"native", "nccl"}:
             raise ValueError("tp_backend must be native or nccl")
         if self.tp_output_device is not None:
@@ -208,6 +222,10 @@ class ExLlamaV3LoadConfig:
             raise TypeError("max_image_bytes must be an integer")
         if self.max_image_bytes <= 0:
             raise ValueError("max_image_bytes must be positive")
+        if not isinstance(self.vision_cache_mb, int) or isinstance(self.vision_cache_mb, bool):
+            raise TypeError("vision_cache_mb must be an integer")
+        if self.vision_cache_mb < 0:
+            raise ValueError("vision_cache_mb must be non-negative")
         if self.draft_model_directory is not None:
             if not isinstance(self.draft_model_directory, str):
                 raise TypeError("draft_model_directory must be a string or None")
@@ -217,6 +235,8 @@ class ExLlamaV3LoadConfig:
             object.__setattr__(self, "draft_model_directory", normalized_draft)
         if self.mtp_enabled and self.draft_model_directory is not None:
             raise ValueError("mtp_enabled and draft_model_directory are mutually exclusive")
+        if self.dynamic_draft_tokens and not (self.mtp_enabled or self.draft_model_directory is not None):
+            raise ValueError("dynamic_draft_tokens requires MTP or an external draft model")
         if not isinstance(self.draft_tokens, int) or isinstance(self.draft_tokens, bool):
             raise TypeError("draft_tokens must be an integer")
         if self.draft_tokens <= 0:
@@ -476,8 +496,15 @@ class RuntimeFailed:
 RuntimeEvent = RuntimeStarted | RuntimeTextDelta | RuntimeFinished | RuntimeCancelled | RuntimeFailed
 
 
+class RuntimeInjectionUnavailable(RuntimeError):
+    """Raised when a runtime session can no longer accept forced output."""
+
+
 class RuntimeSessionLike(Protocol):
     def __aiter__(self) -> AsyncIterator[RuntimeEvent]:
+        ...
+
+    def inject_text(self, text: str) -> None:
         ...
 
     async def cancel(self) -> None:

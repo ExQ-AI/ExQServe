@@ -36,6 +36,11 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
             "6",
             "--mtp-cache-bits",
             "fp16",
+            "--max-injection-body-bytes",
+            "8192",
+            "--dynamic-draft",
+            "--draft-confidence",
+            "0.55",
             "--autosplit-no-forward",
             "--cuda-malloc-async",
             "--qc-staging",
@@ -83,6 +88,9 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
     assert config.mtp_enabled is True
     assert config.mtp_draft_tokens == 6
     assert config.mtp_cache_bits is None
+    assert config.max_injection_body_bytes == 8192
+    assert config.dynamic_draft_tokens is True
+    assert config.draft_confidence == 0.55
     assert config.autosplit_no_forward is True
     assert config.cuda_malloc_async is True
     assert config.qc_staging == 0
@@ -125,11 +133,15 @@ def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path)
                 "mtp: true",
                 "mtp-draft-tokens: 6",
                 "mtp-cache-bits: 8",
+                "max-injection-body-bytes: 12288",
+                "dynamic-draft-tokens: true",
+                "draft-confidence: 0.6",
                 "autosplit-no-forward: true",
                 "cuda-malloc-async: true",
                 "qc-staging: 0",
                 "vision: true",
                 "allow-remote-images: true",
+                "vision-cache-mb: 64",
                 "public-metrics: true",
                 "capture-mode: metadata",
                 f"capture-path: {capture}",
@@ -156,14 +168,45 @@ def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path)
     assert config.mtp_enabled is True
     assert config.mtp_draft_tokens == 6
     assert config.mtp_cache_bits == 8
+    assert config.max_injection_body_bytes == 12288
+    assert config.dynamic_draft_tokens is True
+    assert config.draft_confidence == 0.6
     assert config.autosplit_no_forward is True
     assert config.cuda_malloc_async is True
     assert config.qc_staging == 0
     assert config.vision_enabled is True
     assert config.allow_remote_images is True
+    assert config.vision_cache_mb == 64
     assert config.protect_metrics is False
     assert config.capture_mode is CaptureMode.METADATA
     assert config.capture_path == capture
+
+
+def test_cli_and_yaml_support_chat_template_override_with_cli_precedence(tmp_path: Path) -> None:
+    yaml_template = tmp_path / "yaml-template.jinja"
+    cli_template = tmp_path / "cli-template.jinja"
+    yaml_template.write_text("YAML {{ messages }}", encoding="utf-8")
+    cli_template.write_text("CLI {{ messages }}", encoding="utf-8")
+    config_path = tmp_path / "exqserve.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"model-directory: {tmp_path / 'model'}",
+                f"chat-template: {yaml_template}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    assert yaml_config.chat_template == yaml_template
+    assert yaml_config.runtime_load_config().chat_template == "YAML {{ messages }}"
+
+    cli_config = cli.parse_config(
+        ["--config", str(config_path), "--chat-template", str(cli_template)]
+    )
+    assert cli_config.chat_template == cli_template
+    assert cli_config.runtime_load_config().chat_template == "CLI {{ messages }}"
 
 
 def test_cli_explicit_values_override_yaml_including_lists_and_booleans(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exqserve"
-version = "0.1.0"
+version = "0.2.0"
 description = "OpenAI- and Anthropic-compatible serving for ExLlamaV3"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,7 +28,7 @@ exqserve = "exqserve.server.cli:main"
 
 [project.optional-dependencies]
 runtime = [
-    "exllamav3>=1.4.2,<1.5",
+    "exllamav3>=1.4.4,<1.5",
 ]
 dev = [
     "build>=1.2,<2",
