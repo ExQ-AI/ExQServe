@@ -66,7 +66,9 @@ def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
     assert '("fast" | "safe")' in constraint.lark_grammar
     assert "%json" in constraint.lark_grammar
     assert "function_0_parameter_2?" in constraint.lark_grammar
-    assert '"</tool_call>"' in constraint.lark_grammar
+    assert "start: WS? function WS? </tool_call>" in constraint.lark_grammar
+    assert '"</tool_call>"' not in constraint.lark_grammar
+    assert "<tool_call> WS? function" not in constraint.lark_grammar
 
 
 def test_qwen_constraint_bounds_structural_whitespace() -> None:
@@ -98,9 +100,15 @@ def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> N
     )
 
     assert constraint is not None
-    assert constraint.eos_after_completed is False
+    assert constraint.eos_after_completed is True
     assert '"<function=lookup>"' in constraint.lark_grammar
     assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' in constraint.lark_grammar
+    assert (
+        "start: WS? function WS? </tool_call> "
+        "(WS? <tool_call> WS? function WS? </tool_call>)*"
+    ) in constraint.lark_grammar
+    assert '"<tool_call>"' not in constraint.lark_grammar
+    assert '"</tool_call>"' not in constraint.lark_grammar
     assert "%json" not in constraint.lark_grammar
 
 

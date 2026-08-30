@@ -151,7 +151,14 @@ def qwen_tool_constraint(
     if not tools:
         return None
 
-    lines = ["%llguidance {}", 'start: WS? function WS? "</tool_call>"']
+    if tool_policy.allow_parallel:
+        start_rule = (
+            "start: WS? function WS? </tool_call> "
+            "(WS? <tool_call> WS? function WS? </tool_call>)*"
+        )
+    else:
+        start_rule = "start: WS? function WS? </tool_call>"
+    lines = ["%llguidance {}", start_rule]
     lines.append("function: " + " | ".join(f"function_{index}" for index in range(len(tools))))
     uses_raw_string = False
 
@@ -218,7 +225,7 @@ def qwen_tool_constraint(
     return ToolGenerationConstraint(
         trigger=_QWEN_TOOL_TRIGGER,
         lark_grammar="\n".join(lines),
-        eos_after_completed=not tool_policy.allow_parallel,
+        eos_after_completed=True,
     )
 
 
