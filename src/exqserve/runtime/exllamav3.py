@@ -1303,6 +1303,13 @@ class ExLlamaV3Runtime:
 
         _configure_cuda_malloc_async(config.cuda_malloc_async)
         _configure_qc_staging(config.qc_staging)
+        resources = self._build_resources(config)
+        self._resources = resources
+        self._generator = None
+        self._backend_failed = False
+
+    @staticmethod
+    def _build_resources(config: ExLlamaV3LoadConfig) -> _ExLlamaV3Resources:
         backend = _load_backend_module()
         reserve_per_device = _effective_reserve_per_device(config)
         model: Any | None = None
@@ -1484,9 +1491,7 @@ class ExLlamaV3Runtime:
             output_id_to_piece,
             output_native_piece_ids,
         )
-        self._resources = resources
-        self._generator = None
-        self._backend_failed = False
+        return resources
 
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         """Tokenize a raw document-continuation prompt without applying a chat template."""
