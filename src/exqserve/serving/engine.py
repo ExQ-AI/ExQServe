@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -14,13 +13,7 @@ from exqserve.agent._json import InvalidJsonError, parse_json_strict
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.structured_output import StructuredOutputSpec, validate_structured_output
 from exqserve.agent.tools import ToolPolicy
-from exqserve.agent.validation import (
-    ValidationCode,
-    ValidationResult,
-    validate_tool_calls,
-    validate_tool_calls_with_canonical_arguments,
-    validate_tool_history,
-)
+from exqserve.agent.validation import validate_tool_calls, validate_tool_history
 from exqserve.control.request import RequestRejected, RequestTerminalReason
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import (
@@ -36,7 +29,6 @@ from exqserve.core.events import (
     ToolCallStarted,
     UsageUpdated,
 )
-from exqserve.core.items import ToolCallItem
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenAwareIncrementalParser,
@@ -74,28 +66,9 @@ from exqserve.serving.runtime_events import (
     completion_reason_from_runtime,
     timing_event_from_runtime,
 )
+from exqserve.serving.tool_batch import ToolCallBatchGate, tool_validation_failure
 
 logger = logging.getLogger(__name__)
-
-_TOOL_CALL_INVALID_CODES = frozenset(
-    {
-        ValidationCode.INVALID_JSON,
-        ValidationCode.DUPLICATE_JSON_KEY,
-        ValidationCode.JSON_VALUE_NOT_OBJECT,
-        ValidationCode.SCHEMA_VALIDATION_FAILED,
-        ValidationCode.DUPLICATE_TOOL_CALL_ID,
-        ValidationCode.INVALID_TOOL_CALL_ORDER,
-    }
-)
-
-
-def _tool_validation_failure(result: ValidationResult) -> tuple[str, str]:
-    if result.is_valid:
-        raise ValueError("tool validation result must contain at least one issue")
-    if any(issue.code in _TOOL_CALL_INVALID_CODES for issue in result.issues):
-        return "tool_call_invalid", "Model produced an invalid tool call."
-    return "tool_policy_violation", "Model output violated the requested tool policy."
-
 
 class RuntimeTemplateRenderer(Protocol):
     def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
@@ -482,18 +455,6 @@ class ServingSession:
         atomic_parallel_tools: bool = False,
         constrained_parallel_tool_call_limit: int = 8,
     ) -> None:
-        if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
-            raise TypeError("tool_call_fanout_limit must be an integer")
-        if tool_call_fanout_limit <= 0:
-            raise ValueError("tool_call_fanout_limit must be positive")
-        if not isinstance(atomic_parallel_tools, bool):
-            raise TypeError("atomic_parallel_tools must be a bool")
-        if not isinstance(constrained_parallel_tool_call_limit, int) or isinstance(
-            constrained_parallel_tool_call_limit, bool
-        ):
-            raise TypeError("constrained_parallel_tool_call_limit must be an integer")
-        if constrained_parallel_tool_call_limit <= 0:
-            raise ValueError("constrained_parallel_tool_call_limit must be positive")
         self._request_id = request_id
         self._controlled = controlled
         self._runtime_iterator = controlled.__aiter__()
@@ -504,17 +465,16 @@ class ServingSession:
         self._requested_stop_sequences = frozenset(
             condition for condition in requested_stop_conditions if isinstance(condition, str)
         )
-        self._tool_call_fanout_limit = tool_call_fanout_limit
-        self._atomic_parallel_tools = atomic_parallel_tools
-        self._constrained_parallel_tool_call_limit = constrained_parallel_tool_call_limit
+        self._tool_batch = ToolCallBatchGate(
+            tool_policy,
+            tool_call_fanout_limit=tool_call_fanout_limit,
+            atomic_parallel_tools=atomic_parallel_tools,
+            constrained_parallel_tool_call_limit=constrained_parallel_tool_call_limit,
+        )
         self._pending: deque[GenerationEvent] = deque()
-        self._buffered_tool_events: list[GenerationEvent] = []
         self._terminal = False
         self._parser_finished = False
         self._text_parts: list[str] = []
-        self._accepted_call_ids: set[str] = set()
-        self._completed_calls: list[ToolCallItem] = []
-        self._completed_call_signatures: set[tuple[str, str]] = set()
         self._runtime_trace: list[dict[str, object]] | None = None
 
     @property
@@ -542,26 +502,11 @@ class ServingSession:
             await self.cancel()
         return False
 
-    def _publish_tool_event(self, event: GenerationEvent) -> None:
-        if self._atomic_parallel_tools:
-            self._buffered_tool_events.append(event)
-        else:
-            self._pending.append(event)
-
     def _discard_atomic_tool_batch(self) -> None:
-        if self._atomic_parallel_tools:
-            self._buffered_tool_events.clear()
+        self._tool_batch.abort()
 
     def _flush_atomic_tool_batch(self) -> None:
-        if not self._atomic_parallel_tools or not self._buffered_tool_events:
-            return
-        self._pending.extend(self._buffered_tool_events)
-        self._buffered_tool_events.clear()
-
-    def _effective_tool_call_limit(self) -> int:
-        if not self._atomic_parallel_tools:
-            return self._tool_call_fanout_limit
-        return min(self._tool_call_fanout_limit, self._constrained_parallel_tool_call_limit)
+        self._pending.extend(self._tool_batch.commit_events())
 
     async def cancel(self) -> None:
         if self._terminal:
@@ -590,80 +535,25 @@ class ServingSession:
             self._pending.append(event)
             return
         if isinstance(event, ToolCallStarted):
-            if event.call_id in self._accepted_call_ids:
-                await self._model_failure(
-                    "tool_call_stream_invalid",
-                    "Model produced a duplicate tool-call start event.",
-                )
+            decision = self._tool_batch.on_started(event)
+            if decision.failure is not None:
+                await self._model_failure(decision.failure.code, decision.failure.message)
                 return
-            effective_limit = self._effective_tool_call_limit()
-            if len(self._accepted_call_ids) >= effective_limit:
-                logger.warning(
-                    "model exceeded tool-call fanout limit request_id=%s limit=%d",
-                    self._request_id,
-                    effective_limit,
-                )
-                await self._model_failure(
-                    "tool_policy_violation",
-                    "Model output exceeded the server tool-call policy.",
-                )
-                return
-            self._accepted_call_ids.add(event.call_id)
-            self._publish_tool_event(event)
+            self._pending.extend(decision.events)
             return
         if isinstance(event, ToolCallArgumentsDelta):
-            if event.call_id not in self._accepted_call_ids:
-                await self._model_failure(
-                    "tool_call_stream_invalid",
-                    "Model produced tool arguments before an accepted tool call start.",
-                )
+            decision = self._tool_batch.on_arguments_delta(event)
+            if decision.failure is not None:
+                await self._model_failure(decision.failure.code, decision.failure.message)
                 return
-            self._publish_tool_event(event)
+            self._pending.extend(decision.events)
             return
         if isinstance(event, ToolCallCompleted):
-            if event.call.call_id not in self._accepted_call_ids:
-                await self._model_failure(
-                    "tool_call_stream_invalid",
-                    "Model completed a tool call that was not accepted.",
-                )
+            decision = self._tool_batch.on_completed(event)
+            if decision.failure is not None:
+                await self._model_failure(decision.failure.code, decision.failure.message)
                 return
-            candidate_calls = (*self._completed_calls, event.call)
-            detailed_validation = validate_tool_calls_with_canonical_arguments(
-                candidate_calls,
-                self._tool_policy,
-            )
-            validation = detailed_validation.result
-            if not validation.is_valid:
-                logger.warning(
-                    "model produced invalid completed tool call request_id=%s issues=%s",
-                    self._request_id,
-                    ",".join(issue.code.value for issue in validation.issues),
-                )
-                code, message = _tool_validation_failure(validation)
-                await self._model_failure(code, message)
-                return
-            canonical_arguments = detailed_validation.canonical_arguments[-1]
-            assert canonical_arguments is not None
-            signature = (event.call.name, canonical_arguments)
-            if self._atomic_parallel_tools and signature in self._completed_call_signatures:
-                signature_hash = hashlib.sha256(
-                    f"{signature[0]}\0{signature[1]}".encode()
-                ).hexdigest()[:12]
-                logger.warning(
-                    "model repeated constrained-parallel tool call request_id=%s index=%d signature=%s",
-                    self._request_id,
-                    event.call.index,
-                    signature_hash,
-                )
-                await self._model_failure(
-                    "tool_policy_violation",
-                    "Model repeated a tool call inside one constrained parallel batch.",
-                )
-                return
-            if self._atomic_parallel_tools:
-                self._completed_call_signatures.add(signature)
-            self._completed_calls.append(event.call)
-            self._publish_tool_event(event)
+            self._pending.extend(decision.events)
             return
         self._pending.append(event)
 
@@ -713,18 +603,19 @@ class ServingSession:
             )
             return
 
-        final_tool_validation = validate_tool_calls(tuple(self._completed_calls), self._tool_policy)
+        completed_calls = self._tool_batch.completed_calls
+        final_tool_validation = validate_tool_calls(completed_calls, self._tool_policy)
         if not final_tool_validation.is_valid:
             logger.warning(
                 "model output violates requested tool policy request_id=%s issues=%s",
                 self._request_id,
                 ",".join(issue.code.value for issue in final_tool_validation.issues),
             )
-            code, message = _tool_validation_failure(final_tool_validation)
+            code, message = tool_validation_failure(final_tool_validation)
             await self._model_failure(code, message)
             return
 
-        if not incomplete_tool and not self._completed_calls and self._structured_output is not None:
+        if not incomplete_tool and not completed_calls and self._structured_output is not None:
             structured = validate_structured_output("".join(self._text_parts), self._structured_output)
             if not structured.is_valid:
                 await self._model_failure(
@@ -735,7 +626,7 @@ class ServingSession:
 
         reason = (
             CompletionReason.TOOL_CALLS
-            if self._completed_calls
+            if completed_calls
             else completion_reason_from_runtime(event.reason)
         )
 

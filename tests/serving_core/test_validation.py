@@ -365,7 +365,7 @@ def test_atomic_constrained_parallel_buffers_unique_calls_until_terminal() -> No
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
         assert not session._pending
-        assert len(session._buffered_tool_events) == 6
+        assert session._tool_batch.buffered_event_count == 6
 
         await session._process_runtime(_finished())
         events = [event async for event in session]
@@ -557,7 +557,7 @@ def test_atomic_constrained_parallel_runtime_failure_discards_buffered_calls() -
         ).submit(_request(policy))
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
-        assert session._buffered_tool_events
+        assert session._tool_batch.has_buffered_events
         error = CanonicalError(
             ErrorCategory.RUNTIME_FAILURE,
             "backend_failed",
@@ -596,9 +596,9 @@ def test_atomic_constrained_parallel_client_cancel_discards_buffered_calls() -> 
         ).submit(_request(policy))
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
-        assert session._buffered_tool_events
+        assert session._tool_batch.has_buffered_events
         await session.cancel()
-        assert not session._buffered_tool_events
+        assert not session._tool_batch.has_buffered_events
         assert controlled.cancel_calls == [RequestTerminalReason.CLIENT_CANCELLED]
 
     asyncio.run(scenario())
@@ -738,7 +738,7 @@ def test_atomic_constrained_parallel_runtime_stream_end_discards_entire_batch() 
         )
         assert isinstance(events[-1], GenerationFailed)
         assert events[-1].error.code == "runtime_stream_ended"
-        assert not session._buffered_tool_events
+        assert not session._tool_batch.has_buffered_events
 
     asyncio.run(scenario())
 
