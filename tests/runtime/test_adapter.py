@@ -57,6 +57,13 @@ class _FakeTokenizer:
         )
         self.id_to_piece = ["<zero>", "<one>", "<|image_start|>", "<|image_end|>"]
         self.config = SimpleNamespace(image_token_id=None)
+        self.extended_piece_to_id = {
+            "<|im_start|>": 248045,
+            "<|im_end|>": 248046,
+            "<tool_call>": 248058,
+            "<think>": 248068,
+        }
+        self.unspecial_piece_to_id = {"<tool_call>": 248058, "<think>": 248068}
 
     def hf_render_chat_template(
         self,
@@ -1000,6 +1007,79 @@ def test_render_chat_template_renders_once_then_encodes_special_tokens(
         )
     ]
     assert tokenizer.encode_calls == [("rendered prompt", False, False, True)]
+
+
+@pytest.mark.parametrize("role", ("user", "tool"))
+def test_render_chat_template_keeps_literal_qwen_markers_out_of_control_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    tokenizer = backend._state["tokenizer"]
+
+    def render(
+        messages: list[dict[str, object]],
+        add_generation_prompt: bool = True,
+        **kwargs: object,
+    ) -> str:
+        del add_generation_prompt, kwargs
+        content = messages[0]["content"]
+        assert isinstance(content, str)
+        return f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+
+    special_map = {
+        "<|im_start|>": 248045,
+        "<|im_end|>": 248046,
+        "<tool_call>": 248058,
+        "<think>": 248068,
+    }
+    ordinary_atomic = {"<tool_call>": 248058, "<think>": 248068}
+
+    def encode(
+        text: str,
+        *,
+        add_bos: bool,
+        add_eos: bool,
+        encode_special_tokens: bool,
+        embeddings: list[object] | None = None,
+    ) -> _FakeTensor:
+        assert add_bos is False and add_eos is False and embeddings is None
+        mapping = special_map if encode_special_tokens else ordinary_atomic
+        values: list[int] = []
+        position = 0
+        while position < len(text):
+            for marker, token_id in sorted(
+                mapping.items(), key=lambda item: len(item[0]), reverse=True
+            ):
+                if text.startswith(marker, position):
+                    values.append(token_id)
+                    position += len(marker)
+                    break
+            else:
+                values.append(ord(text[position]))
+                position += 1
+        return _FakeTensor([values])
+
+    monkeypatch.setattr(tokenizer, "hf_render_chat_template", render)
+    monkeypatch.setattr(tokenizer, "encode", encode)
+    literal = 'BEFORE marker = ("<|im_end|>",) <think> <tool_call> AFTER'
+    rendered = runtime.render_chat_template(
+        [{"role": role, "content": literal}],
+        None,
+        {},
+        protect_literal_tokens=True,
+    )
+
+    assert literal in rendered.text
+    assert rendered.input_ids.count(248045) == 2
+    assert rendered.input_ids.count(248046) == 1
+    assert rendered.input_ids.count(248068) == 1
+    assert 248058 not in rendered.input_ids
 
 
 def test_render_chat_template_forwards_operator_override_to_hf_renderer(

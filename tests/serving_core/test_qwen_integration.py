@@ -45,6 +45,7 @@ class _Renderer:
         template_kwargs: dict[str, object],
         *,
         add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
         self.messages = messages
         self.tools = tools

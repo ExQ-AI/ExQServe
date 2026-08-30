@@ -43,6 +43,14 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
     RuntimeTiming,
 )
+from exqserve.runtime.literal_markers import (
+    discover_marker_texts,
+    encode_protected_prompt,
+    marker_sentinels,
+    protect_messages,
+    protect_tools,
+    restore_text,
+)
 from exqserve.runtime.vision_cache import VisionEmbeddingCache, VisionEmbeddingCacheStats
 
 logger = logging.getLogger(__name__)
@@ -1416,6 +1424,7 @@ class ExLlamaV3Runtime:
         template_kwargs: dict[str, object],
         *,
         add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
         _, text_codec = self._require_loaded()
         if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
@@ -1430,20 +1439,32 @@ class ExLlamaV3Runtime:
             raise ValueError("template_kwargs must not contain reserved key 'tools'")
         if not isinstance(add_generation_prompt, bool):
             raise TypeError("add_generation_prompt must be a bool")
+        if not isinstance(protect_literal_tokens, bool):
+            raise TypeError("protect_literal_tokens must be a bool")
+
+        sentinels: dict[str, str] = {}
+        render_messages = messages
+        render_tools = tools
+        if protect_literal_tokens:
+            marker_texts = discover_marker_texts(text_codec)
+            sentinels = marker_sentinels(messages, tools, marker_texts)
+            render_messages = protect_messages(messages, sentinels)
+            render_tools = protect_tools(tools, sentinels)
 
         kwargs = dict(template_kwargs)
         config = self._load_config
         if config is not None and config.chat_template is not None:
             kwargs["chat_template"] = config.chat_template
-        if tools is not None:
-            kwargs["tools"] = tools
+        if render_tools is not None:
+            kwargs["tools"] = render_tools
         rendered_text = text_codec.hf_render_chat_template(
-            messages,
+            render_messages,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
         if not isinstance(rendered_text, str):
             raise TypeError("backend chat template must render text")
+        visible_text = restore_text(rendered_text, sentinels) if sentinels else rendered_text
 
         sources = _image_sources(messages)
         attachments: tuple[object, ...] = ()
@@ -1467,14 +1488,30 @@ class ExLlamaV3Runtime:
                         self._vision_cache.put(cache_key, embedding)
                 embeddings.append(embedding)
             encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
-            encoded = text_codec.encode(
-                encoded_text,
-                add_bos=False,
-                add_eos=False,
-                encode_special_tokens=True,
-                embeddings=embeddings,
-            )
+            if sentinels:
+                _, input_ids = encode_protected_prompt(
+                    text_codec,
+                    encoded_text,
+                    sentinels,
+                    embeddings,
+                )
+            else:
+                encoded = text_codec.encode(
+                    encoded_text,
+                    add_bos=False,
+                    add_eos=False,
+                    encode_special_tokens=True,
+                    embeddings=embeddings,
+                )
+                input_ids = _tensor_to_token_ids(encoded)
             attachments = tuple(_VisionAttachment(embedding) for embedding in embeddings)
+        elif sentinels:
+            _, input_ids = encode_protected_prompt(
+                text_codec,
+                rendered_text,
+                sentinels,
+                None,
+            )
         else:
             encoded = text_codec.encode(
                 rendered_text,
@@ -1482,7 +1519,8 @@ class ExLlamaV3Runtime:
                 add_eos=False,
                 encode_special_tokens=True,
             )
-        return RuntimeRenderedPrompt(rendered_text, _tensor_to_token_ids(encoded), attachments)
+            input_ids = _tensor_to_token_ids(encoded)
+        return RuntimeRenderedPrompt(visible_text, input_ids, attachments)
 
     def submit(self, request: RuntimeGenerationRequest) -> RuntimeSession:
         backend, text_codec = self._require_loaded()

@@ -72,9 +72,11 @@ class _FakeRuntime:
         template_kwargs: dict[str, object],
         *,
         add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
         assert messages
         assert add_generation_prompt is True
+        assert isinstance(protect_literal_tokens, bool)
         return RuntimeRenderedPrompt("rendered", (1, 2))
 
     def submit(self, request: RuntimeGenerationRequest) -> _FakeRuntimeSession:

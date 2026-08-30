@@ -79,8 +79,9 @@ class _Runtime:
         template_kwargs: dict[str, object],
         *,
         add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
-        del template_kwargs, add_generation_prompt
+        del template_kwargs, add_generation_prompt, protect_literal_tokens
         if tools:
             return RuntimeRenderedPrompt("tool", (77,))
         rendered = repr(messages)

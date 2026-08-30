@@ -180,6 +180,7 @@ class TemplateRequest:
     tools: tuple[TemplateTool, ...]
     template_kwargs: tuple[tuple[str, TemplateScalar], ...]
     add_generation_prompt: bool = True
+    protect_literal_tokens: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple):
@@ -205,6 +206,7 @@ class TemplateRequest:
             _validate_scalar(value)
 
         _validate_bool("add_generation_prompt", self.add_generation_prompt)
+        _validate_bool("protect_literal_tokens", self.protect_literal_tokens)
 
 
 @dataclass(frozen=True, slots=True)

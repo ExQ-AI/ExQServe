@@ -420,6 +420,7 @@ class QwenPromptCompiler(HFTemplatePromptCompiler):
                 reasoning,
                 preserve_thinking=has_reasoning_history,
             ),
+            protect_literal_tokens=True,
         )
 
     def _raw_output_is_text_only(

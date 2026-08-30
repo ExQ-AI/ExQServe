@@ -301,6 +301,7 @@ def test_compile_calls_adapter_and_hashes_final_token_ids_stably() -> None:
     assert len(first.prompt_hash) == 64
     assert first.stop_conditions == ()
     assert first.use_native_eos is True
+    assert first.template_request.protect_literal_tokens is True
     assert adapter.requests == [first.template_request, second.template_request]
 
 

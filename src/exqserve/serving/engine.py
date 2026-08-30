@@ -103,6 +103,7 @@ class RuntimeTemplateRenderer(Protocol):
         template_kwargs: dict[str, object],
         *,
         add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
         ...
 
@@ -185,12 +186,21 @@ class RuntimeTemplateAdapter:
             raise TypeError("request must be a TemplateRequest")
         messages = [_message_dict(message) for message in request.messages]
         tools = [_tool_dict(tool) for tool in request.tools] if request.tools else None
-        rendered = self._renderer.render_chat_template(
-            messages,
-            tools,
-            dict(request.template_kwargs),
-            add_generation_prompt=request.add_generation_prompt,
-        )
+        if request.protect_literal_tokens:
+            rendered = self._renderer.render_chat_template(
+                messages,
+                tools,
+                dict(request.template_kwargs),
+                add_generation_prompt=request.add_generation_prompt,
+                protect_literal_tokens=True,
+            )
+        else:
+            rendered = self._renderer.render_chat_template(
+                messages,
+                tools,
+                dict(request.template_kwargs),
+                add_generation_prompt=request.add_generation_prompt,
+            )
         return RenderedPrompt(rendered.text, rendered.input_ids, rendered.runtime_attachments)
 
     def tokenize_encoded_prompt(self, text: str) -> RenderedPrompt:
