@@ -450,6 +450,7 @@ def test_qwen_composition_forwards_enabled_tool_constraint(tmp_path: Path) -> No
                     }
                 ],
                 "reasoning_effort": "disabled",
+                "parallel_tool_calls": False,
             },
         )
 
@@ -459,6 +460,46 @@ def test_qwen_composition_forwards_enabled_tool_constraint(tmp_path: Path) -> No
         assert constraint is not None
         assert constraint.trigger == "<tool_call>"
         assert '"<function=lookup>"' in constraint.lark_grammar
+
+    asyncio.run(scenario())
+
+
+def test_qwen_constrained_parallel_rejects_before_runtime_submission(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
+        composed = compose_server(
+            ServerConfig(
+                tmp_path,
+                served_model_id="qwen",
+                tool_constraint_mode=ToolConstraintMode.SCHEMA,
+            ),
+            runtime=runtime,
+        )
+        response = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "parallel_tool_calls": True,
+                "reasoning_effort": "disabled",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "tool_constraint_unsupported"
+        assert runtime.submit_calls == []
 
     asyncio.run(scenario())
 

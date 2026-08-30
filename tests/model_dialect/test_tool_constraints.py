@@ -18,7 +18,7 @@ def _policy(
     *tools: FunctionTool,
     mode: ToolChoiceMode = ToolChoiceMode.AUTO,
     name: str | None = None,
-    parallel: bool = True,
+    parallel: bool = False,
 ) -> ToolPolicy:
     return ToolPolicy(tuple(tools), ToolChoice(mode, name), parallel)
 
@@ -103,13 +103,35 @@ def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> N
     assert constraint.eos_after_completed is True
     assert '"<function=lookup>"' in constraint.lark_grammar
     assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' in constraint.lark_grammar
-    assert (
-        "start: WS? function WS? </tool_call> "
-        "(WS? <tool_call> WS? function WS? </tool_call>)*"
-    ) in constraint.lark_grammar
+    assert "start: WS? function WS? </tool_call>" in constraint.lark_grammar
     assert '"<tool_call>"' not in constraint.lark_grammar
     assert '"</tool_call>"' not in constraint.lark_grammar
     assert "%json" not in constraint.lark_grammar
+
+
+@pytest.mark.parametrize("mode", (ToolConstraintMode.FORMAT, ToolConstraintMode.SCHEMA))
+def test_qwen_constrained_parallel_is_fail_closed_until_termination_is_certified(
+    mode: ToolConstraintMode,
+) -> None:
+    with pytest.raises(ToolConstraintUnsupported, match="parallel.*disabled"):
+        qwen_tool_constraint(
+            _policy(_tool("save", _qwen_schema()), parallel=True),
+            mode,
+        )
+
+    with pytest.raises(ToolConstraintUnsupported, match="parallel.*disabled"):
+        qwen_tool_constraint(
+            _policy(_tool("save", _qwen_schema(), strict=True), parallel=True),
+            ToolConstraintMode.OFF,
+        )
+
+    assert (
+        qwen_tool_constraint(
+            _policy(_tool("save", _qwen_schema()), parallel=True),
+            ToolConstraintMode.OFF,
+        )
+        is None
+    )
 
 
 def test_qwen_strict_tool_escalates_off_baseline_to_schema() -> None:

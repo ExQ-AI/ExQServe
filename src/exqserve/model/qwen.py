@@ -150,6 +150,11 @@ def qwen_tool_constraint(
         return None
     if mode is ToolConstraintMode.OFF and not any(tool.strict for tool in tools):
         return None
+    if tool_policy.allow_parallel:
+        raise ToolConstraintUnsupported(
+            "Qwen constrained parallel tool generation is temporarily disabled pending "
+            "same-turn termination certification"
+        )
 
     branch_modes = tuple(
         ToolConstraintMode.SCHEMA
@@ -158,13 +163,7 @@ def qwen_tool_constraint(
         for tool in tools
     )
 
-    if tool_policy.allow_parallel:
-        start_rule = (
-            "start: WS? function WS? </tool_call> "
-            "(WS? <tool_call> WS? function WS? </tool_call>)*"
-        )
-    else:
-        start_rule = "start: WS? function WS? </tool_call>"
+    start_rule = "start: WS? function WS? </tool_call>"
     lines = ["%llguidance {}", start_rule]
     lines.append("function: " + " | ".join(f"function_{index}" for index in range(len(tools))))
     uses_raw_string = False
