@@ -788,6 +788,44 @@ def test_atomic_constrained_parallel_provenance_failure_discards_entire_batch() 
     asyncio.run(scenario())
 
 
+def test_atomic_constrained_parallel_provenance_failure_survives_cancel_error() -> None:
+    class _ProvenanceFailParser(_ScriptedParser):
+        def finish(self) -> _Finish:
+            raise NativeTokenProvenanceError("missing native-token provenance")
+
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ProvenanceFailParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        controlled = _CancelRaises([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        await session._process_runtime(_finished())
+        events = [event async for event in session]
+
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "output_token_provenance_unavailable"
+
+    asyncio.run(scenario())
+
+
 def test_atomic_constrained_parallel_runtime_stream_end_discards_entire_batch() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
