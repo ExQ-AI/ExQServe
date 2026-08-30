@@ -176,6 +176,7 @@ def _build_model_bundle(
     runtime_factory: RuntimeFactory | None,
 ) -> ActiveModelBundle:
     runtime_object = _load_runtime(config, model_directory, runtime, runtime_factory)
+    tool_options = config.tool_serving_options()
     served_model = ServedModelInfo(
         public_model_id,
         int(time.time()),
@@ -207,11 +208,11 @@ def _build_model_bundle(
                 )
             return constraint_provider.create_tool_constraint(
                 tool_policy,
-                config.tool_constraint_mode,
+                tool_options.constraint_mode,
             )
 
         tool_constraint_factory = create_tool_constraint
-    elif config.tool_constraint_mode is not ToolConstraintMode.OFF:
+    elif tool_options.constraint_mode is not ToolConstraintMode.OFF:
         raise ValueError(
             f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
         )
@@ -228,8 +229,8 @@ def _build_model_bundle(
         parser_factory,
         cast(RequestControllerLike, controller),
         tool_constraint_factory,
-        config.tool_call_fanout_limit,
-        config.constrained_parallel_tool_call_limit,
+        tool_options.fanout_limit,
+        tool_options.constrained_parallel_limit,
     )
     raw_engine = RawServingEngine(runtime_object, cast(RawRequestController, controller))
     observed = ObservedServingEngine(engine, metrics, capture=capture)
@@ -285,15 +286,16 @@ def compose_server(
 
     model_manager = ModelManager(candidates, initial_bundle, build_bundle)
     raw_manager = ManagedRawServingEngine(model_manager)
+    store_options = config.response_store_options()
     response_store = InMemoryResponseStore(
-        config.response_store_max_records,
-        ttl_seconds=config.response_store_ttl_seconds,
-        max_total_bytes=config.response_store_max_bytes,
+        store_options.max_records,
+        ttl_seconds=store_options.ttl_seconds,
+        max_total_bytes=store_options.max_total_bytes,
     )
     response_lifecycle_store = InMemoryResponseLifecycleStore(
-        config.response_store_max_records,
-        ttl_seconds=config.response_store_ttl_seconds,
-        max_total_bytes=config.response_store_max_bytes,
+        store_options.max_records,
+        ttl_seconds=store_options.ttl_seconds,
+        max_total_bytes=store_options.max_total_bytes,
     )
 
     @asynccontextmanager

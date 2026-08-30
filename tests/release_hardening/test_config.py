@@ -76,6 +76,16 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert control.max_total_tokens == 32768
     assert control.timeout_seconds is None
 
+    store = config.response_store_options()
+    assert store.max_records == 1024
+    assert store.ttl_seconds == 3600.0
+    assert store.max_total_bytes == 64 * 1024 * 1024
+
+    tool_serving = config.tool_serving_options()
+    assert tool_serving.constraint_mode is ToolConstraintMode.OFF
+    assert tool_serving.fanout_limit == 32
+    assert tool_serving.constrained_parallel_limit == 8
+
 
 def test_server_config_snapshots_custom_chat_template_at_startup(tmp_path: Path) -> None:
     template = tmp_path / "custom.jinja"

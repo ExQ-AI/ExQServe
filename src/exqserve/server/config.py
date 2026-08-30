@@ -10,6 +10,7 @@ from exqserve.core.sampling import SamplingOverridePolicy
 from exqserve.model.contracts import ToolConstraintMode
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import ExLlamaV3LoadConfig, LoRAAdapterConfig
+from exqserve.server.options import ResponseStoreOptions, ToolServingOptions
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +278,20 @@ class ServerConfig:
                 )
                 for index, path in enumerate(self.loras)
             ),
+        )
+
+    def response_store_options(self) -> ResponseStoreOptions:
+        return ResponseStoreOptions(
+            self.response_store_max_records,
+            self.response_store_ttl_seconds,
+            self.response_store_max_bytes,
+        )
+
+    def tool_serving_options(self) -> ToolServingOptions:
+        return ToolServingOptions(
+            self.tool_constraint_mode,
+            self.tool_call_fanout_limit,
+            self.constrained_parallel_tool_call_limit,
         )
 
     def request_control_config(self, model_limit: int | None = None) -> RequestControlConfig:
