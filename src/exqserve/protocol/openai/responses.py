@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from exqserve.agent.schema import JsonSchema
+from exqserve.agent.schema import JsonSchema, validate_strict_function_schema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.events import (
@@ -361,18 +361,21 @@ def _parse_tools(value: object) -> tuple[FunctionTool, ...]:
             raise invalid_request("invalid_tools", "Function description must be text.", f"tools[{index}].description")
         if not isinstance(strict, bool):
             raise invalid_request("invalid_tools", "Function strict must be boolean.", f"tools[{index}].strict")
-        if strict:
-            raise invalid_request(
-                "unsupported_strict_tools",
-                "Strict function tools require constrained decoding and are not supported.",
-                f"tools[{index}].strict",
-            )
         schema = _schema_from_object(
             tool.get("parameters", {"type": "object", "properties": {}}),
             param=f"tools[{index}].parameters",
         )
+        if strict:
+            try:
+                validate_strict_function_schema(schema)
+            except (TypeError, ValueError) as exc:
+                raise invalid_request(
+                    "invalid_json_schema",
+                    f"Strict function schema is invalid: {exc}",
+                    f"tools[{index}].parameters",
+                ) from exc
         try:
-            tools.append(FunctionTool(name, description, schema))
+            tools.append(FunctionTool(name, description, schema, strict))
         except (TypeError, ValueError) as exc:
             raise invalid_request("invalid_tools", "Function tool declaration is invalid.", f"tools[{index}]") from exc
     return tuple(tools)

@@ -88,6 +88,10 @@ class QwenDialect:
     dialect_id: str = "qwen"
     capabilities: ModelCapabilities = QWEN38_CAPABILITIES
 
+    @property
+    def supports_strict_tools(self) -> bool:
+        return True
+
     def matches(self, architecture: str | None) -> bool:
         if architecture is None:
             return False
@@ -121,6 +125,10 @@ class QwenDialect:
 class Gemma4Dialect:
     dialect_id: str = "gemma4"
     capabilities: ModelCapabilities = GEMMA4_CAPABILITIES
+
+    @property
+    def supports_strict_tools(self) -> bool:
+        return True
 
     def matches(self, architecture: str | None) -> bool:
         if architecture is None:

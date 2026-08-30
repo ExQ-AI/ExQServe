@@ -18,9 +18,12 @@ from exqserve.agent.tools import ToolPolicy
 from exqserve.control.request import RequestController
 from exqserve.core.model import ServedModelInfo
 from exqserve.model.contracts import (
+    StrictToolConstraintProvider,
     ToolConstraintMode,
     ToolConstraintProvider,
+    ToolConstraintUnsupported,
     ToolGenerationConstraint,
+    has_exposed_strict_tool,
 )
 from exqserve.model.registry import default_model_dialect_registry
 from exqserve.observability.capture import CaptureManager, CaptureMode, JsonlCaptureSink
@@ -190,20 +193,28 @@ def _build_model_bundle(
     compiler = dialect.create_compiler(template_adapter)
 
     tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
-    if config.tool_constraint_mode is not ToolConstraintMode.OFF:
-        if not isinstance(dialect, ToolConstraintProvider):
-            raise ValueError(
-                f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
-            )
+    if isinstance(dialect, ToolConstraintProvider):
         constraint_provider = dialect
+        strict_capable = (
+            isinstance(dialect, StrictToolConstraintProvider)
+            and dialect.supports_strict_tools
+        )
 
         def create_tool_constraint(tool_policy: ToolPolicy) -> ToolGenerationConstraint | None:
+            if has_exposed_strict_tool(tool_policy) and not strict_capable:
+                raise ToolConstraintUnsupported(
+                    f"model dialect {dialect.dialect_id!r} does not support strict function tools"
+                )
             return constraint_provider.create_tool_constraint(
                 tool_policy,
                 config.tool_constraint_mode,
             )
 
         tool_constraint_factory = create_tool_constraint
+    elif config.tool_constraint_mode is not ToolConstraintMode.OFF:
+        raise ValueError(
+            f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
+        )
 
     def parser_factory(
         request_id: str,

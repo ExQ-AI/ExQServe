@@ -19,8 +19,9 @@ def _tool(name: str = "bash") -> FunctionTool:
 def test_function_tool_has_only_v1_function_fields() -> None:
     tool = _tool()
 
-    assert [field.name for field in fields(tool)] == ["name", "description", "parameters"]
+    assert [field.name for field in fields(tool)] == ["name", "description", "parameters", "strict"]
     assert tool.name == "bash"
+    assert tool.strict is False
 
 
 def test_function_tool_rejects_empty_name_and_invalid_fields() -> None:
@@ -32,6 +33,9 @@ def test_function_tool_rejects_empty_name_and_invalid_fields() -> None:
 
     with pytest.raises(TypeError, match="parameters"):
         FunctionTool("bash", None, object())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="strict"):
+        FunctionTool("bash", None, JsonSchema('{}'), 1)  # type: ignore[arg-type]
 
 
 def test_tool_choice_modes_are_exact_v1_set() -> None:

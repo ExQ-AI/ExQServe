@@ -88,12 +88,17 @@ def gemma4_tool_constraint(
 ) -> ToolGenerationConstraint | None:
     if not isinstance(mode, ToolConstraintMode):
         raise TypeError("mode must be a ToolConstraintMode")
-    if mode is ToolConstraintMode.OFF:
-        return None
 
     tools = tuple(sorted(exposed_tools(tool_policy), key=lambda item: item.name))
     if not tools:
         return None
+    has_strict = any(tool.strict for tool in tools)
+    if mode is ToolConstraintMode.OFF and not has_strict:
+        return None
+    if has_strict and tool_policy.allow_parallel:
+        raise ToolConstraintUnsupported(
+            "Gemma strict tool generation with parallel tool calls is not certified"
+        )
 
     lines = ["%llguidance {}", "start: tool"]
     lines.append("tool: " + " | ".join(f"tool_{index}" for index in range(len(tools))))
@@ -102,10 +107,9 @@ def gemma4_tool_constraint(
             raise ToolConstraintUnsupported(
                 f"Gemma constrained generation cannot represent tool name {tool.name!r}"
             )
+        branch_schema = mode is ToolConstraintMode.SCHEMA or tool.strict
         schema: dict[str, JsonValue] = (
-            {"type": "object"}
-            if mode is ToolConstraintMode.FORMAT
-            else constraint_schema(tool.parameters)
+            constraint_schema(tool.parameters) if branch_schema else {"type": "object"}
         )
         lines.append(
             f"tool_{index}: {lark_literal(f'call:{tool.name}')} "

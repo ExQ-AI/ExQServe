@@ -10,7 +10,7 @@ import pytest
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec
-from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.control.request import RequestRejected, RequestTerminalReason
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import GenerationEvent
@@ -163,6 +163,47 @@ def test_submit_compiles_and_builds_runtime_request_exactly_once() -> None:
                 stop_conditions=("<stop>",),
             )
         ]
+
+    asyncio.run(scenario())
+
+
+def test_strict_tools_reject_before_compilation_when_no_constraint_provider_exists() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
+        policy = ToolPolicy(
+            (
+                FunctionTool(
+                    "lookup",
+                    None,
+                    JsonSchema(
+                        '{"type":"object","properties":{"id":{"type":"integer"}},'
+                        '"required":["id"],"additionalProperties":false}'
+                    ),
+                    True,
+                ),
+            ),
+            ToolChoice(ToolChoiceMode.AUTO),
+            allow_parallel=False,
+        )
+        request = ServingRequest(
+            CanonicalRequest(
+                "strict-req",
+                "model",
+                items=(MessageItem(MessageRole.USER, "hello"),),
+            ),
+            ReasoningPolicy(),
+            policy,
+            max_output_tokens=16,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(request)
+
+        assert exc_info.value.error.code == "tool_constraint_unsupported"
+        assert compiler.calls == []
+        assert controller.requests == []
 
     asyncio.run(scenario())
 

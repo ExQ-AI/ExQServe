@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from exqserve.agent.schema import JsonSchema, _schema_violations
+from exqserve.agent.schema import JsonSchema, _schema_violations, validate_strict_function_schema
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
@@ -79,6 +79,47 @@ def test_schema_rejects_duplicate_keys_and_non_finite_json() -> None:
 
     with pytest.raises(ValueError, match="non-finite"):
         JsonSchema('{"const":NaN}')
+
+
+def test_strict_function_schema_accepts_required_nullable_nested_objects() -> None:
+    schema = JsonSchema(
+        '{"type":"object","properties":{'
+        '"name":{"type":["string","null"]},'
+        '"options":{"type":"object","properties":{"enabled":{"type":"boolean"}},'
+        '"required":["enabled"],"additionalProperties":false}'
+        '},"required":["name","options"],"additionalProperties":false}'
+    )
+
+    validate_strict_function_schema(schema)
+
+
+def test_strict_function_schema_requires_closed_objects_and_all_properties_required() -> None:
+    with pytest.raises(ValueError, match="additionalProperties"):
+        validate_strict_function_schema(
+            JsonSchema('{"type":"object","properties":{},"required":[]}')
+        )
+
+    with pytest.raises(ValueError, match="missing 'name'"):
+        validate_strict_function_schema(
+            JsonSchema(
+                '{"type":"object","properties":{"name":{"type":"string"}},'
+                '"required":[],"additionalProperties":false}'
+            )
+        )
+
+    with pytest.raises(ValueError, match="additionalProperties"):
+        validate_strict_function_schema(
+            JsonSchema(
+                '{"type":"object","properties":{"nested":{"type":"object",'
+                '"properties":{},"required":[]}},"required":["nested"],'
+                '"additionalProperties":false}'
+            )
+        )
+
+
+def test_strict_function_schema_requires_object_root() -> None:
+    with pytest.raises(ValueError, match="root type 'object'"):
+        validate_strict_function_schema(JsonSchema('{"type":"string"}'))
 
 
 def test_json_schema_is_immutable() -> None:

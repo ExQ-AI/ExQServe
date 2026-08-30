@@ -10,8 +10,8 @@ from exqserve.model.qwen import qwen_tool_constraint
 from exqserve.model.tool_constraints import qwen_parameter_schema
 
 
-def _tool(name: str, schema: str) -> FunctionTool:
-    return FunctionTool(name, None, JsonSchema(schema))
+def _tool(name: str, schema: str, *, strict: bool = False) -> FunctionTool:
+    return FunctionTool(name, None, JsonSchema(schema), strict)
 
 
 def _policy(
@@ -110,6 +110,73 @@ def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> N
     assert '"<tool_call>"' not in constraint.lark_grammar
     assert '"</tool_call>"' not in constraint.lark_grammar
     assert "%json" not in constraint.lark_grammar
+
+
+def test_qwen_strict_tool_escalates_off_baseline_to_schema() -> None:
+    constraint = qwen_tool_constraint(
+        _policy(_tool("save", _qwen_schema(), strict=True), parallel=False),
+        ToolConstraintMode.OFF,
+    )
+
+    assert constraint is not None
+    assert '"<parameter=count>"' in constraint.lark_grammar
+    assert '"minimum":1' in constraint.lark_grammar
+    assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' not in constraint.lark_grammar
+
+
+def test_qwen_mixed_strict_and_non_strict_tools_keep_distinct_branches() -> None:
+    strict_schema = (
+        '{"type":"object","properties":{"strict_value":{"type":"integer"}},'
+        '"required":["strict_value"],"additionalProperties":false}'
+    )
+    loose_schema = (
+        '{"type":"object","properties":{"loose_value":{"type":"integer"}},'
+        '"required":["loose_value"],"additionalProperties":false}'
+    )
+    constraint = qwen_tool_constraint(
+        _policy(
+            _tool("strict_tool", strict_schema, strict=True),
+            _tool("loose_tool", loose_schema),
+            parallel=False,
+        ),
+        ToolConstraintMode.OFF,
+    )
+
+    assert constraint is not None
+    assert '"<function=strict_tool>"' in constraint.lark_grammar
+    assert '"<parameter=strict_value>"' in constraint.lark_grammar
+    assert '"<function=loose_tool>"' in constraint.lark_grammar
+    assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' in constraint.lark_grammar
+    assert '"<parameter=loose_value>"' not in constraint.lark_grammar
+
+
+def test_qwen_named_non_strict_tool_ignores_hidden_strict_tools_when_baseline_off() -> None:
+    strict_tool = _tool("strict_tool", _qwen_schema(), strict=True)
+    loose_tool = _tool("loose_tool", _qwen_schema())
+    policy = _policy(
+        strict_tool,
+        loose_tool,
+        mode=ToolChoiceMode.NAMED,
+        name="loose_tool",
+        parallel=False,
+    )
+
+    assert qwen_tool_constraint(policy, ToolConstraintMode.OFF) is None
+
+
+def test_gemma_strict_tool_escalates_off_baseline_but_rejects_parallel() -> None:
+    tool = _tool("save", _schema(), strict=True)
+    constraint = gemma4_tool_constraint(
+        _policy(tool, parallel=False),
+        ToolConstraintMode.OFF,
+    )
+
+    assert constraint is not None
+    assert '"count"' in constraint.lark_grammar
+    assert constraint.eos_after_completed is True
+
+    with pytest.raises(ToolConstraintUnsupported, match="parallel"):
+        gemma4_tool_constraint(_policy(tool, parallel=True), ToolConstraintMode.OFF)
 
 
 def test_gemma_schema_constraint_uses_complete_standard_json_schema() -> None:

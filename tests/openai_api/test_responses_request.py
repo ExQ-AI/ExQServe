@@ -288,7 +288,7 @@ def test_responses_named_choice_must_reference_declared_function() -> None:
     assert exc_info.value.code == "invalid_tool_choice"
 
 
-def test_responses_rejects_strict_function_tools_until_constrained_decoding_exists() -> None:
+def test_responses_accepts_and_preserves_strict_function_tools() -> None:
     body = _full_body()
     tools = body["tools"]
     assert isinstance(tools, list)
@@ -296,8 +296,24 @@ def test_responses_rejects_strict_function_tools_until_constrained_decoding_exis
     assert isinstance(tool, dict)
     tool["strict"] = True
 
+    parsed = ResponsesRequestAdapter().parse(body, request_id="strict-responses")
+
+    assert parsed.serving.tools.tools[0].strict is True
+
+
+def test_responses_rejects_invalid_strict_function_schema() -> None:
+    body = _full_body()
+    tools = body["tools"]
+    assert isinstance(tools, list)
+    tool = tools[0]
+    assert isinstance(tool, dict)
+    tool["strict"] = True
+    parameters = tool["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.pop("additionalProperties")
+
     with pytest.raises(OpenAIProtocolError) as exc_info:
-        ResponsesRequestAdapter().parse(body, request_id="strict-responses")
+        ResponsesRequestAdapter().parse(body, request_id="strict-responses-invalid")
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.code == "unsupported_strict_tools"
+    assert exc_info.value.code == "invalid_json_schema"

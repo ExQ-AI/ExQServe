@@ -13,6 +13,7 @@ class FunctionTool:
     name: str
     description: str | None
     parameters: JsonSchema
+    strict: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -23,6 +24,8 @@ class FunctionTool:
             raise TypeError("description must be a string or None")
         if not isinstance(self.parameters, JsonSchema):
             raise TypeError("parameters must be a JsonSchema")
+        if not isinstance(self.strict, bool):
+            raise TypeError("strict must be a bool")
 
 
 class ToolChoiceMode(str, Enum):

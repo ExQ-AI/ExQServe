@@ -49,6 +49,7 @@ from exqserve.model.contracts import (
     TemplateToolResponse,
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
+    has_exposed_strict_tool,
 )
 from exqserve.runtime.contracts import (
     RuntimeConstraintUnsupported,
@@ -321,6 +322,17 @@ class ServingEngine:
         return len((await self._compile_request_async(request)).input_ids)
 
     async def submit(self, request: ServingRequest) -> ServingSession:
+        if (
+            self._tool_constraint_factory is None
+            and has_exposed_strict_tool(request.tools)
+        ):
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INVALID_REQUEST,
+                    "tool_constraint_unsupported",
+                    "Strict function tools are not supported by the selected model dialect.",
+                )
+            )
         compiled = await self._compile_request_async(request)
 
         try:

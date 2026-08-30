@@ -23,6 +23,7 @@ from exqserve.plugin_api import (
     ModelDialectPluginRegistration,
     ReasoningPolicy,
     RenderedPrompt,
+    StrictToolConstraintProvider,
     TemplateMessage,
     TemplateRequest,
     TextCompleted,
@@ -188,6 +189,7 @@ def test_tool_constraint_provider_is_additive_to_plugin_api_v1() -> None:
     assert not isinstance(_Dialect(), ToolConstraintProvider)
     dialect = _ConstrainedDialect()
     assert isinstance(dialect, ToolConstraintProvider)
+    assert not isinstance(dialect, StrictToolConstraintProvider)
     constraint = dialect.create_tool_constraint(_POLICY, ToolConstraintMode.FORMAT)
     assert constraint == ToolGenerationConstraint("<tool>", 'start: "ok"', False)
 

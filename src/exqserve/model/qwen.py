@@ -144,12 +144,19 @@ def qwen_tool_constraint(
 ) -> ToolGenerationConstraint | None:
     if not isinstance(mode, ToolConstraintMode):
         raise TypeError("mode must be a ToolConstraintMode")
-    if mode is ToolConstraintMode.OFF:
-        return None
 
     tools = tuple(sorted(exposed_tools(tool_policy), key=lambda item: item.name))
     if not tools:
         return None
+    if mode is ToolConstraintMode.OFF and not any(tool.strict for tool in tools):
+        return None
+
+    branch_modes = tuple(
+        ToolConstraintMode.SCHEMA
+        if mode is ToolConstraintMode.SCHEMA or tool.strict
+        else ToolConstraintMode.FORMAT
+        for tool in tools
+    )
 
     if tool_policy.allow_parallel:
         start_rule = (
@@ -162,7 +169,7 @@ def qwen_tool_constraint(
     lines.append("function: " + " | ".join(f"function_{index}" for index in range(len(tools))))
     uses_raw_string = False
 
-    if mode is ToolConstraintMode.FORMAT:
+    if ToolConstraintMode.FORMAT in branch_modes:
         lines.extend(
             [
                 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?',
@@ -172,13 +179,13 @@ def qwen_tool_constraint(
             ]
         )
 
-    for index, tool in enumerate(tools):
+    for index, (tool, branch_mode) in enumerate(zip(tools, branch_modes, strict=True)):
         if not _valid_tag_name(tool.name):
             raise ToolConstraintUnsupported(
                 f"Qwen constrained generation cannot represent tool name {tool.name!r}"
             )
         open_tag = lark_literal(f"<function={tool.name}>")
-        if mode is ToolConstraintMode.FORMAT:
+        if branch_mode is ToolConstraintMode.FORMAT:
             lines.append(f'function_{index}: {open_tag} WS? parameter* "</function>"')
             continue
 

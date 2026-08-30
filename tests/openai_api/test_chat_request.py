@@ -233,7 +233,7 @@ def test_chat_named_choice_must_reference_declared_function() -> None:
     assert exc_info.value.code == "invalid_tool_choice"
 
 
-def test_chat_rejects_strict_function_tools_until_constrained_decoding_exists() -> None:
+def test_chat_accepts_and_preserves_strict_function_tools() -> None:
     body = _full_body()
     tools = body["tools"]
     assert isinstance(tools, list)
@@ -241,8 +241,24 @@ def test_chat_rejects_strict_function_tools_until_constrained_decoding_exists() 
     assert isinstance(function, dict)
     function["strict"] = True
 
+    parsed = ChatRequestAdapter().parse(body, request_id="strict-chat")
+
+    assert parsed.serving.tools.tools[0].strict is True
+
+
+def test_chat_rejects_invalid_strict_function_schema() -> None:
+    body = _full_body()
+    tools = body["tools"]
+    assert isinstance(tools, list)
+    function = tools[0]["function"]
+    assert isinstance(function, dict)
+    function["strict"] = True
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters.pop("additionalProperties")
+
     with pytest.raises(OpenAIProtocolError) as exc_info:
-        ChatRequestAdapter().parse(body, request_id="strict-chat")
+        ChatRequestAdapter().parse(body, request_id="strict-chat-invalid")
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.code == "unsupported_strict_tools"
+    assert exc_info.value.code == "invalid_json_schema"

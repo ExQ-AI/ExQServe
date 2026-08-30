@@ -71,6 +71,63 @@ def _schema_violations(schema: JsonSchema, value: JsonValue) -> tuple[_SchemaVio
     return tuple(sorted(violations, key=_violation_sort_key))
 
 
+def validate_strict_function_schema(schema: JsonSchema) -> None:
+    """Validate strict function declaration structure before generation."""
+
+    if not isinstance(schema, JsonSchema):
+        raise TypeError("schema must be a JsonSchema")
+    value = parse_json_strict(schema.canonical_json)
+    assert isinstance(value, dict)
+    if value.get("type") != "object":
+        raise ValueError("strict function parameters must declare root type 'object'")
+    _validate_strict_schema_node(value, ())
+
+
+def _validate_strict_schema_node(value: JsonValue, path: tuple[str | int, ...]) -> None:
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_strict_schema_node(child, (*path, index))
+        return
+    if not isinstance(value, dict):
+        return
+
+    type_value = value.get("type")
+    object_schema = (
+        type_value == "object"
+        or (isinstance(type_value, list) and "object" in type_value)
+        or "properties" in value
+    )
+    if object_schema:
+        location = _format_schema_path(path)
+        if value.get("additionalProperties") is not False:
+            raise ValueError(f"object schema at {location} must set additionalProperties to false")
+        properties = value.get("properties", {})
+        assert isinstance(properties, dict)
+        required = value.get("required", [])
+        assert isinstance(required, list)
+        required_names = {item for item in required if isinstance(item, str)}
+        missing = sorted(set(properties) - required_names)
+        if missing:
+            raise ValueError(
+                f"object schema at {location} must require every property; missing {missing[0]!r}"
+            )
+
+    for key, child in value.items():
+        _validate_strict_schema_node(child, (*path, key))
+
+
+def _format_schema_path(path: tuple[str | int, ...]) -> str:
+    if not path:
+        return "$"
+    rendered = "$"
+    for part in path:
+        if isinstance(part, int):
+            rendered += f"[{part}]"
+        else:
+            rendered += f".{part}"
+    return rendered
+
+
 def _violation_sort_key(violation: _SchemaViolation) -> tuple[object, ...]:
     path_key = tuple(
         (0, f"{part:020d}") if isinstance(part, int) else (1, part)

@@ -9,12 +9,25 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from exqserve.agent.reasoning import ReasoningPolicy
-from exqserve.agent.tools import ToolPolicy
+from exqserve.agent.tools import ToolChoiceMode, ToolPolicy
 from exqserve.core.events import GenerationEvent
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.tokens import NativeTokenSpan
 
 type TemplateScalar = str | int | float | bool | None
+
+
+def has_exposed_strict_tool(policy: ToolPolicy) -> bool:
+    if not isinstance(policy, ToolPolicy):
+        raise TypeError("policy must be a ToolPolicy")
+    if policy.choice.mode is ToolChoiceMode.NONE:
+        return False
+    if policy.choice.mode is ToolChoiceMode.NAMED:
+        return any(
+            tool.name == policy.choice.name and tool.strict
+            for tool in policy.tools
+        )
+    return any(tool.strict for tool in policy.tools)
 
 
 def _validate_bool(name: str, value: bool) -> None:
@@ -359,6 +372,13 @@ class ToolConstraintProvider(Protocol):
         tool_policy: ToolPolicy,
         mode: ToolConstraintMode,
     ) -> ToolGenerationConstraint | None:
+        ...
+
+
+@runtime_checkable
+class StrictToolConstraintProvider(Protocol):
+    @property
+    def supports_strict_tools(self) -> bool:
         ...
 
 

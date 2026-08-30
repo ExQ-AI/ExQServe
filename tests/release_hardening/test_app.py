@@ -341,6 +341,86 @@ def test_composition_requires_constraint_provider_only_when_mode_is_enabled(tmp_
         raise AssertionError("unsupported dialect accepted explicit constrained generation")
 
 
+def test_qwen_strict_tool_escalates_constraint_when_global_mode_is_off(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
+        composed = compose_server(ServerConfig(tmp_path, served_model_id="qwen"), runtime=runtime)
+        response = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"id": {"type": "integer"}},
+                                "required": ["id"],
+                                "additionalProperties": False,
+                            },
+                            "strict": True,
+                        },
+                    }
+                ],
+                "parallel_tool_calls": False,
+                "reasoning_effort": "disabled",
+            },
+        )
+
+        assert response.status_code == 200
+        assert len(runtime.submit_calls) == 1
+        constraint = runtime.submit_calls[0].generation_constraint
+        assert constraint is not None
+        assert '"<parameter=id>"' in constraint.lark_grammar
+
+    asyncio.run(scenario())
+
+
+def test_generic_strict_tool_rejects_before_runtime_submission_when_global_mode_is_off(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        runtime.model_metadata = RuntimeModelMetadata(131072, "LlamaForCausalLM")
+        composed = compose_server(ServerConfig(tmp_path, served_model_id="generic"), runtime=runtime)
+        response = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "generic",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                                "additionalProperties": False,
+                            },
+                            "strict": True,
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "tool_constraint_unsupported"
+        assert runtime.submit_calls == []
+
+    asyncio.run(scenario())
+
+
 def test_qwen_composition_forwards_enabled_tool_constraint(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = _FakeRuntime()
