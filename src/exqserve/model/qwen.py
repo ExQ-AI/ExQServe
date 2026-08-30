@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from exqserve.agent._json import (
     InvalidJsonError,
@@ -472,6 +473,19 @@ class QwenParserFinish:
             raise TypeError("incomplete_tool_call must be a bool")
 
 
+class _QwenMode(Enum):
+    TEXT = auto()
+    REASONING = auto()
+    TOOL = auto()
+
+
+class _QwenToolState(Enum):
+    FUNCTION = auto()
+    PARAMETERS = auto()
+    OUTER = auto()
+    MALFORMED = auto()
+
+
 _PLAIN_MARKERS = ("<think>", "</think>", "<tool_call>")
 _FUNCTION_OPEN = "<function="
 _FUNCTION_CLOSE = "</function>"
@@ -679,14 +693,14 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._string_parameters = _qwen_string_parameters(tool_policy)
         self._request_id = request_id
         self._buffer = ""
-        self._mode = "reasoning" if start_in_reasoning else "text"
+        self._mode = _QwenMode.REASONING if start_in_reasoning else _QwenMode.TEXT
         self._text_open = False
         self._text_value = ""
         self._reasoning_open = False
         self._reasoning_value = ""
         self._call_index = 0
-        self._tool_return_mode = "text"
-        self._tool_state = "function"
+        self._tool_return_mode = _QwenMode.TEXT
+        self._tool_state = _QwenToolState.FUNCTION
         self._tool_name: str | None = None
         self._tool_call_id: str | None = None
         self._tool_started = False
@@ -704,7 +718,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             return
         self._literal_context.observe(text)
         self._last_content_character = text[-1]
-        if self._mode == "reasoning":
+        if self._mode is _QwenMode.REASONING:
             if not self._reasoning_open:
                 events.append(ReasoningStarted(self._request_id))
                 self._reasoning_open = True
@@ -721,11 +735,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         events.append(TextDelta(self._request_id, text))
 
     def _close_current_channel(self, events: list[GenerationEvent]) -> None:
-        if self._mode == "reasoning" and self._reasoning_open:
+        if self._mode is _QwenMode.REASONING and self._reasoning_open:
             events.append(ReasoningCompleted(self._request_id, self._reasoning_value))
             self._reasoning_open = False
             self._reasoning_value = ""
-        elif self._mode == "text" and self._text_open:
+        elif self._mode is _QwenMode.TEXT and self._text_open:
             events.append(TextCompleted(self._request_id, self._text_value))
             self._text_open = False
             self._text_value = ""
@@ -733,8 +747,8 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
     def _enter_tool(self, events: list[GenerationEvent]) -> None:
         self._close_current_channel(events)
         self._tool_return_mode = self._mode
-        self._mode = "tool"
-        self._tool_state = "function"
+        self._mode = _QwenMode.TOOL
+        self._tool_state = _QwenToolState.FUNCTION
         self._tool_name = None
         self._tool_call_id = None
         self._tool_started = False
@@ -743,7 +757,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
     def _restore_after_tool(self) -> None:
         self._mode = self._tool_return_mode
-        self._tool_state = "function"
+        self._tool_state = _QwenToolState.FUNCTION
         self._tool_name = None
         self._tool_call_id = None
         self._tool_started = False
@@ -803,13 +817,13 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
             self._buffer = self._buffer[len(marker) :]
             if marker == "<think>":
-                if self._mode != "reasoning":
+                if self._mode is not _QwenMode.REASONING:
                     self._close_current_channel(events)
-                    self._mode = "reasoning"
+                    self._mode = _QwenMode.REASONING
             else:
-                if self._mode == "reasoning":
+                if self._mode is _QwenMode.REASONING:
                     self._close_current_channel(events)
-                    self._mode = "text"
+                    self._mode = _QwenMode.TEXT
             return True
 
         held = _longest_partial_marker_suffix(self._buffer)
@@ -828,7 +842,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
     def _mark_tool_malformed(self) -> None:
         self._had_incomplete_tool = True
-        self._tool_state = "malformed"
+        self._tool_state = _QwenToolState.MALFORMED
 
     def _ensure_tool_started(self, events: list[GenerationEvent]) -> None:
         if self._tool_started:
@@ -864,7 +878,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         else:
             self._tool_arguments_json = "".join(self._tool_argument_parts) + "}"
             self._emit_tool_delta("}", events)
-        self._tool_state = "outer"
+        self._tool_state = _QwenToolState.OUTER
 
     def _process_tool_function(self) -> bool:
         if self._consume_tool_whitespace():
@@ -888,7 +902,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._tool_name = name
         self._tool_call_id = _deterministic_call_id(self._request_id, self._call_index)
         self._buffer = self._buffer[header_end + 1 :]
-        self._tool_state = "parameters"
+        self._tool_state = _QwenToolState.PARAMETERS
         return True
 
     def _process_tool_parameters(self, events: list[GenerationEvent]) -> bool:
@@ -976,11 +990,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         return True
 
     def _process_tool(self, events: list[GenerationEvent]) -> bool:
-        if self._tool_state == "function":
+        if self._tool_state is _QwenToolState.FUNCTION:
             return self._process_tool_function()
-        if self._tool_state == "parameters":
+        if self._tool_state is _QwenToolState.PARAMETERS:
             return self._process_tool_parameters(events)
-        if self._tool_state == "outer":
+        if self._tool_state is _QwenToolState.OUTER:
             return self._process_tool_outer(events)
         return self._process_tool_malformed()
 
@@ -989,29 +1003,29 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             self._enter_tool(events)
             return
         if marker == "<think>":
-            if self._mode == "reasoning":
+            if self._mode is _QwenMode.REASONING:
                 self._emit_content(marker, events)
                 return
             self._close_current_channel(events)
-            self._mode = "reasoning"
+            self._mode = _QwenMode.REASONING
             return
         if marker == "</think>":
-            if self._mode != "reasoning":
+            if self._mode is not _QwenMode.REASONING:
                 self._emit_content(marker, events)
                 return
             self._close_current_channel(events)
-            self._mode = "text"
+            self._mode = _QwenMode.TEXT
 
     def _feed_native_text_segment(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
             return
-        if self._mode != "tool":
+        if self._mode is not _QwenMode.TOOL:
             self._emit_content(text, events)
             return
         self._buffer += text
-        while self._mode == "tool" and self._process_tool(events):
+        while self._mode is _QwenMode.TOOL and self._process_tool(events):
             pass
-        if self._mode != "tool" and self._buffer:
+        if self._mode is not _QwenMode.TOOL and self._buffer:
             remainder = self._buffer
             self._buffer = ""
             self._emit_content(remainder, events)
@@ -1086,7 +1100,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             exact = next((marker for marker in _PLAIN_MARKERS if marker == combined), None)
             if exact is not None:
                 self._unverified_marker_prefix = ""
-                if self._mode == "tool":
+                if self._mode is _QwenMode.TOOL:
                     self._feed_native_text_segment(combined, events)
                 else:
                     self._handle_marker_candidate(
@@ -1104,8 +1118,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._unverified_marker_prefix = combined
         return len(chunk)
 
+    def _in_tool_mode(self) -> bool:
+        return self._mode is _QwenMode.TOOL
+
     def _feed_unverified_text(self, chunk: str, events: list[GenerationEvent]) -> None:
-        if self._mode == "tool":
+        if self._in_tool_mode():
             self._feed_native_text_segment(chunk, events)
             return
 
@@ -1124,7 +1141,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
             position, marker = match
             self._feed_native_text_segment(chunk[cursor:position], events)
-            if self._mode == "tool":
+            if self._in_tool_mode():
                 self._feed_native_text_segment(marker, events)
                 cursor = position + len(marker)
                 continue
@@ -1160,7 +1177,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             if span.start < cursor or span.end > len(chunk) or chunk[span.start : span.end] != span.text:
                 raise ValueError("native token spans do not match the supplied chunk")
             self._feed_native_text_segment(chunk[cursor : span.start], events)
-            if self._mode == "tool" or span.text not in _PLAIN_MARKERS:
+            if self._mode is _QwenMode.TOOL or span.text not in _PLAIN_MARKERS:
                 self._feed_native_text_segment(span.text, events)
             else:
                 self._handle_marker_candidate(
@@ -1183,7 +1200,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
         while True:
             progressed = (
-                self._process_tool(events) if self._mode == "tool" else self._process_plain(events)
+                self._process_tool(events) if self._mode is _QwenMode.TOOL else self._process_plain(events)
             )
             if not progressed:
                 break
@@ -1205,7 +1222,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                     "Qwen marker provenance was unavailable outside a definite literal context"
                 )
             self._apply_native_marker(marker, events)
-        if self._mode == "tool":
+        if self._mode is _QwenMode.TOOL:
             self._had_incomplete_tool = True
             self._buffer = ""
             self._restore_after_tool()
@@ -1213,12 +1230,12 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             while self._buffer:
                 progressed = (
                     self._process_tool(events)
-                    if self._mode == "tool"
+                    if self._in_tool_mode()
                     else self._process_plain(events, final=True)
                 )
                 if not progressed:
                     break
-            if self._mode == "tool":
+            if self._in_tool_mode():
                 self._had_incomplete_tool = True
                 self._buffer = ""
                 self._restore_after_tool()
