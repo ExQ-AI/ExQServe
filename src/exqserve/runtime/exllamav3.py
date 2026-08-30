@@ -1140,6 +1140,24 @@ def _create_backend_job(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ExLlamaV3Resources:
+    config: ExLlamaV3LoadConfig
+    backend: Any
+    tokenizer: Any
+    model: Any
+    cache: Any
+    vision_model: Any | None
+    vision_cache: VisionEmbeddingCache | None
+    draft_model: Any | None
+    draft_cache: Any | None
+    loras: tuple[Any, ...]
+    model_metadata: RuntimeModelMetadata
+    native_eos_token_ids: tuple[int, ...]
+    output_id_to_piece: tuple[str, ...] | None
+    output_native_piece_ids: frozenset[int] | None
+
+
 class ExLlamaV3Runtime:
     capabilities = RuntimeCapabilities(
         cancellation=True,
@@ -1152,53 +1170,25 @@ class ExLlamaV3Runtime:
     )
 
     def __init__(self) -> None:
-        self._backend: Any | None = None
-        self._load_config: ExLlamaV3LoadConfig | None = None
-        self._tokenizer: Any | None = None
-        self._model: Any | None = None
-        self._cache: Any | None = None
-        self._vision_model: Any | None = None
-        self._vision_cache: VisionEmbeddingCache | None = None
-        self._draft_model: Any | None = None
-        self._draft_cache: Any | None = None
-        self._loras: list[Any] = []
+        self._resources: _ExLlamaV3Resources | None = None
         self._generator: Any | None = None
         self._backend_failed = False
-        self._model_metadata = RuntimeModelMetadata()
-        self._native_eos_token_ids: tuple[int, ...] = ()
-        self._output_id_to_piece: tuple[str, ...] | None = None
-        self._output_native_piece_ids: frozenset[int] | None = None
 
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
-        return self._model_metadata
+        resources = self._resources
+        return RuntimeModelMetadata() if resources is None else resources.model_metadata
 
     @property
     def vision_cache_stats(self) -> VisionEmbeddingCacheStats | None:
-        cache = self._vision_cache
-        return None if cache is None else cache.stats()
+        resources = self._resources
+        if resources is None or resources.vision_cache is None:
+            return None
+        return resources.vision_cache.stats()
 
     @property
     def is_ready(self) -> bool:
-        base_ready = (
-            self._backend is not None
-            and self._load_config is not None
-            and self._tokenizer is not None
-            and self._model is not None
-            and self._cache is not None
-        )
-        if not base_ready:
-            return False
-        assert self._load_config is not None
-        draft_enabled = (
-            self._load_config.mtp_enabled or self._load_config.draft_model_directory is not None
-        )
-        draft_ready = not draft_enabled or (
-            self._draft_model is not None and self._draft_cache is not None
-        )
-        vision_ready = not self._load_config.vision_enabled or self._vision_model is not None
-        lora_ready = len(self._loras) == len(self._load_config.lora_adapters)
-        return draft_ready and vision_ready and lora_ready
+        return self._resources is not None
 
     @property
     def is_healthy(self) -> bool:
@@ -1207,25 +1197,30 @@ class ExLlamaV3Runtime:
     def _mark_backend_failed(self) -> None:
         self._backend_failed = True
 
-    def _require_loaded(self) -> tuple[Any, Any]:
-        if not self.is_ready or self._backend is None:
+    def _require_resources(self) -> _ExLlamaV3Resources:
+        resources = self._resources
+        if resources is None:
             raise RuntimeError("ExLlamaV3 runtime is not ready")
-        return self._backend, self._tokenizer
+        return resources
+
+    def _require_loaded(self) -> tuple[Any, Any]:
+        resources = self._require_resources()
+        return resources.backend, resources.tokenizer
 
     def _ensure_generator(self) -> Any:
         if self._generator is not None:
             return self._generator
-        backend, text_codec = self._require_loaded()
-        if self._model is None or self._cache is None or self._load_config is None:
-            raise RuntimeError("ExLlamaV3 runtime is not ready")
+        resources = self._require_resources()
+        backend = resources.backend
+        text_codec = resources.tokenizer
         try:
             asyncio.get_running_loop()
         except RuntimeError as exc:
             raise RuntimeError("ExLlamaV3 submit requires a running event loop") from exc
-        config = self._load_config
+        config = resources.config
         draft_enabled = config.mtp_enabled or config.draft_model_directory is not None
         if draft_enabled:
-            if self._draft_model is None or self._draft_cache is None:
+            if resources.draft_model is None or resources.draft_cache is None:
                 raise RuntimeError("ExLlamaV3 draft runtime is not ready")
             dynamic_draft = config.dynamic_draft_tokens
             generator_options = {
@@ -1238,21 +1233,21 @@ class ExLlamaV3Runtime:
             # the draft-token count: model, cache, tokenizer, batch/chunk limits, queue size,
             # draft model, draft cache, draft-token count.
             self._generator = backend.AsyncGenerator(
-                self._model,
-                self._cache,
+                resources.model,
+                resources.cache,
                 text_codec,
                 config.max_batch_size,
                 config.max_chunk_size,
                 8,
-                self._draft_model,
-                self._draft_cache,
+                resources.draft_model,
+                resources.draft_cache,
                 config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
                 **generator_options,
             )
         elif config.ngram_match_min:
             self._generator = backend.AsyncGenerator(
-                self._model,
-                self._cache,
+                resources.model,
+                resources.cache,
                 text_codec,
                 config.max_batch_size,
                 config.max_chunk_size,
@@ -1266,8 +1261,8 @@ class ExLlamaV3Runtime:
             )
         else:
             self._generator = backend.AsyncGenerator(
-                self._model,
-                self._cache,
+                resources.model,
+                resources.cache,
                 text_codec,
                 max_batch_size=config.max_batch_size,
                 max_chunk_size=config.max_chunk_size,
@@ -1279,7 +1274,7 @@ class ExLlamaV3Runtime:
     def load(self, config: ExLlamaV3LoadConfig) -> None:
         if not isinstance(config, ExLlamaV3LoadConfig):
             raise TypeError("config must be an ExLlamaV3LoadConfig")
-        if self.is_ready or self._backend is not None:
+        if self._resources is not None:
             raise RuntimeError("ExLlamaV3 runtime is already loaded")
 
         _configure_cuda_malloc_async(config.cuda_malloc_async)
@@ -1293,6 +1288,7 @@ class ExLlamaV3Runtime:
         draft_cache_object: Any | None = None
         loras: list[Any] = []
         model_metadata = RuntimeModelMetadata()
+        native_eos_token_ids: tuple[int, ...] = ()
         output_id_to_piece: tuple[str, ...] | None = None
         output_native_piece_ids: frozenset[int] | None = None
         try:
@@ -1307,7 +1303,7 @@ class ExLlamaV3Runtime:
             text_codec = backend.Tokenizer.from_config(backend_config)
             output_id_to_piece, output_native_piece_ids = _output_token_provenance_metadata(text_codec)
             raw_eos_token_ids = getattr(backend_config, "eos_token_id_list", ())
-            self._native_eos_token_ids = tuple(
+            native_eos_token_ids = tuple(
                 dict.fromkeys(
                     token_id
                     for token_id in raw_eos_token_ids
@@ -1439,42 +1435,34 @@ class ExLlamaV3Runtime:
             if vision_model is not None:
                 with suppress(Exception):
                     vision_model.unload()
-            self._backend = None
-            self._load_config = None
-            self._tokenizer = None
-            self._model = None
-            self._cache = None
-            self._vision_model = None
-            self._vision_cache = None
-            self._draft_model = None
-            self._draft_cache = None
-            self._loras = []
-            self._generator = None
-            self._model_metadata = RuntimeModelMetadata()
-            self._native_eos_token_ids = ()
-            self._output_id_to_piece = None
-            self._output_native_piece_ids = None
             raise
 
-        self._backend = backend
-        self._load_config = config
-        self._tokenizer = text_codec
-        self._model = model
-        self._cache = cache_object
-        self._vision_model = vision_model
-        self._vision_cache = (
+        assert model is not None
+        assert cache_object is not None
+        vision_cache = (
             VisionEmbeddingCache(config.vision_cache_mb * 1024 * 1024)
             if vision_model is not None
             else None
         )
-        self._draft_model = draft_model
-        self._draft_cache = draft_cache_object
-        self._loras = loras
+        resources = _ExLlamaV3Resources(
+            config,
+            backend,
+            text_codec,
+            model,
+            cache_object,
+            vision_model,
+            vision_cache,
+            draft_model,
+            draft_cache_object,
+            tuple(loras),
+            model_metadata,
+            native_eos_token_ids,
+            output_id_to_piece,
+            output_native_piece_ids,
+        )
+        self._resources = resources
         self._generator = None
         self._backend_failed = False
-        self._model_metadata = model_metadata
-        self._output_id_to_piece = output_id_to_piece
-        self._output_native_piece_ids = output_native_piece_ids
 
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         """Tokenize a raw document-continuation prompt without applying a chat template."""
@@ -1511,7 +1499,8 @@ class ExLlamaV3Runtime:
         add_generation_prompt: bool = True,
         protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
-        _, text_codec = self._require_loaded()
+        resources = self._require_resources()
+        text_codec = resources.tokenizer
         if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
             raise TypeError("messages must be a list of dictionaries")
         if tools is not None and (
@@ -1537,8 +1526,8 @@ class ExLlamaV3Runtime:
             render_tools = protect_tools(tools, sentinels)
 
         kwargs = dict(template_kwargs)
-        config = self._load_config
-        if config is not None and config.chat_template is not None:
+        config = resources.config
+        if config.chat_template is not None:
             kwargs["chat_template"] = config.chat_template
         if render_tools is not None:
             kwargs["tools"] = render_tools
@@ -1554,9 +1543,10 @@ class ExLlamaV3Runtime:
         sources = _image_sources(messages)
         attachments: tuple[object, ...] = ()
         if sources:
-            vision_model = self._vision_model
-            if config is None or not config.vision_enabled or vision_model is None:
+            vision_model = resources.vision_model
+            if not config.vision_enabled or vision_model is None:
                 raise ValueError("vision input requires a vision-enabled runtime")
+            vision_cache = resources.vision_cache
             embeddings: list[object] = []
             for source in sources:
                 data = _load_image_bytes(
@@ -1565,12 +1555,12 @@ class ExLlamaV3Runtime:
                     max_bytes=config.max_image_bytes,
                 )
                 cache_key = hashlib.sha256(data).hexdigest()
-                embedding = None if self._vision_cache is None else self._vision_cache.get(cache_key)
+                embedding = None if vision_cache is None else vision_cache.get(cache_key)
                 if embedding is None:
                     image = _decode_image_bytes(data)
                     embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
-                    if self._vision_cache is not None:
-                        self._vision_cache.put(cache_key, embedding)
+                    if vision_cache is not None:
+                        vision_cache.put(cache_key, embedding)
                 embeddings.append(embedding)
             encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
             if sentinels:
@@ -1608,12 +1598,12 @@ class ExLlamaV3Runtime:
         return RuntimeRenderedPrompt(visible_text, input_ids, attachments)
 
     def submit(self, request: RuntimeGenerationRequest) -> RuntimeSession:
-        backend, text_codec = self._require_loaded()
+        resources = self._require_resources()
+        backend = resources.backend
+        text_codec = resources.tokenizer
         if self._backend_failed:
             raise RuntimeError("ExLlamaV3 runtime is unhealthy after a backend generation failure")
-        config = self._load_config
-        if config is None:
-            raise RuntimeError("ExLlamaV3 runtime is not ready")
+        config = resources.config
         if not isinstance(request, RuntimeGenerationRequest):
             raise TypeError("request must be a RuntimeGenerationRequest")
         generator = self._ensure_generator()
@@ -1637,22 +1627,23 @@ class ExLlamaV3Runtime:
                 config.max_requeue_tokens,
                 embeddings or None,
                 output_filters,
-                self._native_eos_token_ids,
+                resources.native_eos_token_ids,
             ),
             self._mark_backend_failed,
-            id_to_piece=self._output_id_to_piece,
-            native_piece_ids=self._output_native_piece_ids,
+            id_to_piece=resources.output_id_to_piece,
+            native_piece_ids=resources.output_native_piece_ids,
         )
 
     async def close(self) -> None:
-        if self._backend is None and self._generator is None and self._model is None:
+        resources = self._resources
+        if resources is None:
             return
 
         generator = self._generator
-        model = self._model
-        vision_model = self._vision_model
-        draft_model = self._draft_model
-        loras = list(self._loras)
+        model = resources.model
+        vision_model = resources.vision_model
+        draft_model = resources.draft_model
+        loras = list(resources.loras)
         close_error: BaseException | None = None
         if generator is not None:
             try:
@@ -1684,23 +1675,10 @@ class ExLlamaV3Runtime:
                 if close_error is None:
                     close_error = exc
 
-        self._backend = None
-        self._load_config = None
-        self._tokenizer = None
-        self._model = None
-        self._cache = None
-        self._vision_model = None
-        if self._vision_cache is not None:
-            self._vision_cache.clear()
-        self._vision_cache = None
-        self._draft_model = None
-        self._draft_cache = None
-        self._loras = []
+        if resources.vision_cache is not None:
+            resources.vision_cache.clear()
+        self._resources = None
         self._generator = None
-        self._model_metadata = RuntimeModelMetadata()
-        self._native_eos_token_ids = ()
-        self._output_id_to_piece = None
-        self._output_native_piece_ids = None
 
         if close_error is not None:
             raise RuntimeError("Failed to close ExLlamaV3 runtime cleanly.") from close_error

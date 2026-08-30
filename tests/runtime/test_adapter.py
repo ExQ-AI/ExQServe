@@ -884,9 +884,11 @@ def test_lora_loads_multiple_adapters_with_independent_scaling_and_unloads(
         (backend._state["model"], "/loras/b", 0.75),
     ]
     assert backend._state["model"].load_calls
-    assert len(runtime._loras) == 2
+    assert runtime._resources is not None
+    assert len(runtime._resources.loras) == 2
 
     asyncio.run(runtime.close())
+    assert runtime._resources is None
     assert [adapter.unload_calls for adapter in _FakeLoRA.instances] == [1, 1]
     assert backend._state["model"].unload_calls == 1
 
@@ -919,7 +921,7 @@ def test_lora_load_failure_rolls_back_prior_adapter_and_target(
     assert _FakeLoRA.instances[0].unload_calls == 1
     assert backend._state["model"].unload_calls == 1
     assert runtime.is_ready is False
-    assert runtime._loras == []
+    assert runtime._resources is None
 
 
 def test_model_metadata_falls_back_to_config_limit_when_rope_limit_is_unavailable(

@@ -65,8 +65,9 @@ def test_real_qwen_lora_load_generate_unload_then_plain_reload() -> None:
         )
     )
     try:
-        assert len(runtime._loras) == 1
-        loaded_lora = runtime._loras[0]
+        assert runtime._resources is not None
+        assert len(runtime._resources.loras) == 1
+        loaded_lora = runtime._resources.loras[0]
         target_modules = getattr(loaded_lora, "target_modules", None)
         assert isinstance(target_modules, dict)
         assert target_modules, "real PEFT adapter matched zero ExLlamaV3 target modules"
@@ -74,7 +75,7 @@ def test_real_qwen_lora_load_generate_unload_then_plain_reload() -> None:
     finally:
         asyncio.run(runtime.close())
 
-    assert runtime._loras == []
+    assert runtime._resources is None
     assert runtime.is_ready is False
 
     plain = ExLlamaV3Runtime()
@@ -90,7 +91,8 @@ def test_real_qwen_lora_load_generate_unload_then_plain_reload() -> None:
         )
     )
     try:
-        assert plain._loras == []
+        assert plain._resources is not None
+        assert plain._resources.loras == ()
         _generate_once(plain, "plain-after-lora")
     finally:
         asyncio.run(plain.close())
