@@ -412,5 +412,3 @@ class ChatRequestAdapter:
             parse_stop(body.get("stop")),
         )
         return ParsedOpenAIRequest(serving, model, stream, OpenAIProtocol.CHAT, include_usage)
-
-

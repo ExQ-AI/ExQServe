@@ -589,5 +589,3 @@ class ResponsesRequestAdapter:
             instruction_items,
             state_input_items,
         )
-
-
