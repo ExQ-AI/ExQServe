@@ -203,3 +203,59 @@ def test_qwen_provenance_loss_at_ambiguous_marker_fails_closed() -> None:
         assert not any(isinstance(event, ToolCallCompleted) for event in events)
 
     asyncio.run(scenario())
+
+
+def test_qwen_provenance_loss_deferred_to_eof_fails_closed_through_serving() -> None:
+    async def scenario() -> None:
+        renderer = _Renderer()
+        compiler = QwenPromptCompiler(RuntimeTemplateAdapter(renderer))
+        policy = ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        usage = TokenUsage(input_tokens=3, output_tokens=4)
+        controlled = _Controlled(
+            [
+                RuntimeStarted("req-qwen-eof-provenance"),
+                RuntimeTextDelta(
+                    "req-qwen-eof-provenance",
+                    "ends with quote '</think>",
+                    (1, 2, 3),
+                    None,
+                    True,
+                ),
+                RuntimeFinished(
+                    "req-qwen-eof-provenance",
+                    RuntimeStopReason.EOS,
+                    usage,
+                    RuntimeTiming(),
+                ),
+            ]
+        )
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
+                request_id,
+                start_in_reasoning=True,
+                tool_policy=tool_policy,
+            ),
+            _Controller(controlled),
+        )
+        request = ServingRequest(
+            CanonicalRequest(
+                "req-qwen-eof-provenance",
+                "qwen",
+                (MessageItem(MessageRole.USER, "inspect"),),
+            ),
+            ReasoningPolicy(ReasoningMode.ENABLED),
+            policy,
+            max_output_tokens=16,
+        )
+
+        events = [event async for event in await engine.submit(request)]
+
+        failures = [event for event in events if isinstance(event, GenerationFailed)]
+        assert len(failures) == 1
+        assert failures[0].error.code == "output_" + "token_provenance_unavailable"
+        assert failures[0].error.retryable is True
+        assert controlled.terminal_reason is RequestTerminalReason.APPLICATION_CANCELLED
+        assert not any(isinstance(event, GenerationCompleted) for event in events)
+
+    asyncio.run(scenario())

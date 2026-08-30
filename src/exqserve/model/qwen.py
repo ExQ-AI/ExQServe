@@ -690,6 +690,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._last_content_character: str | None = None
         self._literal_context = _MarkdownCodeContext()
         self._pending_native_marker: tuple[str, str, bool] | None = None
+        self._unverified_marker_prefix = ""
         self._finished = False
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
@@ -1055,7 +1056,53 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             )
         self._apply_native_marker(marker, events)
 
+    @staticmethod
+    def _split_marker_prefix_suffix(text: str) -> tuple[str, str]:
+        max_width = min(len(text), max(len(marker) for marker in _PLAIN_MARKERS) - 1)
+        for width in range(max_width, 0, -1):
+            suffix = text[-width:]
+            if any(marker.startswith(suffix) for marker in _PLAIN_MARKERS):
+                return text[:-width], suffix
+        return text, ""
+
+    def _resolve_unverified_marker_prefix(
+        self,
+        chunk: str,
+        events: list[GenerationEvent],
+    ) -> int:
+        if not self._unverified_marker_prefix:
+            return 0
+
+        pending = self._unverified_marker_prefix
+        combined = pending
+        for consumed, character in enumerate(chunk, start=1):
+            combined += character
+            exact = next((marker for marker in _PLAIN_MARKERS if marker == combined), None)
+            if exact is not None:
+                self._unverified_marker_prefix = ""
+                if self._mode == "tool":
+                    self._feed_native_text_segment(combined, events)
+                else:
+                    self._handle_marker_candidate(
+                        exact,
+                        chunk[consumed:],
+                        events,
+                        verified=False,
+                    )
+                return consumed
+            if not any(marker.startswith(combined) for marker in _PLAIN_MARKERS):
+                self._unverified_marker_prefix = ""
+                self._feed_native_text_segment(pending, events)
+                return 0
+
+        self._unverified_marker_prefix = combined
+        return len(chunk)
+
     def _feed_unverified_text(self, chunk: str, events: list[GenerationEvent]) -> None:
+        if self._mode == "tool":
+            self._feed_native_text_segment(chunk, events)
+            return
+
         cursor = 0
         while cursor < len(chunk):
             match: tuple[int, str] | None = None
@@ -1064,7 +1111,9 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 if position >= 0 and (match is None or position < match[0]):
                     match = (position, marker)
             if match is None:
-                self._feed_native_text_segment(chunk[cursor:], events)
+                stable, prefix = self._split_marker_prefix_suffix(chunk[cursor:])
+                self._feed_native_text_segment(stable, events)
+                self._unverified_marker_prefix = prefix
                 return
 
             position, marker = match
@@ -1091,11 +1140,14 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
         events: list[GenerationEvent] = []
         self._resolve_pending_native_marker(chunk, events)
+        prefix_consumed = self._resolve_unverified_marker_prefix(chunk, events)
+        if prefix_consumed == len(chunk):
+            return tuple(events)
         if native_token_spans is None:
-            self._feed_unverified_text(chunk, events)
+            self._feed_unverified_text(chunk[prefix_consumed:], events)
             return tuple(events)
 
-        cursor = 0
+        cursor = prefix_consumed
         for span in native_token_spans:
             if not isinstance(span, NativeTokenSpan):
                 raise TypeError("native_token_spans must contain NativeTokenSpan values")
@@ -1136,10 +1188,17 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             return QwenParserFinish((), self._had_incomplete_tool)
 
         events: list[GenerationEvent] = []
+        if self._unverified_marker_prefix:
+            self._feed_native_text_segment(self._unverified_marker_prefix, events)
+            self._unverified_marker_prefix = ""
         if self._pending_native_marker is not None:
-            marker, _, _ = self._pending_native_marker
+            marker, _, verified = self._pending_native_marker
             self._pending_native_marker = None
-            self._emit_content(marker, events)
+            if not verified:
+                raise NativeTokenProvenanceError(
+                    "Qwen marker provenance was unavailable outside a definite literal context"
+                )
+            self._apply_native_marker(marker, events)
         if self._mode == "tool":
             self._had_incomplete_tool = True
             self._buffer = ""

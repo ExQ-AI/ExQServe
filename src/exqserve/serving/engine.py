@@ -581,11 +581,30 @@ class ServingSession:
             return
         self._pending.append(event)
 
+    async def _fail_native_token_provenance(self) -> None:
+        await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        self._pending.append(
+            GenerationFailed(
+                self._request_id,
+                _safe_error(
+                    ErrorCategory.RUNTIME_FAILURE,
+                    "output_token_provenance_unavailable",
+                    "Inference output provenance was insufficient to classify a Qwen structural marker safely.",
+                    retryable=True,
+                ),
+            )
+        )
+        self._terminal = True
+
     async def _finish_parser_events(self) -> bool:
         if self._parser_finished:
             return False
         self._parser_finished = True
-        finish = self._parser.finish()
+        try:
+            finish = self._parser.finish()
+        except NativeTokenProvenanceError:
+            await self._fail_native_token_provenance()
+            return False
         for event in finish.events:
             await self._process_semantic(event)
             if self._terminal:
@@ -683,7 +702,28 @@ class ServingSession:
     async def _process_runtime(self, event: RuntimeEvent) -> None:
         if self._runtime_trace is not None:
             if isinstance(event, RuntimeTextDelta):
-                self._runtime_trace.append({"type": "text_delta", "text": event.text, "token_ids": list(event.token_ids)})
+                spans = (
+                    None
+                    if event.native_token_spans is None
+                    else [
+                        {
+                            "start": span.start,
+                            "end": span.end,
+                            "token_id": span.token_id,
+                            "text": span.text,
+                        }
+                        for span in event.native_token_spans
+                    ]
+                )
+                self._runtime_trace.append(
+                    {
+                        "type": "text_delta",
+                        "text": event.text,
+                        "token_ids": list(event.token_ids),
+                        "native_token_provenance": event.native_token_provenance,
+                        "native_token_spans": spans,
+                    }
+                )
             elif isinstance(event, RuntimeFinished):
                 self._runtime_trace.append(
                     {
@@ -712,19 +752,7 @@ class ServingSession:
                 else:
                     semantic_events = self._parser.feed(event.text)
             except NativeTokenProvenanceError:
-                await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
-                self._pending.append(
-                    GenerationFailed(
-                        self._request_id,
-                        _safe_error(
-                            ErrorCategory.RUNTIME_FAILURE,
-                            "output_token_provenance_unavailable",
-                            "Inference output provenance was insufficient to classify a Qwen structural marker safely.",
-                            retryable=True,
-                        ),
-                    )
-                )
-                self._terminal = True
+                await self._fail_native_token_provenance()
                 return
             for semantic in semantic_events:
                 await self._process_semantic(semantic)

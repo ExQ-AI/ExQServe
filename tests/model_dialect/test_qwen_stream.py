@@ -613,6 +613,54 @@ def test_native_aware_direct_quote_veto_is_chunk_invariant() -> None:
     assert _reasoning_text(events) == whole
 
 
+def test_native_aware_unmatched_direct_quote_at_eof_does_not_veto_verified_marker() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    source = "ends with quote '</think>"
+    span = _native_span(source, "</think>", 248069)
+    events = list(parser.feed_with_native_tokens(source, (span,)))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == "ends with quote '"
+
+
+def test_native_aware_unmatched_direct_quote_at_eof_fails_closed_without_provenance() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    source = "ends with quote '</think>"
+    parser.feed_with_native_tokens(source, None)
+
+    with pytest.raises(NativeTokenProvenanceError):
+        parser.finish()
+
+
+@pytest.mark.parametrize("marker", ["<think>", "</think>", "<tool_call>"])
+def test_native_aware_unverified_marker_prefix_split_fails_closed(marker: str) -> None:
+    for split in range(1, len(marker)):
+        parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+        parser.feed_with_native_tokens("ambiguous " + marker[:split], None)
+        with pytest.raises(NativeTokenProvenanceError):
+            parser.feed_with_native_tokens(marker[split:] + " outside", None)
+
+
+def test_native_aware_unverified_prefix_can_finish_in_verified_literal_context() -> None:
+    marker = "</think>"
+    split = 4
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    events = list(parser.feed_with_native_tokens("code `" + marker[:split], None))
+    events.extend(parser.feed_with_native_tokens(marker[split:] + "` remains reasoning", ()))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == "code `</think>` remains reasoning"
+
+
+def test_native_aware_verified_ordinary_prefix_does_not_poison_unverified_neighbor() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    events = list(parser.feed_with_native_tokens("literal <tool_", ()))
+    events.extend(parser.feed_with_native_tokens("call> remains prose", None))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == "literal <tool_call> remains prose"
+
+
 def test_native_marker_must_pass_dialect_state_validation() -> None:
     parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
     nested = "nested <think> stays reasoning"

@@ -16,6 +16,7 @@ from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import GenerationEvent
 from exqserve.core.items import MessageItem, MessageRole, ToolResultItem
 from exqserve.core.request import CanonicalRequest
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
     CompiledPrompt,
@@ -170,7 +171,13 @@ def test_full_runtime_trace_preserves_parser_pre_text_and_terminal_metadata() ->
     class TraceControlled(_Controlled):
         def __aiter__(self):  # type: ignore[no-untyped-def]
             async def stream():  # type: ignore[no-untyped-def]
-                yield RuntimeTextDelta("req-1", "raw </think>", (248069,))
+                yield RuntimeTextDelta(
+                    "req-1",
+                    "raw </think>",
+                    (42, 248069),
+                    (NativeTokenSpan(4, 12, 248069, "</think>"),),
+                    True,
+                )
                 yield RuntimeFinished(
                     request_id="req-1",
                     reason=RuntimeStopReason.EOS,
@@ -201,7 +208,15 @@ def test_full_runtime_trace_preserves_parser_pre_text_and_terminal_metadata() ->
         _ = [event async for event in session]
 
         assert session.runtime_trace == (
-            {"type": "text_delta", "text": "raw </think>", "token_ids": [248069]},
+            {
+                "type": "text_delta",
+                "text": "raw </think>",
+                "token_ids": [42, 248069],
+                "native_token_provenance": True,
+                "native_token_spans": [
+                    {"start": 4, "end": 12, "token_id": 248069, "text": "</think>"}
+                ],
+            },
             {
                 "type": "finished",
                 "reason": "eos",
