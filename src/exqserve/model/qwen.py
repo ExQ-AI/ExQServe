@@ -486,6 +486,13 @@ class _QwenToolState(Enum):
     MALFORMED = auto()
 
 
+class _QwenMarkerDisposition(Enum):
+    LITERAL = auto()
+    STRUCTURAL = auto()
+    PENDING = auto()
+    FAIL_CLOSED = auto()
+
+
 _PLAIN_MARKERS = ("<think>", "</think>", "<tool_call>")
 _FUNCTION_OPEN = "<function="
 _FUNCTION_CLOSE = "</function>"
@@ -579,6 +586,111 @@ def _marker_is_directly_quoted(
     if right_at >= len(text):
         return False, True
     return text[right_at] == left, False
+
+
+class _QwenMarkerBoundaryTracker:
+    """Track Qwen literal/provenance boundaries without owning semantic channel state."""
+
+    def __init__(self) -> None:
+        self._literal_context = _MarkdownCodeContext()
+        self._last_content_character: str | None = None
+        self._pending_native_marker: tuple[str, str, bool] | None = None
+        self._unverified_marker_prefix = ""
+
+    @property
+    def last_content_character(self) -> str | None:
+        return self._last_content_character
+
+    @property
+    def unverified_marker_prefix(self) -> str:
+        return self._unverified_marker_prefix
+
+    def set_unverified_marker_prefix(self, value: str) -> None:
+        self._unverified_marker_prefix = value
+
+    def clear_unverified_marker_prefix(self) -> None:
+        self._unverified_marker_prefix = ""
+
+    def observe_content(self, text: str) -> None:
+        if not text:
+            return
+        self._literal_context.observe(text)
+        self._last_content_character = text[-1]
+
+    def classify_plain_marker(
+        self,
+        text: str,
+        marker: str,
+        *,
+        final: bool,
+    ) -> _QwenMarkerDisposition:
+        code_literal, code_pending = self._literal_context.classify_marker(
+            text,
+            marker,
+            final=final,
+        )
+        if code_pending:
+            return _QwenMarkerDisposition.PENDING
+        if code_literal:
+            return _QwenMarkerDisposition.LITERAL
+
+        is_literal, needs_more_text = _marker_is_directly_quoted(
+            text,
+            marker,
+            self._last_content_character,
+        )
+        if needs_more_text and not final:
+            return _QwenMarkerDisposition.PENDING
+        if is_literal:
+            return _QwenMarkerDisposition.LITERAL
+        return _QwenMarkerDisposition.STRUCTURAL
+
+    def classify_native_marker(
+        self,
+        marker: str,
+        following_text: str,
+        *,
+        verified: bool,
+    ) -> _QwenMarkerDisposition:
+        if self._literal_context.marker_is_literal_now():
+            return _QwenMarkerDisposition.LITERAL
+
+        quote = self._last_content_character
+        if quote in {"'", '"'}:
+            if following_text:
+                if following_text[0] == quote:
+                    return _QwenMarkerDisposition.LITERAL
+            else:
+                self._pending_native_marker = (marker, quote, verified)
+                return _QwenMarkerDisposition.PENDING
+
+        if not verified:
+            return _QwenMarkerDisposition.FAIL_CLOSED
+        return _QwenMarkerDisposition.STRUCTURAL
+
+    def resolve_pending_native_marker(
+        self,
+        following_text: str,
+    ) -> tuple[str, _QwenMarkerDisposition] | None:
+        pending = self._pending_native_marker
+        if pending is None:
+            return None
+        marker, quote, verified = pending
+        self._pending_native_marker = None
+        if following_text and following_text[0] == quote:
+            return marker, _QwenMarkerDisposition.LITERAL
+        if not verified:
+            return marker, _QwenMarkerDisposition.FAIL_CLOSED
+        return marker, _QwenMarkerDisposition.STRUCTURAL
+
+    @staticmethod
+    def split_marker_prefix_suffix(text: str) -> tuple[str, str]:
+        max_width = min(len(text), max(len(marker) for marker in _PLAIN_MARKERS) - 1)
+        for width in range(max_width, 0, -1):
+            suffix = text[-width:]
+            if any(marker.startswith(suffix) for marker in _PLAIN_MARKERS):
+                return text[:-width], suffix
+        return text, ""
 
 
 def _is_pending_tool_candidate(text: str) -> bool:
@@ -927,17 +1039,13 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._tool_return_mode = _QwenMode.TEXT
         self._tool_parser: _QwenToolCallParser | None = None
         self._had_incomplete_tool = False
-        self._last_content_character: str | None = None
-        self._literal_context = _MarkdownCodeContext()
-        self._pending_native_marker: tuple[str, str, bool] | None = None
-        self._unverified_marker_prefix = ""
+        self._marker_boundaries = _QwenMarkerBoundaryTracker()
         self._finished = False
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
             return
-        self._literal_context.observe(text)
-        self._last_content_character = text[-1]
+        self._marker_boundaries.observe_content(text)
         if self._mode is _QwenMode.REASONING:
             if not self._reasoning_open:
                 events.append(ReasoningStarted(self._request_id))
@@ -1000,26 +1108,14 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 self._buffer = self._buffer[position:]
                 return True
 
-            code_literal, code_pending = self._literal_context.classify_marker(
+            disposition = self._marker_boundaries.classify_plain_marker(
                 self._buffer,
                 marker,
                 final=final,
             )
-            if code_pending:
+            if disposition is _QwenMarkerDisposition.PENDING:
                 return False
-            if code_literal:
-                self._emit_content(marker, events)
-                self._buffer = self._buffer[len(marker) :]
-                return True
-
-            is_literal, needs_more_text = _marker_is_directly_quoted(
-                self._buffer,
-                marker,
-                self._last_content_character,
-            )
-            if needs_more_text and not final:
-                return False
-            if is_literal:
+            if disposition is _QwenMarkerDisposition.LITERAL:
                 self._emit_content(marker, events)
                 self._buffer = self._buffer[len(marker) :]
                 return True
@@ -1091,6 +1187,23 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             self._close_current_channel(events)
             self._mode = _QwenMode.TEXT
 
+    def _apply_marker_disposition(
+        self,
+        marker: str,
+        disposition: _QwenMarkerDisposition,
+        events: list[GenerationEvent],
+    ) -> None:
+        if disposition is _QwenMarkerDisposition.PENDING:
+            return
+        if disposition is _QwenMarkerDisposition.LITERAL:
+            self._emit_content(marker, events)
+            return
+        if disposition is _QwenMarkerDisposition.FAIL_CLOSED:
+            raise NativeTokenProvenanceError(
+                "Qwen marker provenance was unavailable outside a definite literal context"
+            )
+        self._apply_native_marker(marker, events)
+
     def _feed_native_text_segment(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
             return
@@ -1110,18 +1223,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         chunk: str,
         events: list[GenerationEvent],
     ) -> None:
-        if self._pending_native_marker is None:
+        resolved = self._marker_boundaries.resolve_pending_native_marker(chunk)
+        if resolved is None:
             return
-        marker, quote, verified = self._pending_native_marker
-        self._pending_native_marker = None
-        if chunk and chunk[0] == quote:
-            self._emit_content(marker, events)
-            return
-        if not verified:
-            raise NativeTokenProvenanceError(
-                "Qwen marker provenance was unavailable outside a definite literal context"
-            )
-        self._apply_native_marker(marker, events)
+        marker, disposition = resolved
+        self._apply_marker_disposition(marker, disposition, events)
 
     def _handle_marker_candidate(
         self,
@@ -1131,50 +1237,28 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         *,
         verified: bool,
     ) -> None:
-        if self._literal_context.marker_is_literal_now():
-            self._emit_content(marker, events)
-            return
-
-        quote = self._last_content_character
-        if quote in {"'", '"'}:
-            if following_text:
-                if following_text[0] == quote:
-                    self._emit_content(marker, events)
-                    return
-            else:
-                self._pending_native_marker = (marker, quote, verified)
-                return
-
-        if not verified:
-            raise NativeTokenProvenanceError(
-                "Qwen marker provenance was unavailable outside a definite literal context"
-            )
-        self._apply_native_marker(marker, events)
-
-    @staticmethod
-    def _split_marker_prefix_suffix(text: str) -> tuple[str, str]:
-        max_width = min(len(text), max(len(marker) for marker in _PLAIN_MARKERS) - 1)
-        for width in range(max_width, 0, -1):
-            suffix = text[-width:]
-            if any(marker.startswith(suffix) for marker in _PLAIN_MARKERS):
-                return text[:-width], suffix
-        return text, ""
+        disposition = self._marker_boundaries.classify_native_marker(
+            marker,
+            following_text,
+            verified=verified,
+        )
+        self._apply_marker_disposition(marker, disposition, events)
 
     def _resolve_unverified_marker_prefix(
         self,
         chunk: str,
         events: list[GenerationEvent],
     ) -> int:
-        if not self._unverified_marker_prefix:
+        pending = self._marker_boundaries.unverified_marker_prefix
+        if not pending:
             return 0
 
-        pending = self._unverified_marker_prefix
         combined = pending
         for consumed, character in enumerate(chunk, start=1):
             combined += character
             exact = next((marker for marker in _PLAIN_MARKERS if marker == combined), None)
             if exact is not None:
-                self._unverified_marker_prefix = ""
+                self._marker_boundaries.clear_unverified_marker_prefix()
                 if self._mode is _QwenMode.TOOL:
                     self._feed_native_text_segment(combined, events)
                 else:
@@ -1186,11 +1270,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                     )
                 return consumed
             if not any(marker.startswith(combined) for marker in _PLAIN_MARKERS):
-                self._unverified_marker_prefix = ""
+                self._marker_boundaries.clear_unverified_marker_prefix()
                 self._feed_native_text_segment(pending, events)
                 return 0
 
-        self._unverified_marker_prefix = combined
+        self._marker_boundaries.set_unverified_marker_prefix(combined)
         return len(chunk)
 
     def _in_tool_mode(self) -> bool:
@@ -1209,9 +1293,9 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 if position >= 0 and (match is None or position < match[0]):
                     match = (position, marker)
             if match is None:
-                stable, prefix = self._split_marker_prefix_suffix(chunk[cursor:])
+                stable, prefix = self._marker_boundaries.split_marker_prefix_suffix(chunk[cursor:])
                 self._feed_native_text_segment(stable, events)
-                self._unverified_marker_prefix = prefix
+                self._marker_boundaries.set_unverified_marker_prefix(prefix)
                 return
 
             position, marker = match
@@ -1286,17 +1370,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             return QwenParserFinish((), self._had_incomplete_tool)
 
         events: list[GenerationEvent] = []
-        if self._unverified_marker_prefix:
-            self._feed_native_text_segment(self._unverified_marker_prefix, events)
-            self._unverified_marker_prefix = ""
-        if self._pending_native_marker is not None:
-            marker, _, verified = self._pending_native_marker
-            self._pending_native_marker = None
-            if not verified:
-                raise NativeTokenProvenanceError(
-                    "Qwen marker provenance was unavailable outside a definite literal context"
-                )
-            self._apply_native_marker(marker, events)
+        pending_prefix = self._marker_boundaries.unverified_marker_prefix
+        if pending_prefix:
+            self._feed_native_text_segment(pending_prefix, events)
+            self._marker_boundaries.clear_unverified_marker_prefix()
+        self._resolve_pending_native_marker("", events)
         if self._mode is _QwenMode.TOOL:
             self._discard_incomplete_tool()
         else:
@@ -1312,7 +1390,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 self._discard_incomplete_tool()
             elif self._buffer:
                 quoted_partial_marker = (
-                    self._last_content_character in {"'", '"', "`"}
+                    self._marker_boundaries.last_content_character in {"'", '"', "`"}
                     and any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS)
                 )
                 if quoted_partial_marker:
