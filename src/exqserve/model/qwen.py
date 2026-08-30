@@ -674,6 +674,231 @@ def _qwen_string_parameters(tool_policy: ToolPolicy | None) -> dict[str, frozens
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class _QwenToolFeedResult:
+    events: tuple[GenerationEvent, ...]
+    remainder: str
+    closed: bool
+    completed_call: bool
+    incomplete: bool
+
+
+class _QwenToolCallParser:
+    """Parse exactly one Qwen native Tool Call envelope."""
+
+    def __init__(
+        self,
+        request_id: str,
+        index: int,
+        string_parameters: dict[str, frozenset[str]],
+    ) -> None:
+        self._request_id = request_id
+        self._index = index
+        self._string_parameters = dict(string_parameters)
+        self._buffer = ""
+        self._state = _QwenToolState.FUNCTION
+        self._name: str | None = None
+        self._call_id: str | None = None
+        self._started = False
+        self._argument_parts: list[str] = []
+        self._arguments_json: str | None = None
+        self._closed = False
+        self._completed_call = False
+        self._incomplete = False
+
+    def _consume_whitespace(self) -> bool:
+        stripped = self._buffer.lstrip()
+        if len(stripped) == len(self._buffer):
+            return False
+        self._buffer = stripped
+        return True
+
+    def _mark_malformed(self) -> None:
+        self._incomplete = True
+        self._state = _QwenToolState.MALFORMED
+
+    def _ensure_started(self, events: list[GenerationEvent]) -> None:
+        if self._started:
+            return
+        assert self._name is not None
+        assert self._call_id is not None
+        events.append(
+            ToolCallStarted(
+                request_id=self._request_id,
+                call_id=self._call_id,
+                name=self._name,
+                index=self._index,
+            )
+        )
+        self._started = True
+
+    def _emit_delta(self, delta: str, events: list[GenerationEvent]) -> None:
+        assert self._call_id is not None
+        events.append(
+            ToolCallArgumentsDelta(
+                request_id=self._request_id,
+                call_id=self._call_id,
+                delta=delta,
+                index=self._index,
+            )
+        )
+
+    def _complete_arguments(self, events: list[GenerationEvent]) -> None:
+        self._ensure_started(events)
+        if not self._argument_parts:
+            self._arguments_json = "{}"
+            self._emit_delta("{}", events)
+        else:
+            self._arguments_json = "".join(self._argument_parts) + "}"
+            self._emit_delta("}", events)
+        self._state = _QwenToolState.OUTER
+
+    def _process_function(self) -> bool:
+        if self._consume_whitespace():
+            return True
+        if not self._buffer:
+            return False
+        if _FUNCTION_OPEN.startswith(self._buffer):
+            return False
+        if not self._buffer.startswith(_FUNCTION_OPEN):
+            self._mark_malformed()
+            return True
+
+        header_end = self._buffer.find(">", len(_FUNCTION_OPEN))
+        if header_end < 0:
+            return False
+        name = self._buffer[len(_FUNCTION_OPEN) : header_end]
+        if not _valid_tag_name(name):
+            self._mark_malformed()
+            return True
+
+        self._name = name
+        self._call_id = _deterministic_call_id(self._request_id, self._index)
+        self._buffer = self._buffer[header_end + 1 :]
+        self._state = _QwenToolState.PARAMETERS
+        return True
+
+    def _process_parameters(self, events: list[GenerationEvent]) -> bool:
+        if self._consume_whitespace():
+            return True
+        if not self._buffer:
+            return False
+
+        if self._buffer.startswith(_FUNCTION_CLOSE):
+            self._buffer = self._buffer[len(_FUNCTION_CLOSE) :]
+            self._complete_arguments(events)
+            return True
+        if _FUNCTION_CLOSE.startswith(self._buffer):
+            return False
+
+        if self._buffer.startswith(_PARAMETER_OPEN):
+            header_end = self._buffer.find(">", len(_PARAMETER_OPEN))
+            if header_end < 0:
+                return False
+            parameter_name = self._buffer[len(_PARAMETER_OPEN) : header_end]
+            if not _valid_tag_name(parameter_name):
+                self._mark_malformed()
+                return True
+
+            value_start = header_end + 1
+            close_at = _find_parameter_close(self._buffer, value_start)
+            if close_at < 0:
+                return False
+            assert self._name is not None
+            string_parameter = parameter_name in self._string_parameters.get(
+                self._name, frozenset()
+            )
+            value_json = _parameter_value_json(
+                self._buffer[value_start:close_at],
+                string_parameter=string_parameter,
+            )
+            prefix = "{" if not self._argument_parts else ","
+            fragment = f"{prefix}{canonical_json_dumps(parameter_name)}:{value_json}"
+            self._ensure_started(events)
+            self._argument_parts.append(fragment)
+            self._emit_delta(fragment, events)
+            self._buffer = self._buffer[close_at + len(_PARAMETER_CLOSE) :]
+            return True
+        if _PARAMETER_OPEN.startswith(self._buffer):
+            return False
+
+        self._mark_malformed()
+        return True
+
+    def _process_outer(self, events: list[GenerationEvent]) -> bool:
+        if self._consume_whitespace():
+            return True
+        if not self._buffer:
+            return False
+        if self._buffer.startswith(_TOOL_CLOSE):
+            assert self._name is not None
+            assert self._call_id is not None
+            assert self._arguments_json is not None
+            self._buffer = self._buffer[len(_TOOL_CLOSE) :]
+            events.append(
+                ToolCallCompleted(
+                    self._request_id,
+                    ToolCallItem(
+                        call_id=self._call_id,
+                        name=self._name,
+                        arguments_json=self._arguments_json,
+                        index=self._index,
+                    ),
+                )
+            )
+            self._closed = True
+            self._completed_call = True
+            return True
+        if _TOOL_CLOSE.startswith(self._buffer):
+            return False
+        self._mark_malformed()
+        return True
+
+    def _process_malformed(self) -> bool:
+        close_at = self._buffer.find(_TOOL_CLOSE)
+        if close_at < 0:
+            return False
+        self._buffer = self._buffer[close_at + len(_TOOL_CLOSE) :]
+        self._closed = True
+        return True
+
+    def _process(self, events: list[GenerationEvent]) -> bool:
+        if self._state is _QwenToolState.FUNCTION:
+            return self._process_function()
+        if self._state is _QwenToolState.PARAMETERS:
+            return self._process_parameters(events)
+        if self._state is _QwenToolState.OUTER:
+            return self._process_outer(events)
+        return self._process_malformed()
+
+    def feed(self, text: str) -> _QwenToolFeedResult:
+        if self._closed:
+            raise RuntimeError("cannot feed a closed Qwen Tool Call parser")
+        self._buffer += text
+        events: list[GenerationEvent] = []
+        while not self._closed and self._process(events):
+            pass
+
+        remainder = ""
+        if self._closed:
+            remainder = self._buffer
+            self._buffer = ""
+        return _QwenToolFeedResult(
+            tuple(events),
+            remainder,
+            self._closed,
+            self._completed_call,
+            self._incomplete,
+        )
+
+    def finish_incomplete(self) -> None:
+        if self._closed:
+            return
+        self._buffer = ""
+        self._incomplete = True
+        self._closed = True
+
+
 class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
     """Incrementally convert Qwen model-native text into canonical semantic events."""
 
@@ -700,12 +925,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._reasoning_value = ""
         self._call_index = 0
         self._tool_return_mode = _QwenMode.TEXT
-        self._tool_state = _QwenToolState.FUNCTION
-        self._tool_name: str | None = None
-        self._tool_call_id: str | None = None
-        self._tool_started = False
-        self._tool_argument_parts: list[str] = []
-        self._tool_arguments_json: str | None = None
+        self._tool_parser: _QwenToolCallParser | None = None
         self._had_incomplete_tool = False
         self._last_content_character: str | None = None
         self._literal_context = _MarkdownCodeContext()
@@ -748,21 +968,23 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._close_current_channel(events)
         self._tool_return_mode = self._mode
         self._mode = _QwenMode.TOOL
-        self._tool_state = _QwenToolState.FUNCTION
-        self._tool_name = None
-        self._tool_call_id = None
-        self._tool_started = False
-        self._tool_argument_parts = []
-        self._tool_arguments_json = None
+        self._tool_parser = _QwenToolCallParser(
+            self._request_id,
+            self._call_index,
+            self._string_parameters,
+        )
 
     def _restore_after_tool(self) -> None:
         self._mode = self._tool_return_mode
-        self._tool_state = _QwenToolState.FUNCTION
-        self._tool_name = None
-        self._tool_call_id = None
-        self._tool_started = False
-        self._tool_argument_parts = []
-        self._tool_arguments_json = None
+        self._tool_parser = None
+
+    def _discard_incomplete_tool(self) -> None:
+        parser = self._tool_parser
+        if parser is not None:
+            parser.finish_incomplete()
+        self._had_incomplete_tool = True
+        self._buffer = ""
+        self._restore_after_tool()
 
     def _process_plain(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
         match: tuple[int, str] | None = None
@@ -833,170 +1055,23 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             self._buffer = self._buffer[safe_length:]
         return False
 
-    def _consume_tool_whitespace(self) -> bool:
-        stripped = self._buffer.lstrip()
-        if len(stripped) == len(self._buffer):
-            return False
-        self._buffer = stripped
-        return True
-
-    def _mark_tool_malformed(self) -> None:
-        self._had_incomplete_tool = True
-        self._tool_state = _QwenToolState.MALFORMED
-
-    def _ensure_tool_started(self, events: list[GenerationEvent]) -> None:
-        if self._tool_started:
-            return
-        assert self._tool_name is not None
-        assert self._tool_call_id is not None
-        events.append(
-            ToolCallStarted(
-                request_id=self._request_id,
-                call_id=self._tool_call_id,
-                name=self._tool_name,
-                index=self._call_index,
-            )
-        )
-        self._tool_started = True
-
-    def _emit_tool_delta(self, delta: str, events: list[GenerationEvent]) -> None:
-        assert self._tool_call_id is not None
-        events.append(
-            ToolCallArgumentsDelta(
-                request_id=self._request_id,
-                call_id=self._tool_call_id,
-                delta=delta,
-                index=self._call_index,
-            )
-        )
-
-    def _complete_function_arguments(self, events: list[GenerationEvent]) -> None:
-        self._ensure_tool_started(events)
-        if not self._tool_argument_parts:
-            self._tool_arguments_json = "{}"
-            self._emit_tool_delta("{}", events)
-        else:
-            self._tool_arguments_json = "".join(self._tool_argument_parts) + "}"
-            self._emit_tool_delta("}", events)
-        self._tool_state = _QwenToolState.OUTER
-
-    def _process_tool_function(self) -> bool:
-        if self._consume_tool_whitespace():
-            return True
-        if not self._buffer:
-            return False
-        if _FUNCTION_OPEN.startswith(self._buffer):
-            return False
-        if not self._buffer.startswith(_FUNCTION_OPEN):
-            self._mark_tool_malformed()
-            return True
-
-        header_end = self._buffer.find(">", len(_FUNCTION_OPEN))
-        if header_end < 0:
-            return False
-        name = self._buffer[len(_FUNCTION_OPEN) : header_end]
-        if not _valid_tag_name(name):
-            self._mark_tool_malformed()
-            return True
-
-        self._tool_name = name
-        self._tool_call_id = _deterministic_call_id(self._request_id, self._call_index)
-        self._buffer = self._buffer[header_end + 1 :]
-        self._tool_state = _QwenToolState.PARAMETERS
-        return True
-
-    def _process_tool_parameters(self, events: list[GenerationEvent]) -> bool:
-        if self._consume_tool_whitespace():
-            return True
-        if not self._buffer:
-            return False
-
-        if self._buffer.startswith(_FUNCTION_CLOSE):
-            self._buffer = self._buffer[len(_FUNCTION_CLOSE) :]
-            self._complete_function_arguments(events)
-            return True
-        if _FUNCTION_CLOSE.startswith(self._buffer):
-            return False
-
-        if self._buffer.startswith(_PARAMETER_OPEN):
-            header_end = self._buffer.find(">", len(_PARAMETER_OPEN))
-            if header_end < 0:
-                return False
-            parameter_name = self._buffer[len(_PARAMETER_OPEN) : header_end]
-            if not _valid_tag_name(parameter_name):
-                self._mark_tool_malformed()
-                return True
-
-            value_start = header_end + 1
-            close_at = _find_parameter_close(self._buffer, value_start)
-            if close_at < 0:
-                return False
-            assert self._tool_name is not None
-            string_parameter = parameter_name in self._string_parameters.get(
-                self._tool_name, frozenset()
-            )
-            value_json = _parameter_value_json(
-                self._buffer[value_start:close_at],
-                string_parameter=string_parameter,
-            )
-            prefix = "{" if not self._tool_argument_parts else ","
-            fragment = f"{prefix}{canonical_json_dumps(parameter_name)}:{value_json}"
-            self._ensure_tool_started(events)
-            self._tool_argument_parts.append(fragment)
-            self._emit_tool_delta(fragment, events)
-            self._buffer = self._buffer[close_at + len(_PARAMETER_CLOSE) :]
-            return True
-        if _PARAMETER_OPEN.startswith(self._buffer):
-            return False
-
-        self._mark_tool_malformed()
-        return True
-
-    def _process_tool_outer(self, events: list[GenerationEvent]) -> bool:
-        if self._consume_tool_whitespace():
-            return True
-        if not self._buffer:
-            return False
-        if self._buffer.startswith(_TOOL_CLOSE):
-            assert self._tool_name is not None
-            assert self._tool_call_id is not None
-            assert self._tool_arguments_json is not None
-            self._buffer = self._buffer[len(_TOOL_CLOSE) :]
-            events.append(
-                ToolCallCompleted(
-                    self._request_id,
-                    ToolCallItem(
-                        call_id=self._tool_call_id,
-                        name=self._tool_name,
-                        arguments_json=self._tool_arguments_json,
-                        index=self._call_index,
-                    ),
-                )
-            )
-            self._call_index += 1
-            self._restore_after_tool()
-            return True
-        if _TOOL_CLOSE.startswith(self._buffer):
-            return False
-        self._mark_tool_malformed()
-        return True
-
-    def _process_tool_malformed(self) -> bool:
-        close_at = self._buffer.find(_TOOL_CLOSE)
-        if close_at < 0:
-            return False
-        self._buffer = self._buffer[close_at + len(_TOOL_CLOSE) :]
-        self._restore_after_tool()
-        return True
-
     def _process_tool(self, events: list[GenerationEvent]) -> bool:
-        if self._tool_state is _QwenToolState.FUNCTION:
-            return self._process_tool_function()
-        if self._tool_state is _QwenToolState.PARAMETERS:
-            return self._process_tool_parameters(events)
-        if self._tool_state is _QwenToolState.OUTER:
-            return self._process_tool_outer(events)
-        return self._process_tool_malformed()
+        parser = self._tool_parser
+        if parser is None:
+            raise RuntimeError("Qwen Tool Call mode requires an active Tool Call parser")
+        text = self._buffer
+        self._buffer = ""
+        result = parser.feed(text)
+        events.extend(result.events)
+        if not result.closed:
+            return False
+        if result.incomplete:
+            self._had_incomplete_tool = True
+        if result.completed_call:
+            self._call_index += 1
+        self._restore_after_tool()
+        self._buffer = result.remainder
+        return True
 
     def _apply_native_marker(self, marker: str, events: list[GenerationEvent]) -> None:
         if marker == "<tool_call>":
@@ -1223,9 +1298,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 )
             self._apply_native_marker(marker, events)
         if self._mode is _QwenMode.TOOL:
-            self._had_incomplete_tool = True
-            self._buffer = ""
-            self._restore_after_tool()
+            self._discard_incomplete_tool()
         else:
             while self._buffer:
                 progressed = (
@@ -1236,9 +1309,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 if not progressed:
                     break
             if self._in_tool_mode():
-                self._had_incomplete_tool = True
-                self._buffer = ""
-                self._restore_after_tool()
+                self._discard_incomplete_tool()
             elif self._buffer:
                 quoted_partial_marker = (
                     self._last_content_character in {"'", '"', "`"}
