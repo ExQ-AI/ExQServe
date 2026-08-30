@@ -417,6 +417,71 @@ def test_split_fenced_literal_then_real_close_streams_text_before_eos() -> None:
             assert _text(finished.events) == ""
 
 
+def test_malformed_inline_backticks_do_not_suppress_later_real_tool_call() -> None:
+    source = (
+        "analysis ``foo` bar\n"
+        "</think>\n"
+        "<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
+    )
+
+    for split in range(len(source) + 1):
+        parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+        events = list(parser.feed(source[:split]))
+        events.extend(parser.feed(source[split:]))
+        finished = parser.finish()
+        events.extend(finished.events)
+
+        calls = _completed_calls(events)
+        assert finished.incomplete_tool_call is False
+        assert _reasoning_text(events) == "analysis ``foo` bar\n"
+        assert len(calls) == 1
+        assert calls[0].call.name == "read"
+        assert calls[0].call.arguments_json == '{"file_path":"/x"}'
+
+
+def test_fenced_literal_tool_marker_then_real_tool_call_remains_distinct() -> None:
+    for indent in ("", "   "):
+        fenced = f"{indent}```text\n<tool_call>\n{indent}```\n"
+        source = (
+            fenced
+            + "actual reasoning</think>\n"
+            + "<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
+        )
+
+        for split in range(len(source) + 1):
+            parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+            events = list(parser.feed(source[:split]))
+            events.extend(parser.feed(source[split:]))
+            finished = parser.finish()
+            events.extend(finished.events)
+
+            calls = _completed_calls(events)
+            assert finished.incomplete_tool_call is False
+            assert _reasoning_text(events) == fenced + "actual reasoning"
+            assert len(calls) == 1
+            assert calls[0].call.name == "read"
+            assert calls[0].call.arguments_json == '{"file_path":"/x"}'
+
+
+def test_unclosed_fence_recovers_complete_tool_call_deterministically_at_eos() -> None:
+    source = (
+        "```text\nunclosed code sample\n"
+        "</think>\n"
+        "<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
+    )
+    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    streamed = list(parser.feed(source))
+    finished = parser.finish()
+    events = [*streamed, *finished.events]
+
+    calls = _completed_calls(events)
+    assert finished.incomplete_tool_call is False
+    assert _reasoning_text(events) == "```text\nunclosed code sample\n"
+    assert len(calls) == 1
+    assert calls[0].call.name == "read"
+    assert calls[0].call.arguments_json == '{"file_path":"/x"}'
+
+
 def test_parameter_close_literal_inside_json_string_is_not_treated_as_envelope_close() -> None:
     source = (
         '<tool_call><function=run><parameter=cmd>"echo </parameter> here"'

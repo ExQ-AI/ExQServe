@@ -470,16 +470,28 @@ class _MarkdownCodeContext:
     """Track Qwen backtick-delimited source spans across runtime chunks."""
 
     delimiter_width: int | None = None
+    delimiter_is_fence: bool = False
     pending_backticks: int = 0
+    pending_at_line_start: bool = False
+    indent_spaces: int | None = 0
 
     def _commit_pending_backticks(self) -> None:
         width = self.pending_backticks
         if width == 0:
             return
+        opened_at_line_start = self.pending_at_line_start
         self.pending_backticks = 0
+        self.pending_at_line_start = False
         if self.delimiter_width is None:
             self.delimiter_width = width
-        elif width == self.delimiter_width:
+            self.delimiter_is_fence = opened_at_line_start and width >= 3
+            return
+        if self.delimiter_is_fence:
+            if opened_at_line_start and width >= self.delimiter_width:
+                self.delimiter_width = None
+                self.delimiter_is_fence = False
+            return
+        if width == self.delimiter_width:
             self.delimiter_width = None
 
     def classify_marker(self, text: str, marker: str, *, final: bool = False) -> tuple[bool, bool]:
@@ -488,16 +500,36 @@ class _MarkdownCodeContext:
             return False, False
 
         delimiter = "`" * self.delimiter_width
-        if text.find(delimiter, len(marker)) >= 0:
-            return True, False
+        close_at = text.find(delimiter, len(marker))
+        if close_at >= 0:
+            if self.delimiter_is_fence:
+                return True, False
+            newline_at = text.find("\n", len(marker), close_at)
+            if newline_at < 0:
+                return True, False
+
+        if not self.delimiter_is_fence and text.find("\n", len(marker)) >= 0:
+            self.delimiter_width = None
+            return False, False
         return (False, False) if final else (False, True)
 
     def observe(self, text: str) -> None:
         for character in text:
             if character == "`":
+                if self.pending_backticks == 0:
+                    self.pending_at_line_start = self.indent_spaces is not None and self.indent_spaces <= 3
                 self.pending_backticks += 1
+                self.indent_spaces = None
                 continue
             self._commit_pending_backticks()
+            if character == "\n":
+                if self.delimiter_width is not None and not self.delimiter_is_fence:
+                    self.delimiter_width = None
+                self.indent_spaces = 0
+            elif character == " " and self.indent_spaces is not None:
+                self.indent_spaces += 1
+            else:
+                self.indent_spaces = None
 
 
 def _marker_is_directly_quoted(
@@ -955,9 +987,19 @@ class QwenIncrementalParser:
             self._buffer = ""
             self._restore_after_tool()
         else:
-            while self._buffer and self._process_plain(events, final=True):
-                pass
-            if self._buffer:
+            while self._buffer:
+                progressed = (
+                    self._process_tool(events)
+                    if self._mode == "tool"
+                    else self._process_plain(events, final=True)
+                )
+                if not progressed:
+                    break
+            if self._mode == "tool":
+                self._had_incomplete_tool = True
+                self._buffer = ""
+                self._restore_after_tool()
+            elif self._buffer:
                 quoted_partial_marker = (
                     self._last_content_character in {"'", '"', "`"}
                     and any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS)
