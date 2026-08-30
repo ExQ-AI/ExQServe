@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import pytest
+
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.events import (
@@ -16,6 +18,8 @@ from exqserve.core.events import (
     ToolCallCompleted,
     ToolCallStarted,
 )
+from exqserve.core.tokens import NativeTokenSpan
+from exqserve.model.contracts import NativeTokenProvenanceError
 from exqserve.model.qwen import QwenIncrementalParser
 
 
@@ -494,3 +498,138 @@ def test_parameter_close_literal_inside_json_string_is_not_treated_as_envelope_c
         assert len(calls) == 1
         assert calls[0].call.name == "run"
         assert calls[0].call.arguments_json == '{"cmd":"echo </parameter> here"}'
+
+
+def _native_span(text: str, marker: str, token_id: int) -> NativeTokenSpan:
+    start = text.index(marker)
+    return NativeTokenSpan(start, start + len(marker), token_id, marker)
+
+
+def test_native_aware_marker_is_candidate_with_backtick_literal_veto() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    first = "The format is `</think>` and still reasoning.\n"
+    literal_span = _native_span(first, "</think>", 248069)
+    events = list(parser.feed_with_native_tokens(first, (literal_span,)))
+
+    close = "actual close</think>\n"
+    close_span = _native_span(close, "</think>", 248069)
+    events.extend(parser.feed_with_native_tokens(close, (close_span,)))
+
+    tool = "<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
+    tool_span = _native_span(tool, "<tool_call>", 248058)
+    events.extend(parser.feed_with_native_tokens(tool, (tool_span,)))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == "The format is `</think>` and still reasoning.\nactual close"
+    calls = _completed_calls(events)
+    assert len(calls) == 1
+    assert calls[0].call.name == "read"
+
+
+def test_native_aware_ordinary_same_spelling_marker_is_literal_only() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    source = "literal <tool_call> remains prose"
+    events = list(parser.feed_with_native_tokens(source, ()))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == source
+    assert not _completed_calls(events)
+
+
+def test_native_aware_unverified_ambiguous_marker_fails_closed() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+
+    with pytest.raises(NativeTokenProvenanceError):
+        parser.feed_with_native_tokens("ambiguous </think> outside code", None)
+
+
+def test_native_aware_unverified_marker_inside_backticks_stays_literal() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    source = "code `</think>` remains reasoning"
+    events = list(parser.feed_with_native_tokens(source, None))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == source
+
+
+def test_native_aware_inline_expiry_never_retroactively_promotes_marker() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    first = "`` source <tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>\n"
+    literal_span = _native_span(first, "<tool_call>", 248058)
+    events = list(parser.feed_with_native_tokens(first, (literal_span,)))
+
+    second = "</think><tool_call><function=read><parameter=file_path>/real</parameter></function></tool_call>"
+    close_span = _native_span(second, "</think>", 248069)
+    tool_at = second.index("<tool_call>")
+    tool_span = NativeTokenSpan(tool_at, tool_at + len("<tool_call>"), 248058, "<tool_call>")
+    events.extend(parser.feed_with_native_tokens(second, (close_span, tool_span)))
+    events.extend(parser.finish().events)
+
+    assert "/x" in _reasoning_text(events)
+    calls = _completed_calls(events)
+    assert len(calls) == 1
+    assert calls[0].call.arguments_json == '{"file_path":"/real"}'
+
+
+def test_native_aware_open_fence_never_promotes_literal_tool_at_eof() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    source = "```text\nexample\n</think>\n<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
+    spans = (
+        _native_span(source, "</think>", 248069),
+        _native_span(source, "<tool_call>", 248058),
+    )
+    events = list(parser.feed_with_native_tokens(source, spans))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.incomplete_tool_call is False
+    assert _reasoning_text(events) == source
+    assert not _completed_calls(events)
+
+
+def test_native_aware_direct_quote_veto_is_chunk_invariant() -> None:
+    marker = "</think>"
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    whole = f"quoted '{marker}' still reasoning"
+    span = _native_span(whole, marker, 248069)
+    events = list(parser.feed_with_native_tokens(whole, (span,)))
+    events.extend(parser.finish().events)
+    assert _reasoning_text(events) == whole
+
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    first = f"quoted '{marker}"
+    span = _native_span(first, marker, 248069)
+    events = list(parser.feed_with_native_tokens(first, (span,)))
+    events.extend(parser.feed_with_native_tokens("' still reasoning", ()))
+    events.extend(parser.finish().events)
+    assert _reasoning_text(events) == whole
+
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    events = list(parser.feed_with_native_tokens("quoted '", ()))
+    marker_span = NativeTokenSpan(0, len(marker), 248069, marker)
+    events.extend(parser.feed_with_native_tokens(marker, (marker_span,)))
+    events.extend(parser.feed_with_native_tokens("' still reasoning", ()))
+    events.extend(parser.finish().events)
+    assert _reasoning_text(events) == whole
+
+
+def test_native_marker_must_pass_dialect_state_validation() -> None:
+    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    nested = "nested <think> stays reasoning"
+    nested_span = _native_span(nested, "<think>", 248068)
+    events = list(parser.feed_with_native_tokens(nested, (nested_span,)))
+
+    close = "</think>final literal </think>"
+    first_close = NativeTokenSpan(0, len("</think>"), 248069, "</think>")
+    second_at = close.rindex("</think>")
+    second_close = NativeTokenSpan(
+        second_at,
+        second_at + len("</think>"),
+        248069,
+        "</think>",
+    )
+    events.extend(parser.feed_with_native_tokens(close, (first_close, second_close)))
+    events.extend(parser.finish().events)
+
+    assert _reasoning_text(events) == nested
+    assert _text(events) == "final literal </think>"

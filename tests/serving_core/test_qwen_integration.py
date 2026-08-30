@@ -10,6 +10,7 @@ from exqserve.control.request import RequestTerminalReason
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
+    GenerationFailed,
     ReasoningDelta,
     TextDelta,
     ToolCallCompleted,
@@ -146,5 +147,59 @@ def test_actual_qwen_compiler_parser_flow_through_serving_core_without_cuda() ->
         assert isinstance(events[-1], GenerationCompleted)
         assert events[-1].reason is CompletionReason.TOOL_CALLS
         assert not any(isinstance(event, TextDelta) for event in events)
+
+    asyncio.run(scenario())
+
+
+def test_qwen_provenance_loss_at_ambiguous_marker_fails_closed() -> None:
+    async def scenario() -> None:
+        renderer = _Renderer()
+        compiler = QwenPromptCompiler(RuntimeTemplateAdapter(renderer))
+        tool = FunctionTool(
+            "lookup",
+            "Lookup an item",
+            JsonSchema('{"type":"object","properties":{"id":{"type":"integer"}}}'),
+        )
+        policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        controlled = _Controlled(
+            [
+                RuntimeStarted("req-qwen-provenance"),
+                RuntimeTextDelta(
+                    "req-qwen-provenance",
+                    "ambiguous </think> outside code",
+                    (1, 2, 3),
+                    None,
+                    True,
+                ),
+            ]
+        )
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
+                request_id,
+                start_in_reasoning=True,
+                tool_policy=tool_policy,
+            ),
+            _Controller(controlled),
+        )
+        request = ServingRequest(
+            CanonicalRequest(
+                "req-qwen-provenance",
+                "qwen",
+                (MessageItem(MessageRole.USER, "inspect"),),
+            ),
+            ReasoningPolicy(ReasoningMode.ENABLED),
+            policy,
+            max_output_tokens=16,
+        )
+
+        events = [event async for event in await engine.submit(request)]
+
+        failures = [event for event in events if isinstance(event, GenerationFailed)]
+        assert len(failures) == 1
+        assert failures[0].error.code == "output_token_provenance_unavailable"
+        assert failures[0].error.retryable is True
+        assert controlled.terminal_reason is RequestTerminalReason.APPLICATION_CANCELLED
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
 
     asyncio.run(scenario())

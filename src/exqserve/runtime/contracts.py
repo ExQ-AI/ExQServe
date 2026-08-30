@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Protocol
 
 from exqserve.core.errors import CanonicalError
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 
 _PAGE_SIZE = 256
@@ -511,6 +512,8 @@ class RuntimeTextDelta:
     request_id: str
     text: str
     token_ids: tuple[int, ...] = ()
+    native_token_spans: tuple[NativeTokenSpan, ...] | None = None
+    native_token_provenance: bool = False
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -525,6 +528,24 @@ class RuntimeTextDelta:
                 raise TypeError("token_ids must contain only integers")
             if token_id < 0:
                 raise ValueError("token_ids must be non-negative")
+        _validate_bool("native_token_provenance", self.native_token_provenance)
+        if self.native_token_spans is None:
+            return
+        if not self.native_token_provenance:
+            raise ValueError("native_token_spans require native_token_provenance=True")
+        if not isinstance(self.native_token_spans, tuple):
+            raise TypeError("native_token_spans must be a tuple or None")
+        previous_end = 0
+        for span in self.native_token_spans:
+            if not isinstance(span, NativeTokenSpan):
+                raise TypeError("native_token_spans must contain only NativeTokenSpan values")
+            if span.start < previous_end:
+                raise ValueError("native_token_spans must be sorted and non-overlapping")
+            if span.end > len(self.text):
+                raise ValueError("native token span exceeds text bounds")
+            if self.text[span.start : span.end] != span.text:
+                raise ValueError("native token span text does not match RuntimeTextDelta.text")
+            previous_end = span.end
 
 
 @dataclass(frozen=True, slots=True)

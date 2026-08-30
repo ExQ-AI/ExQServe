@@ -37,6 +37,8 @@ from exqserve.core.events import (
 from exqserve.core.items import ToolCallItem
 from exqserve.model.contracts import (
     CompiledPrompt,
+    NativeTokenAwareIncrementalParser,
+    NativeTokenProvenanceError,
     RenderedPrompt,
     TemplateImagePart,
     TemplateMessage,
@@ -698,7 +700,33 @@ class ServingSession:
             self._pending.append(GenerationStarted(self._request_id))
             return
         if isinstance(event, RuntimeTextDelta):
-            for semantic in self._parser.feed(event.text):
+            try:
+                if (
+                    isinstance(self._parser, NativeTokenAwareIncrementalParser)
+                    and event.native_token_provenance
+                ):
+                    semantic_events = self._parser.feed_with_native_tokens(
+                        event.text,
+                        event.native_token_spans,
+                    )
+                else:
+                    semantic_events = self._parser.feed(event.text)
+            except NativeTokenProvenanceError:
+                await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+                self._pending.append(
+                    GenerationFailed(
+                        self._request_id,
+                        _safe_error(
+                            ErrorCategory.RUNTIME_FAILURE,
+                            "output_token_provenance_unavailable",
+                            "Inference output provenance was insufficient to classify a Qwen structural marker safely.",
+                            retryable=True,
+                        ),
+                    )
+                )
+                self._terminal = True
+                return
+            for semantic in semantic_events:
                 await self._process_semantic(semantic)
                 if self._terminal:
                     return

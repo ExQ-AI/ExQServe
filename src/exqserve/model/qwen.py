@@ -37,8 +37,11 @@ from exqserve.core.items import (
     ToolResultItem,
 )
 from exqserve.core.request import CanonicalRequest
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     ModelCapabilities,
+    NativeTokenAwareIncrementalParser,
+    NativeTokenProvenanceError,
     TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
@@ -513,6 +516,11 @@ class _MarkdownCodeContext:
             return False, False
         return (False, False) if final else (False, True)
 
+    def marker_is_literal_now(self) -> bool:
+        """Return whether a marker at the current cursor is inside active code context."""
+        self._commit_pending_backticks()
+        return self.delimiter_width is not None
+
     def observe(self, text: str) -> None:
         for character in text:
             if character == "`":
@@ -639,7 +647,7 @@ def _qwen_string_parameters(tool_policy: ToolPolicy | None) -> dict[str, frozens
     return result
 
 
-class QwenIncrementalParser:
+class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
     """Incrementally convert Qwen model-native text into canonical semantic events."""
 
     def __init__(
@@ -674,6 +682,7 @@ class QwenIncrementalParser:
         self._had_incomplete_tool = False
         self._last_content_character: str | None = None
         self._literal_context = _MarkdownCodeContext()
+        self._pending_native_marker: tuple[str, str, bool] | None = None
         self._finished = False
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
@@ -961,6 +970,144 @@ class QwenIncrementalParser:
             return self._process_tool_outer(events)
         return self._process_tool_malformed()
 
+    def _apply_native_marker(self, marker: str, events: list[GenerationEvent]) -> None:
+        if marker == "<tool_call>":
+            self._enter_tool(events)
+            return
+        if marker == "<think>":
+            if self._mode == "reasoning":
+                self._emit_content(marker, events)
+                return
+            self._close_current_channel(events)
+            self._mode = "reasoning"
+            return
+        if marker == "</think>":
+            if self._mode != "reasoning":
+                self._emit_content(marker, events)
+                return
+            self._close_current_channel(events)
+            self._mode = "text"
+
+    def _feed_native_text_segment(self, text: str, events: list[GenerationEvent]) -> None:
+        if not text:
+            return
+        if self._mode != "tool":
+            self._emit_content(text, events)
+            return
+        self._buffer += text
+        while self._mode == "tool" and self._process_tool(events):
+            pass
+        if self._mode != "tool" and self._buffer:
+            remainder = self._buffer
+            self._buffer = ""
+            self._emit_content(remainder, events)
+
+    def _resolve_pending_native_marker(
+        self,
+        chunk: str,
+        events: list[GenerationEvent],
+    ) -> None:
+        if self._pending_native_marker is None:
+            return
+        marker, quote, verified = self._pending_native_marker
+        self._pending_native_marker = None
+        if chunk and chunk[0] == quote:
+            self._emit_content(marker, events)
+            return
+        if not verified:
+            raise NativeTokenProvenanceError(
+                "Qwen marker provenance was unavailable outside a definite literal context"
+            )
+        self._apply_native_marker(marker, events)
+
+    def _handle_marker_candidate(
+        self,
+        marker: str,
+        following_text: str,
+        events: list[GenerationEvent],
+        *,
+        verified: bool,
+    ) -> None:
+        if self._literal_context.marker_is_literal_now():
+            self._emit_content(marker, events)
+            return
+
+        quote = self._last_content_character
+        if quote in {"'", '"'}:
+            if following_text:
+                if following_text[0] == quote:
+                    self._emit_content(marker, events)
+                    return
+            else:
+                self._pending_native_marker = (marker, quote, verified)
+                return
+
+        if not verified:
+            raise NativeTokenProvenanceError(
+                "Qwen marker provenance was unavailable outside a definite literal context"
+            )
+        self._apply_native_marker(marker, events)
+
+    def _feed_unverified_text(self, chunk: str, events: list[GenerationEvent]) -> None:
+        cursor = 0
+        while cursor < len(chunk):
+            match: tuple[int, str] | None = None
+            for marker in _PLAIN_MARKERS:
+                position = chunk.find(marker, cursor)
+                if position >= 0 and (match is None or position < match[0]):
+                    match = (position, marker)
+            if match is None:
+                self._feed_native_text_segment(chunk[cursor:], events)
+                return
+
+            position, marker = match
+            self._feed_native_text_segment(chunk[cursor:position], events)
+            if self._mode == "tool":
+                self._feed_native_text_segment(marker, events)
+                cursor = position + len(marker)
+                continue
+            following_text = chunk[position + len(marker) :]
+            self._handle_marker_candidate(marker, following_text, events, verified=False)
+            cursor = position + len(marker)
+
+    def feed_with_native_tokens(
+        self,
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+    ) -> tuple[GenerationEvent, ...]:
+        if self._finished:
+            raise RuntimeError("cannot feed a finished Qwen parser")
+        if not isinstance(chunk, str):
+            raise TypeError("chunk must be a string")
+        if native_token_spans is not None and not isinstance(native_token_spans, tuple):
+            raise TypeError("native_token_spans must be a tuple or None")
+
+        events: list[GenerationEvent] = []
+        self._resolve_pending_native_marker(chunk, events)
+        if native_token_spans is None:
+            self._feed_unverified_text(chunk, events)
+            return tuple(events)
+
+        cursor = 0
+        for span in native_token_spans:
+            if not isinstance(span, NativeTokenSpan):
+                raise TypeError("native_token_spans must contain NativeTokenSpan values")
+            if span.start < cursor or span.end > len(chunk) or chunk[span.start : span.end] != span.text:
+                raise ValueError("native token spans do not match the supplied chunk")
+            self._feed_native_text_segment(chunk[cursor : span.start], events)
+            if self._mode == "tool" or span.text not in _PLAIN_MARKERS:
+                self._feed_native_text_segment(span.text, events)
+            else:
+                self._handle_marker_candidate(
+                    span.text,
+                    chunk[span.end :],
+                    events,
+                    verified=True,
+                )
+            cursor = span.end
+        self._feed_native_text_segment(chunk[cursor:], events)
+        return tuple(events)
+
     def feed(self, chunk: str) -> tuple[GenerationEvent, ...]:
         if self._finished:
             raise RuntimeError("cannot feed a finished Qwen parser")
@@ -982,6 +1129,10 @@ class QwenIncrementalParser:
             return QwenParserFinish((), self._had_incomplete_tool)
 
         events: list[GenerationEvent] = []
+        if self._pending_native_marker is not None:
+            marker, _, _ = self._pending_native_marker
+            self._pending_native_marker = None
+            self._emit_content(marker, events)
         if self._mode == "tool":
             self._had_incomplete_tool = True
             self._buffer = ""

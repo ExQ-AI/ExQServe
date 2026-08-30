@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.runtime.contracts import (
     RuntimeFinished,
     RuntimeGenerationRequest,
@@ -163,3 +164,51 @@ def test_non_terminal_empty_stream_result_emits_nothing() -> None:
     assert translate_exllamav3_result(
         _request(), {"stage": "streaming", "text": "", "eos": False}
     ) == ()
+
+
+def test_verified_native_token_spans_preserve_exact_offsets() -> None:
+    events = translate_exllamav3_result(
+        _request(),
+        {
+            "stage": "streaming",
+            "text": "a<tool_call>b",
+            "token_ids": [[1, 2, 3]],
+            "eos": False,
+        },
+        id_to_piece=("", "a", "<tool_call>", "b"),
+        native_piece_ids=frozenset({2}),
+    )
+
+    assert events == (
+        RuntimeTextDelta(
+            "req-1",
+            "a<tool_call>b",
+            (1, 2, 3),
+            (NativeTokenSpan(1, 12, 2, "<tool_call>"),),
+            True,
+        ),
+    )
+
+
+def test_verified_text_without_native_piece_uses_empty_provenance_tuple() -> None:
+    events = translate_exllamav3_result(
+        _request(),
+        {"stage": "streaming", "text": "ab", "token_ids": [[1, 2]], "eos": False},
+        id_to_piece=("", "a", "b"),
+        native_piece_ids=frozenset(),
+    )
+
+    assert events == (RuntimeTextDelta("req-1", "ab", (1, 2), (), True),)
+
+
+def test_text_token_mismatch_preserves_unverified_provenance() -> None:
+    events = translate_exllamav3_result(
+        _request(),
+        {"stage": "streaming", "text": "visible", "token_ids": [[1, 2]], "eos": False},
+        id_to_piece=("", "vis", "ible-stop"),
+        native_piece_ids=frozenset({2}),
+    )
+
+    delta = events[0]
+    assert isinstance(delta, RuntimeTextDelta)
+    assert delta.native_token_spans is None

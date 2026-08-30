@@ -2064,6 +2064,63 @@ def test_runtime_session_drains_ready_exllamav3_results_and_preserves_terminal_r
     asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
 
 
+def test_runtime_session_keeps_ready_results_separate_when_provenance_is_enabled() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            self.queue.put_nowait(
+                {
+                    "stage": "streaming",
+                    "text": "hello ",
+                    "token_ids": [[1]],
+                    "eos": False,
+                }
+            )
+            self.queue.put_nowait(
+                {
+                    "stage": "streaming",
+                    "text": "world",
+                    "token_ids": [[2]],
+                    "eos": True,
+                    "eos_reason": "stop_token",
+                    "prompt_tokens": 3,
+                    "new_tokens": 2,
+                }
+            )
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    assert isinstance(item, dict)
+                    yield item
+                    if item.get("eos") is True:
+                        break
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-provenance", (1, 2, 3), 8),
+            QueuedJob(),
+            id_to_piece=("", "hello ", "world"),
+            native_piece_ids=frozenset(),
+        )
+        events = [event async for event in session]
+        assert events[:2] == [
+            RuntimeTextDelta("req-provenance", "hello ", (1,), (), True),
+            RuntimeTextDelta("req-provenance", "world", (2,), (), True),
+        ]
+        assert isinstance(events[-1], RuntimeFinished)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
 def test_runtime_health_turns_false_after_backend_failure_marker_and_rejects_new_submit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

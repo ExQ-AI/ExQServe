@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
@@ -326,3 +327,32 @@ def test_runtime_event_vocabulary_is_safe_and_immutable() -> None:
     assert RuntimeStopReason.OTHER.value == "other"
     with pytest.raises(ValueError, match="text"):
         RuntimeTextDelta("req", "")
+
+
+def test_runtime_text_delta_validates_native_token_provenance_spans() -> None:
+    span = NativeTokenSpan(1, 12, 248058, "<tool_call>")
+    delta = RuntimeTextDelta("req", "a<tool_call>b", (1, 248058, 2), (span,), True)
+    assert delta.native_token_provenance is True
+    assert delta.native_token_spans == (span,)
+
+    with pytest.raises(ValueError, match="require native_token_provenance"):
+        RuntimeTextDelta("req", "a<tool_call>b", (1, 248058, 2), (span,))
+    with pytest.raises(ValueError, match="does not match"):
+        RuntimeTextDelta(
+            "req",
+            "a<tool_call>b",
+            (1, 248058, 2),
+            (NativeTokenSpan(0, 11, 248058, "<tool_call>"),),
+            True,
+        )
+    with pytest.raises(ValueError, match="sorted and non-overlapping"):
+        RuntimeTextDelta(
+            "req",
+            "<think></think>",
+            (248068, 248069),
+            (
+                NativeTokenSpan(7, 15, 248069, "</think>"),
+                NativeTokenSpan(0, 7, 248068, "<think>"),
+            ),
+            True,
+        )

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
@@ -480,9 +481,65 @@ def _stream_token_ids(value: object) -> tuple[int, ...]:
     return tuple(row)
 
 
+def _output_token_provenance_metadata(
+    text_codec: object,
+) -> tuple[tuple[str, ...] | None, frozenset[int] | None]:
+    get_id_to_piece = getattr(text_codec, "get_id_to_piece_list", None)
+    extended_id_to_piece = getattr(text_codec, "extended_id_to_piece", None)
+    if not callable(get_id_to_piece) or not isinstance(extended_id_to_piece, Mapping):
+        return None, None
+    candidate_pieces = get_id_to_piece(False)
+    if not isinstance(candidate_pieces, list) or not all(
+        isinstance(piece, str) for piece in candidate_pieces
+    ):
+        return None, None
+    native_piece_ids = frozenset(
+        token_id
+        for token_id, piece in extended_id_to_piece.items()
+        if isinstance(token_id, int)
+        and not isinstance(token_id, bool)
+        and token_id >= 0
+        and isinstance(piece, str)
+        and piece
+    )
+    return tuple(candidate_pieces), native_piece_ids
+
+
+def _native_token_spans(
+    text: str,
+    token_ids: tuple[int, ...],
+    id_to_piece: tuple[str, ...] | None,
+    native_piece_ids: frozenset[int] | None,
+) -> tuple[NativeTokenSpan, ...] | None:
+    if id_to_piece is None or native_piece_ids is None or not token_ids:
+        return None
+    pieces: list[str] = []
+    for token_id in token_ids:
+        if token_id >= len(id_to_piece):
+            return None
+        piece = id_to_piece[token_id]
+        if not isinstance(piece, str):
+            return None
+        pieces.append(piece)
+    if "".join(pieces) != text:
+        return None
+
+    spans: list[NativeTokenSpan] = []
+    offset = 0
+    for token_id, piece in zip(token_ids, pieces, strict=True):
+        end = offset + len(piece)
+        if token_id in native_piece_ids and piece:
+            spans.append(NativeTokenSpan(offset, end, token_id, piece))
+        offset = end
+    return tuple(spans)
+
+
 def translate_exllamav3_result(
     request: RuntimeGenerationRequest,
     result: Mapping[str, object],
+    *,
+    id_to_piece: tuple[str, ...] | None = None,
+    native_piece_ids: frozenset[int] | None = None,
 ) -> tuple[RuntimeEvent, ...]:
     """Translate one upstream result dictionary without importing ExLlamaV3 itself."""
 
@@ -497,11 +554,14 @@ def translate_exllamav3_result(
     events: list[RuntimeEvent] = []
     text = result.get("text")
     if isinstance(text, str) and text:
+        token_ids = _stream_token_ids(result.get("token_ids"))
         events.append(
             RuntimeTextDelta(
                 request.request_id,
                 text,
-                _stream_token_ids(result.get("token_ids")),
+                token_ids,
+                _native_token_spans(text, token_ids, id_to_piece, native_piece_ids),
+                id_to_piece is not None and native_piece_ids is not None,
             )
         )
 
@@ -607,12 +667,17 @@ class RuntimeSession:
         request: RuntimeGenerationRequest,
         job: _BackendJob,
         on_backend_failure: Callable[[], None] | None = None,
+        *,
+        id_to_piece: tuple[str, ...] | None = None,
+        native_piece_ids: frozenset[int] | None = None,
     ) -> None:
         if not isinstance(request, RuntimeGenerationRequest):
             raise TypeError("request must be a RuntimeGenerationRequest")
         self._request = request
         self._job = job
         self._on_backend_failure = on_backend_failure
+        self._id_to_piece = id_to_piece
+        self._native_piece_ids = native_piece_ids
         self._iterator = job.__aiter__()
         self._pending: deque[RuntimeEvent] = deque()
         self._cancel_event = asyncio.Event()
@@ -694,7 +759,8 @@ class RuntimeSession:
 
                 try:
                     result = await next_result
-                    result = _merge_ready_stream_results(self._job, result)
+                    if self._id_to_piece is None:
+                        result = _merge_ready_stream_results(self._job, result)
                 except StopAsyncIteration:
                     return self._failure_event(
                         "backend_ended_early",
@@ -724,7 +790,14 @@ class RuntimeSession:
                 if self._cancel_event.is_set():
                     return self._cancelled_event()
 
-                self._pending.extend(translate_exllamav3_result(self._request, result))
+                self._pending.extend(
+                    translate_exllamav3_result(
+                        self._request,
+                        result,
+                        id_to_piece=self._id_to_piece,
+                        native_piece_ids=self._native_piece_ids,
+                    )
+                )
                 if self._pending:
                     return self._pop_pending()
             except asyncio.CancelledError:
@@ -1045,7 +1118,10 @@ def _create_backend_job(
         if not native_eos_token_ids:
             raise RuntimeError("model-native EOS/EOG token IDs are unavailable")
         stop_conditions = tuple(dict.fromkeys((*native_eos_token_ids, *stop_conditions)))
-    kwargs: dict[str, object] = {"stop_conditions": stop_conditions}
+    kwargs: dict[str, object] = {
+        "stop_conditions": stop_conditions,
+        "decode_special_tokens": False,
+    }
     if max_requeue_tokens is not None:
         kwargs["max_rq_tokens"] = max_requeue_tokens
     if embeddings:
@@ -1090,6 +1166,8 @@ class ExLlamaV3Runtime:
         self._backend_failed = False
         self._model_metadata = RuntimeModelMetadata()
         self._native_eos_token_ids: tuple[int, ...] = ()
+        self._output_id_to_piece: tuple[str, ...] | None = None
+        self._output_native_piece_ids: frozenset[int] | None = None
 
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
@@ -1215,6 +1293,8 @@ class ExLlamaV3Runtime:
         draft_cache_object: Any | None = None
         loras: list[Any] = []
         model_metadata = RuntimeModelMetadata()
+        output_id_to_piece: tuple[str, ...] | None = None
+        output_native_piece_ids: frozenset[int] | None = None
         try:
             backend_config = backend.Config.from_directory(config.model_directory)
             backend_config.infer_params.moe_cpu_offload = config.moe_cpu_offload_layers
@@ -1225,6 +1305,7 @@ class ExLlamaV3Runtime:
                 _backend_architecture(backend_config),
             )
             text_codec = backend.Tokenizer.from_config(backend_config)
+            output_id_to_piece, output_native_piece_ids = _output_token_provenance_metadata(text_codec)
             raw_eos_token_ids = getattr(backend_config, "eos_token_id_list", ())
             self._native_eos_token_ids = tuple(
                 dict.fromkeys(
@@ -1371,6 +1452,8 @@ class ExLlamaV3Runtime:
             self._generator = None
             self._model_metadata = RuntimeModelMetadata()
             self._native_eos_token_ids = ()
+            self._output_id_to_piece = None
+            self._output_native_piece_ids = None
             raise
 
         self._backend = backend
@@ -1390,6 +1473,8 @@ class ExLlamaV3Runtime:
         self._generator = None
         self._backend_failed = False
         self._model_metadata = model_metadata
+        self._output_id_to_piece = output_id_to_piece
+        self._output_native_piece_ids = output_native_piece_ids
 
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         """Tokenize a raw document-continuation prompt without applying a chat template."""
@@ -1555,6 +1640,8 @@ class ExLlamaV3Runtime:
                 self._native_eos_token_ids,
             ),
             self._mark_backend_failed,
+            id_to_piece=self._output_id_to_piece,
+            native_piece_ids=self._output_native_piece_ids,
         )
 
     async def close(self) -> None:
@@ -1612,6 +1699,8 @@ class ExLlamaV3Runtime:
         self._generator = None
         self._model_metadata = RuntimeModelMetadata()
         self._native_eos_token_ids = ()
+        self._output_id_to_piece = None
+        self._output_native_piece_ids = None
 
         if close_error is not None:
             raise RuntimeError("Failed to close ExLlamaV3 runtime cleanly.") from close_error

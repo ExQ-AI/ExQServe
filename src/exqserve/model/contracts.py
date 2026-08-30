@@ -12,6 +12,7 @@ from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolPolicy
 from exqserve.core.events import GenerationEvent
 from exqserve.core.request import CanonicalRequest
+from exqserve.core.tokens import NativeTokenSpan
 
 type TemplateScalar = str | int | float | bool | None
 
@@ -306,6 +307,21 @@ class IncrementalParserLike(Protocol):
 
     def finish(self) -> ParserFinishLike:
         ...
+
+
+class NativeTokenProvenanceError(RuntimeError):
+    """Raised when Qwen structural intent cannot be resolved without guessing."""
+
+
+class NativeTokenAwareIncrementalParser:
+    """Nominal internal opt-in for parsers that consume verified token provenance."""
+
+    def feed_with_native_tokens(
+        self,
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+    ) -> tuple[GenerationEvent, ...]:
+        raise NotImplementedError
 
 
 class ToolConstraintMode(str, Enum):
