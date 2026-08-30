@@ -229,6 +229,7 @@ def _build_model_bundle(
         cast(RequestControllerLike, controller),
         tool_constraint_factory,
         config.tool_call_fanout_limit,
+        config.constrained_parallel_tool_call_limit,
     )
     raw_engine = RawServingEngine(runtime_object, cast(RawRequestController, controller))
     observed = ObservedServingEngine(engine, metrics, capture=capture)

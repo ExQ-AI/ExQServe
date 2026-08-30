@@ -11,6 +11,7 @@ from exqserve.agent.validation import (
     ValidationIssue,
     ValidationResult,
     validate_tool_calls,
+    validate_tool_calls_with_canonical_arguments,
 )
 from exqserve.core.items import ToolCallItem
 
@@ -43,6 +44,21 @@ def test_validation_result_contract_is_immutable_and_derived() -> None:
 
     with pytest.raises(FrozenInstanceError):
         issue.message = "changed"  # type: ignore[misc]
+
+
+def test_detailed_tool_validation_returns_canonical_arguments_from_same_parse() -> None:
+    tool = _tool(
+        "lookup",
+        '{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},'
+        '"required":["a","b"],"additionalProperties":false}',
+    )
+    detailed = validate_tool_calls_with_canonical_arguments(
+        (_call(0, "lookup", args='{ "b" : 2, "a" : 1 }'),),
+        _policy(tool),
+    )
+
+    assert detailed.result.is_valid
+    assert detailed.canonical_arguments == ('{"a":1,"b":2}',)
 
 
 def test_validation_codes_cover_v1_agent_semantics() -> None:

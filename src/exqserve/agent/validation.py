@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from exqserve.agent._json import DuplicateJsonKeyError, InvalidJsonError, parse_json_strict
+from exqserve.agent._json import (
+    DuplicateJsonKeyError,
+    InvalidJsonError,
+    canonical_json_dumps,
+    parse_json_strict,
+)
 from exqserve.agent.schema import _schema_violations
 from exqserve.agent.tools import ToolChoiceMode, ToolPolicy
 from exqserve.core.items import (
@@ -64,10 +69,31 @@ class ValidationResult:
         return not self.issues
 
 
+@dataclass(frozen=True, slots=True)
+class ToolCallsValidation:
+    result: ValidationResult
+    canonical_arguments: tuple[str | None, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, ValidationResult):
+            raise TypeError("result must be a ValidationResult")
+        if not isinstance(self.canonical_arguments, tuple):
+            raise TypeError("canonical_arguments must be a tuple")
+        if not all(value is None or isinstance(value, str) for value in self.canonical_arguments):
+            raise TypeError("canonical_arguments entries must be strings or None")
+
+
 def validate_tool_calls(
     calls: tuple[ToolCallItem, ...],
     policy: ToolPolicy,
 ) -> ValidationResult:
+    return validate_tool_calls_with_canonical_arguments(calls, policy).result
+
+
+def validate_tool_calls_with_canonical_arguments(
+    calls: tuple[ToolCallItem, ...],
+    policy: ToolPolicy,
+) -> ToolCallsValidation:
     if not isinstance(calls, tuple):
         raise TypeError("calls must be a tuple")
     if not all(isinstance(call, ToolCallItem) for call in calls):
@@ -78,14 +104,17 @@ def validate_tool_calls(
     issues: list[ValidationIssue] = []
 
     if policy.choice.mode is ToolChoiceMode.NONE and calls:
-        return ValidationResult(
-            (
-                ValidationIssue(
-                    ValidationCode.TOOL_CALL_FORBIDDEN,
-                    "tool calls are forbidden by the current policy",
-                    ("calls",),
-                ),
-            )
+        return ToolCallsValidation(
+            ValidationResult(
+                (
+                    ValidationIssue(
+                        ValidationCode.TOOL_CALL_FORBIDDEN,
+                        "tool calls are forbidden by the current policy",
+                        ("calls",),
+                    ),
+                )
+            ),
+            tuple(None for _ in calls),
         )
 
     if policy.choice.mode in {ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED} and not calls:
@@ -108,6 +137,7 @@ def validate_tool_calls(
 
     declared_tools = {tool.name: tool for tool in policy.tools}
     seen_call_ids: set[str] = set()
+    canonical_arguments: list[str | None] = []
 
     for position, call in enumerate(calls):
         base_path = ("calls", position)
@@ -141,6 +171,7 @@ def validate_tool_calls(
                     (*base_path, "name"),
                 )
             )
+            canonical_arguments.append(None)
             continue
 
         if policy.choice.mode is ToolChoiceMode.NAMED and call.name != policy.choice.name:
@@ -162,6 +193,7 @@ def validate_tool_calls(
                     (*base_path, "arguments"),
                 )
             )
+            canonical_arguments.append(None)
             continue
         except InvalidJsonError as exc:
             issues.append(
@@ -171,6 +203,7 @@ def validate_tool_calls(
                     (*base_path, "arguments"),
                 )
             )
+            canonical_arguments.append(None)
             continue
 
         if not isinstance(arguments, dict):
@@ -181,9 +214,11 @@ def validate_tool_calls(
                     (*base_path, "arguments"),
                 )
             )
+            canonical_arguments.append(None)
             continue
 
-        for violation in _schema_violations(tool.parameters, arguments):
+        violations = _schema_violations(tool.parameters, arguments)
+        for violation in violations:
             issues.append(
                 ValidationIssue(
                     ValidationCode.SCHEMA_VALIDATION_FAILED,
@@ -191,8 +226,9 @@ def validate_tool_calls(
                     (*base_path, "arguments", *violation.path),
                 )
             )
+        canonical_arguments.append(None if violations else canonical_json_dumps(arguments))
 
-    return ValidationResult(tuple(issues))
+    return ToolCallsValidation(ValidationResult(tuple(issues)), tuple(canonical_arguments))
 
 
 def validate_tool_history(items: tuple[CanonicalItem, ...]) -> ValidationResult:

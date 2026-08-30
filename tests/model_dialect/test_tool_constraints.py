@@ -110,20 +110,26 @@ def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> N
 
 
 @pytest.mark.parametrize("mode", (ToolConstraintMode.FORMAT, ToolConstraintMode.SCHEMA))
-def test_qwen_constrained_parallel_is_fail_closed_until_termination_is_certified(
+def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
     mode: ToolConstraintMode,
 ) -> None:
-    with pytest.raises(ToolConstraintUnsupported, match="parallel.*disabled"):
-        qwen_tool_constraint(
-            _policy(_tool("save", _qwen_schema()), parallel=True),
-            mode,
-        )
+    constraint = qwen_tool_constraint(
+        _policy(_tool("save", _qwen_schema()), parallel=True),
+        mode,
+    )
 
-    with pytest.raises(ToolConstraintUnsupported, match="parallel.*disabled"):
-        qwen_tool_constraint(
-            _policy(_tool("save", _qwen_schema(), strict=True), parallel=True),
-            ToolConstraintMode.OFF,
-        )
+    assert constraint is not None
+    assert (
+        "start: WS? function WS? </tool_call> "
+        "(WS? <tool_call> WS? function WS? </tool_call>)*"
+    ) in constraint.lark_grammar
+
+    strict_constraint = qwen_tool_constraint(
+        _policy(_tool("save", _qwen_schema(), strict=True), parallel=True),
+        ToolConstraintMode.OFF,
+    )
+    assert strict_constraint is not None
+    assert '"<parameter=count>"' in strict_constraint.lark_grammar
 
     assert (
         qwen_tool_constraint(

@@ -305,6 +305,10 @@ def test_server_config_delegates_runtime_and_control_invariants(tmp_path: Path) 
         ServerConfig(tmp_path, tool_call_fanout_limit=0)
     with pytest.raises(TypeError, match="tool_call_fanout_limit"):
         ServerConfig(tmp_path, tool_call_fanout_limit=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="constrained_parallel_tool_call_limit"):
+        ServerConfig(tmp_path, constrained_parallel_tool_call_limit=0)
+    with pytest.raises(TypeError, match="constrained_parallel_tool_call_limit"):
+        ServerConfig(tmp_path, constrained_parallel_tool_call_limit=True)  # type: ignore[arg-type]
 
 
 def test_server_config_accepts_only_tool_constraint_enum_values(tmp_path: Path) -> None:

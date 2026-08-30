@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -17,6 +18,7 @@ from exqserve.agent.validation import (
     ValidationCode,
     ValidationResult,
     validate_tool_calls,
+    validate_tool_calls_with_canonical_arguments,
     validate_tool_history,
 )
 from exqserve.control.request import RequestRejected, RequestTerminalReason
@@ -253,16 +255,24 @@ class ServingEngine:
         controller: RequestControllerLike,
         tool_constraint_factory: ToolConstraintFactory | None = None,
         tool_call_fanout_limit: int = 32,
+        constrained_parallel_tool_call_limit: int = 8,
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
         if tool_call_fanout_limit <= 0:
             raise ValueError("tool_call_fanout_limit must be positive")
+        if not isinstance(constrained_parallel_tool_call_limit, int) or isinstance(
+            constrained_parallel_tool_call_limit, bool
+        ):
+            raise TypeError("constrained_parallel_tool_call_limit must be an integer")
+        if constrained_parallel_tool_call_limit <= 0:
+            raise ValueError("constrained_parallel_tool_call_limit must be positive")
         self._compiler = compiler
         self._parser_factory = parser_factory
         self._controller = controller
         self._tool_constraint_factory = tool_constraint_factory
         self._tool_call_fanout_limit = tool_call_fanout_limit
+        self._constrained_parallel_tool_call_limit = constrained_parallel_tool_call_limit
         self._compile_lock = asyncio.Lock()
 
     def _compile_request(self, request: ServingRequest) -> CompiledPrompt:
@@ -451,6 +461,8 @@ class ServingEngine:
             request.structured_output,
             request.stop_conditions,
             self._tool_call_fanout_limit,
+            request.tools.allow_parallel and tool_constraint is not None,
+            self._constrained_parallel_tool_call_limit,
         )
 
 
@@ -467,11 +479,21 @@ class ServingSession:
         structured_output: StructuredOutputSpec | None,
         requested_stop_conditions: tuple[str | int, ...] = (),
         tool_call_fanout_limit: int = 32,
+        atomic_parallel_tools: bool = False,
+        constrained_parallel_tool_call_limit: int = 8,
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
         if tool_call_fanout_limit <= 0:
             raise ValueError("tool_call_fanout_limit must be positive")
+        if not isinstance(atomic_parallel_tools, bool):
+            raise TypeError("atomic_parallel_tools must be a bool")
+        if not isinstance(constrained_parallel_tool_call_limit, int) or isinstance(
+            constrained_parallel_tool_call_limit, bool
+        ):
+            raise TypeError("constrained_parallel_tool_call_limit must be an integer")
+        if constrained_parallel_tool_call_limit <= 0:
+            raise ValueError("constrained_parallel_tool_call_limit must be positive")
         self._request_id = request_id
         self._controlled = controlled
         self._runtime_iterator = controlled.__aiter__()
@@ -483,12 +505,16 @@ class ServingSession:
             condition for condition in requested_stop_conditions if isinstance(condition, str)
         )
         self._tool_call_fanout_limit = tool_call_fanout_limit
+        self._atomic_parallel_tools = atomic_parallel_tools
+        self._constrained_parallel_tool_call_limit = constrained_parallel_tool_call_limit
         self._pending: deque[GenerationEvent] = deque()
+        self._buffered_tool_events: list[GenerationEvent] = []
         self._terminal = False
         self._parser_finished = False
         self._text_parts: list[str] = []
         self._accepted_call_ids: set[str] = set()
         self._completed_calls: list[ToolCallItem] = []
+        self._completed_call_signatures: set[tuple[str, str]] = set()
         self._runtime_trace: list[dict[str, object]] | None = None
 
     @property
@@ -516,15 +542,38 @@ class ServingSession:
             await self.cancel()
         return False
 
+    def _publish_tool_event(self, event: GenerationEvent) -> None:
+        if self._atomic_parallel_tools:
+            self._buffered_tool_events.append(event)
+        else:
+            self._pending.append(event)
+
+    def _discard_atomic_tool_batch(self) -> None:
+        if self._atomic_parallel_tools:
+            self._buffered_tool_events.clear()
+
+    def _flush_atomic_tool_batch(self) -> None:
+        if not self._atomic_parallel_tools or not self._buffered_tool_events:
+            return
+        self._pending.extend(self._buffered_tool_events)
+        self._buffered_tool_events.clear()
+
+    def _effective_tool_call_limit(self) -> int:
+        if not self._atomic_parallel_tools:
+            return self._tool_call_fanout_limit
+        return min(self._tool_call_fanout_limit, self._constrained_parallel_tool_call_limit)
+
     async def cancel(self) -> None:
         if self._terminal:
             return
+        self._discard_atomic_tool_batch()
         await self._controlled.cancel(RequestTerminalReason.CLIENT_CANCELLED)
 
     async def _model_failure(self, code: str, message: str) -> None:
         if self._terminal:
             return
         await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        self._discard_atomic_tool_batch()
         self._pending.append(
             GenerationFailed(
                 self._request_id,
@@ -547,11 +596,12 @@ class ServingSession:
                     "Model produced a duplicate tool-call start event.",
                 )
                 return
-            if len(self._accepted_call_ids) >= self._tool_call_fanout_limit:
+            effective_limit = self._effective_tool_call_limit()
+            if len(self._accepted_call_ids) >= effective_limit:
                 logger.warning(
                     "model exceeded tool-call fanout limit request_id=%s limit=%d",
                     self._request_id,
-                    self._tool_call_fanout_limit,
+                    effective_limit,
                 )
                 await self._model_failure(
                     "tool_policy_violation",
@@ -559,7 +609,7 @@ class ServingSession:
                 )
                 return
             self._accepted_call_ids.add(event.call_id)
-            self._pending.append(event)
+            self._publish_tool_event(event)
             return
         if isinstance(event, ToolCallArgumentsDelta):
             if event.call_id not in self._accepted_call_ids:
@@ -568,7 +618,7 @@ class ServingSession:
                     "Model produced tool arguments before an accepted tool call start.",
                 )
                 return
-            self._pending.append(event)
+            self._publish_tool_event(event)
             return
         if isinstance(event, ToolCallCompleted):
             if event.call.call_id not in self._accepted_call_ids:
@@ -578,7 +628,11 @@ class ServingSession:
                 )
                 return
             candidate_calls = (*self._completed_calls, event.call)
-            validation = validate_tool_calls(candidate_calls, self._tool_policy)
+            detailed_validation = validate_tool_calls_with_canonical_arguments(
+                candidate_calls,
+                self._tool_policy,
+            )
+            validation = detailed_validation.result
             if not validation.is_valid:
                 logger.warning(
                     "model produced invalid completed tool call request_id=%s issues=%s",
@@ -588,13 +642,34 @@ class ServingSession:
                 code, message = _tool_validation_failure(validation)
                 await self._model_failure(code, message)
                 return
+            canonical_arguments = detailed_validation.canonical_arguments[-1]
+            assert canonical_arguments is not None
+            signature = (event.call.name, canonical_arguments)
+            if self._atomic_parallel_tools and signature in self._completed_call_signatures:
+                signature_hash = hashlib.sha256(
+                    f"{signature[0]}\0{signature[1]}".encode()
+                ).hexdigest()[:12]
+                logger.warning(
+                    "model repeated constrained-parallel tool call request_id=%s index=%d signature=%s",
+                    self._request_id,
+                    event.call.index,
+                    signature_hash,
+                )
+                await self._model_failure(
+                    "tool_policy_violation",
+                    "Model repeated a tool call inside one constrained parallel batch.",
+                )
+                return
+            if self._atomic_parallel_tools:
+                self._completed_call_signatures.add(signature)
             self._completed_calls.append(event.call)
-            self._pending.append(event)
+            self._publish_tool_event(event)
             return
         self._pending.append(event)
 
     async def _fail_native_token_provenance(self) -> None:
         await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        self._discard_atomic_tool_batch()
         self._pending.append(
             GenerationFailed(
                 self._request_id,
@@ -664,6 +739,7 @@ class ServingSession:
             else completion_reason_from_runtime(event.reason)
         )
 
+        self._flush_atomic_tool_batch()
         timing_event = timing_event_from_runtime(self._request_id, event.timing)
         if timing_event is not None:
             self._pending.append(timing_event)
@@ -688,6 +764,7 @@ class ServingSession:
         await self._finish_parser_events()
         if self._terminal:
             return
+        self._discard_atomic_tool_batch()
         self._pending.append(GenerationFailed(self._request_id, event.error))
         self._terminal = True
 
@@ -695,6 +772,7 @@ class ServingSession:
         await self._finish_parser_events()
         if self._terminal:
             return
+        self._discard_atomic_tool_batch()
         if self._controlled.terminal_reason is RequestTerminalReason.TIMEOUT:
             self._pending.append(
                 GenerationFailed(
@@ -793,6 +871,7 @@ class ServingSession:
                 if self._pending:
                     continue
                 if not self._terminal:
+                    self._discard_atomic_tool_batch()
                     self._pending.append(
                         GenerationFailed(
                             self._request_id,

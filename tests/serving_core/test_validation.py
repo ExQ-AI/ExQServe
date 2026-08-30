@@ -9,6 +9,7 @@ from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.control.request import RequestTerminalReason
+from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
@@ -24,9 +25,15 @@ from exqserve.core.events import (
 from exqserve.core.items import MessageItem, MessageRole, ToolCallItem
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.usage import TokenUsage
-from exqserve.model.contracts import CompiledPrompt, TemplateRequest
+from exqserve.model.contracts import (
+    CompiledPrompt,
+    NativeTokenProvenanceError,
+    TemplateRequest,
+    ToolGenerationConstraint,
+)
 from exqserve.runtime.contracts import (
     RuntimeEvent,
+    RuntimeFailed,
     RuntimeFinished,
     RuntimeGenerationRequest,
     RuntimeStarted,
@@ -137,6 +144,11 @@ def _finished() -> RuntimeFinished:
         TokenUsage(input_tokens=2, output_tokens=5),
         RuntimeTiming(),
     )
+
+
+def _tool_constraint_factory(policy: ToolPolicy) -> ToolGenerationConstraint:
+    del policy
+    return ToolGenerationConstraint("<tool>", 'start: "ok"', True)
 
 
 def test_undeclared_completed_tool_fails_before_completion_is_released() -> None:
@@ -324,6 +336,432 @@ def test_tool_call_fanout_limit_rejects_call_before_exposing_extra_start() -> No
         assert isinstance(events[-1], GenerationFailed)
         assert events[-1].error.code == "tool_policy_violation"
         assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_buffers_unique_calls_until_terminal() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        second = ToolCallItem("call-2", "lookup", '{"id":2}', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+                ToolCallCompleted("req", second),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        assert not session._pending
+        assert len(session._buffered_tool_events) == 6
+
+        await session._process_runtime(_finished())
+        events = [event async for event in session]
+
+        assert events[:6] == [
+            ToolCallStarted("req", "call-1", "lookup", 0),
+            ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+            ToolCallCompleted("req", first),
+            ToolCallStarted("req", "call-2", "lookup", 1),
+            ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+            ToolCallCompleted("req", second),
+        ]
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_rejects_canonical_duplicate_without_publication() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        duplicate = ToolCallItem("call-2", "lookup", '{ "id" : 1 }', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{ "id" : 1 }', 1),
+                ToolCallCompleted("req", duplicate),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_rejects_non_adjacent_duplicate_without_publication() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        second = ToolCallItem("call-2", "lookup", '{"id":2}', 1)
+        repeated_first = ToolCallItem("call-3", "lookup", '{ "id" : 1 }', 2)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+                ToolCallCompleted("req", second),
+                ToolCallStarted("req", "call-3", "lookup", 2),
+                ToolCallArgumentsDelta("req", "call-3", '{ "id" : 1 }', 2),
+                ToolCallCompleted("req", repeated_first),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_soft_limit_discards_entire_batch() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        second = ToolCallItem("call-2", "lookup", '{"id":2}', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+                ToolCallCompleted("req", second),
+                ToolCallStarted("req", "call-3", "lookup", 2),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+            tool_call_fanout_limit=32,
+            constrained_parallel_tool_call_limit=2,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_limit_uses_lower_global_fanout() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+            tool_call_fanout_limit=1,
+            constrained_parallel_tool_call_limit=8,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_runtime_failure_discards_buffered_calls() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        assert session._buffered_tool_events
+        error = CanonicalError(
+            ErrorCategory.RUNTIME_FAILURE,
+            "backend_failed",
+            "Runtime failed.",
+            retryable=False,
+        )
+        await session._process_runtime(RuntimeFailed("req", error))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert events == [GenerationFailed("req", error)]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_client_cancel_discards_buffered_calls() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        assert session._buffered_tool_events
+        await session.cancel()
+        assert not session._buffered_tool_events
+        assert controlled.cancel_calls == [RequestTerminalReason.CLIENT_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_incomplete_call_discards_entire_batch() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            ),
+            _Finish((), incomplete_tool_call=True),
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        await session._process_runtime(_finished())
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_incomplete"
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_schema_invalid_second_call_discards_entire_batch() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        invalid = ToolCallItem("call-2", "lookup", '{"id":"bad"}', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":"bad"}', 1),
+                ToolCallCompleted("req", invalid),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_invalid"
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_provenance_failure_discards_entire_batch() -> None:
+    class _ProvenanceFailParser(_ScriptedParser):
+        def finish(self) -> _Finish:
+            raise NativeTokenProvenanceError("missing native-token provenance")
+
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ProvenanceFailParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        controlled = _Controlled([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        await session._process_runtime(_finished())
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "output_token_provenance_unavailable"
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_runtime_stream_end_discards_entire_batch() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(_Controlled([])),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "runtime_stream_ended"
+        assert not session._buffered_tool_events
+
+    asyncio.run(scenario())
+
+
+def test_unconstrained_parallel_tool_events_remain_immediately_visible() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(_Controlled([])),
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        assert await anext(session) == ToolCallStarted("req", "call-1", "lookup", 0)
 
     asyncio.run(scenario())
 

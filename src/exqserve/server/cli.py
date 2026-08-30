@@ -29,6 +29,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "model_dialect": "auto",
     "tool_constraint_mode": ToolConstraintMode.OFF.value,
     "tool_call_fanout_limit": 32,
+    "constrained_parallel_tool_call_limit": 8,
     "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,
@@ -158,6 +159,12 @@ def _build_parser(
         dest="tool_call_fanout_limit",
         type=int,
         help="Maximum protocol-visible tool calls allowed in one assistant generation.",
+    )
+    parser.add_argument(
+        "--max-constrained-parallel-tool-calls",
+        dest="constrained_parallel_tool_call_limit",
+        type=int,
+        help="Maximum calls in one atomic constrained-parallel tool batch.",
     )
     parser.add_argument(
         "--chat-template",
@@ -391,6 +398,8 @@ def _config_tokens(raw: Mapping[object, object]) -> list[str]:
     allowed_keys.add("ngram-draft-tokens")
     allowed_keys.discard("tool-call-fanout-limit")
     allowed_keys.add("max-tool-calls-per-generation")
+    allowed_keys.discard("constrained-parallel-tool-call-limit")
+    allowed_keys.add("max-constrained-parallel-tool-calls")
     tokens: list[str] = []
 
     model_value = raw.get("model-directory")
@@ -618,6 +627,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.moe_cpu_offload_layers,
         args.moe_cpu_threads,
         args.tool_call_fanout_limit,
+        args.constrained_parallel_tool_call_limit,
     )
 
 

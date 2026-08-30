@@ -464,7 +464,7 @@ def test_qwen_composition_forwards_enabled_tool_constraint(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
-def test_qwen_constrained_parallel_rejects_before_runtime_submission(tmp_path: Path) -> None:
+def test_qwen_constrained_parallel_restores_runtime_constraint(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = _FakeRuntime()
         runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
@@ -497,9 +497,11 @@ def test_qwen_constrained_parallel_rejects_before_runtime_submission(tmp_path: P
             },
         )
 
-        assert response.status_code == 400
-        assert response.json()["error"]["code"] == "tool_constraint_unsupported"
-        assert runtime.submit_calls == []
+        assert response.status_code == 200
+        assert len(runtime.submit_calls) == 1
+        constraint = runtime.submit_calls[0].generation_constraint
+        assert constraint is not None
+        assert "(WS? <tool_call> WS? function WS? </tool_call>)*" in constraint.lark_grammar
 
     asyncio.run(scenario())
 
