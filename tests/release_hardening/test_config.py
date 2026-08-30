@@ -301,6 +301,10 @@ def test_server_config_delegates_runtime_and_control_invariants(tmp_path: Path) 
         ServerConfig(tmp_path, port=0)
     with pytest.raises(ValueError, match="default_api_output_tokens"):
         ServerConfig(tmp_path, default_api_output_tokens=0)
+    with pytest.raises(ValueError, match="tool_call_fanout_limit"):
+        ServerConfig(tmp_path, tool_call_fanout_limit=0)
+    with pytest.raises(TypeError, match="tool_call_fanout_limit"):
+        ServerConfig(tmp_path, tool_call_fanout_limit=True)  # type: ignore[arg-type]
 
 
 def test_server_config_accepts_only_tool_constraint_enum_values(tmp_path: Path) -> None:

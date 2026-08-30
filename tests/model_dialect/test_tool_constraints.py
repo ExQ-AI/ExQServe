@@ -33,13 +33,24 @@ def _schema() -> str:
     )
 
 
+def _qwen_schema() -> str:
+    return (
+        '{"type":"object","properties":{'
+        '"command":{"type":"string"},'
+        '"count":{"type":"integer","minimum":1},'
+        '"enabled":{"type":"boolean"},'
+        '"mode":{"type":"string","enum":["fast","safe"]}'
+        '},"required":["command","count","mode"],"additionalProperties":false}'
+    )
+
+
 def test_constraint_modes_are_stable() -> None:
     assert [mode.value for mode in ToolConstraintMode] == ["off", "format", "schema"]
 
 
 def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
     constraint = qwen_tool_constraint(
-        _policy(_tool("save", _schema()), parallel=False),
+        _policy(_tool("save", _qwen_schema()), parallel=False),
         ToolConstraintMode.SCHEMA,
     )
 
@@ -47,14 +58,37 @@ def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
     assert constraint.trigger == "<tool_call>"
     assert constraint.eos_after_completed is True
     assert '"<function=save>"' in constraint.lark_grammar
+    assert '"<parameter=command>"' in constraint.lark_grammar
     assert '"<parameter=count>"' in constraint.lark_grammar
     assert '"<parameter=mode>"' in constraint.lark_grammar
-    assert '"<parameter=tags>"' in constraint.lark_grammar
     assert '"minimum":1' in constraint.lark_grammar
-    assert '"pattern":"^[a-z]+$"' in constraint.lark_grammar
+    assert 'qwen_raw_string[suffix="</parameter>"]' in constraint.lark_grammar
+    assert '("fast" | "safe")' in constraint.lark_grammar
     assert "%json" in constraint.lark_grammar
     assert "function_0_parameter_2?" in constraint.lark_grammar
     assert '"</tool_call>"' in constraint.lark_grammar
+
+
+def test_qwen_constraint_bounds_structural_whitespace() -> None:
+    constraint = qwen_tool_constraint(
+        _policy(_tool("save", _qwen_schema()), parallel=False),
+        ToolConstraintMode.SCHEMA,
+    )
+
+    assert constraint is not None
+    assert "WS: /[ \\t\\r\\n]{1,8}/" in constraint.lark_grammar
+    assert "WS: /[ \\t\\r\\n]+/" not in constraint.lark_grammar
+
+
+def test_qwen_schema_mode_rejects_unrepresentable_native_string_keywords() -> None:
+    schema = (
+        '{"type":"object","properties":{'
+        '"command":{"type":"string","pattern":"^git .+$"}'
+        '},"required":["command"]}'
+    )
+
+    with pytest.raises(ToolConstraintUnsupported, match="pattern"):
+        qwen_tool_constraint(_policy(_tool("run", schema)), ToolConstraintMode.SCHEMA)
 
 
 def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> None:
@@ -207,6 +241,7 @@ def test_gemma_constraint_rejects_every_name_the_native_parser_rejects(name: str
 def test_constraint_lark_grammars_compile_when_llguidance_is_installed() -> None:
     llguidance = pytest.importorskip("llguidance")
     policy = _policy(_tool("save", _schema()))
+    qwen_policy = _policy(_tool("qwen_save", _qwen_schema()))
     ref_policy = _policy(
         _tool(
             "ref_save",
@@ -217,7 +252,7 @@ def test_constraint_lark_grammars_compile_when_llguidance_is_installed() -> None
 
     for constraint in (
         qwen_tool_constraint(policy, ToolConstraintMode.FORMAT),
-        qwen_tool_constraint(policy, ToolConstraintMode.SCHEMA),
+        qwen_tool_constraint(qwen_policy, ToolConstraintMode.SCHEMA),
         qwen_tool_constraint(ref_policy, ToolConstraintMode.SCHEMA),
         gemma4_tool_constraint(policy, ToolConstraintMode.FORMAT),
         gemma4_tool_constraint(policy, ToolConstraintMode.SCHEMA),

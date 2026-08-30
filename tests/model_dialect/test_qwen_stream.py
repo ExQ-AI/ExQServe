@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from exqserve.agent.schema import JsonSchema
+from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.events import (
     GenerationEvent,
     ReasoningCompleted,
@@ -177,6 +179,56 @@ def test_parameter_values_use_strict_json_when_possible_and_string_otherwise() -
     assert call.arguments_json == (
         '{"count":3,"enabled":true,"meta":{"x":1},"label":"hello 中文"}'
     )
+
+
+def test_string_parameter_schema_preserves_raw_json_looking_text_as_string() -> None:
+    tool = FunctionTool(
+        "save",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"label":{"type":"string"},'
+            '"enabled":{"type":"boolean"},'
+            '"count":{"type":"integer"}'
+            '},"required":["label","enabled","count"]}'
+        ),
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    parser = QwenIncrementalParser("req-string", tool_policy=policy)
+    source = (
+        "<tool_call><function=save>"
+        "<parameter=label>true</parameter>"
+        "<parameter=enabled>true</parameter>"
+        "<parameter=count>3</parameter>"
+        "</function></tool_call>"
+    )
+    events = list(parser.feed(source))
+    events.extend(parser.finish().events)
+    call = _completed_calls(events)[0].call
+
+    assert call.arguments_json == '{"label":"true","enabled":true,"count":3}'
+
+
+def test_string_parameter_schema_still_accepts_json_quoted_string_surface() -> None:
+    tool = FunctionTool(
+        "save",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"label":{"type":"string"}},'
+            '"required":["label"]}'
+        ),
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    parser = QwenIncrementalParser("req-quoted", tool_policy=policy)
+    events = list(
+        parser.feed(
+            '<tool_call><function=save><parameter=label>"hello"</parameter>'
+            "</function></tool_call>"
+        )
+    )
+    events.extend(parser.finish().events)
+
+    assert _completed_calls(events)[0].call.arguments_json == '{"label":"hello"}'
 
 
 def test_duplicate_parameter_names_are_preserved_for_downstream_strict_validation() -> None:

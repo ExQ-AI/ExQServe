@@ -216,6 +216,7 @@ def _build_model_bundle(
         parser_factory,
         cast(RequestControllerLike, controller),
         tool_constraint_factory,
+        config.tool_call_fanout_limit,
     )
     raw_engine = RawServingEngine(runtime_object, cast(RawRequestController, controller))
     observed = ObservedServingEngine(engine, metrics, capture=capture)

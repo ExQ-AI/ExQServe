@@ -275,6 +275,7 @@ def _backend(
                 config_dict=config_dict,
                 model_classes=model_classes,
                 max_position_embeddings=max_position_embeddings,
+                eos_token_id_list=[248044, 248046],
                 infer_params=SimpleNamespace(moe_cpu_offload=0, moe_cpu_threads=None),
                 rope_settings=SimpleNamespace(
                     max_position_embeddings=rope_max_position_embeddings,
@@ -1511,14 +1512,22 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
             logit_bias=((10, 2.0), (20, -1.5)),
         ),
     )
+    native_eos = RuntimeGenerationRequest(
+        "req-c",
+        (6,),
+        5,
+        stop_conditions=("literal-stop",),
+        use_native_eos=True,
+    )
 
     async def scenario() -> None:
         runtime.submit(default_request)
         runtime.submit(explicit)
+        runtime.submit(native_eos)
 
     asyncio.run(scenario())
 
-    assert _FakeDefaultSampler.calls == 1
+    assert _FakeDefaultSampler.calls == 2
     assert _FakeComboSampler.calls == [
         {
             "temperature": 0.7,
@@ -1536,8 +1545,12 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
             "logit_bias": {10: 2.0, 20: -1.5},
         }
     ]
-    assert _FakeTorch.calls == [([[1, 2, 3]], "long"), ([[4, 5]], "long")]
-    assert len(_FakeAsyncJob.calls) == 2
+    assert _FakeTorch.calls == [
+        ([[1, 2, 3]], "long"),
+        ([[4, 5]], "long"),
+        ([[6]], "long"),
+    ]
+    assert len(_FakeAsyncJob.calls) == 3
     _, _, first_args, first_kwargs = _FakeAsyncJob.calls[0]
     assert first_args == (8, 0, 4, first_args[3], None)
     assert isinstance(first_args[3], _FakeDefaultSampler)
@@ -1549,6 +1562,9 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
     assert second_args[4] == 123
     assert second_kwargs["stop_conditions"] == (7,)
     assert "max_rq_tokens" not in second_kwargs
+    _, _, third_args, third_kwargs = _FakeAsyncJob.calls[2]
+    assert third_args[:3] == (5, 0, 4)
+    assert third_kwargs["stop_conditions"] == (248044, 248046, "literal-stop")
 
 
 def test_submit_maps_explicit_generation_constraint_to_strict_llguidance_filter(

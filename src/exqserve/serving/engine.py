@@ -239,11 +239,17 @@ class ServingEngine:
         parser_factory: ParserFactory,
         controller: RequestControllerLike,
         tool_constraint_factory: ToolConstraintFactory | None = None,
+        tool_call_fanout_limit: int = 32,
     ) -> None:
+        if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
+            raise TypeError("tool_call_fanout_limit must be an integer")
+        if tool_call_fanout_limit <= 0:
+            raise ValueError("tool_call_fanout_limit must be positive")
         self._compiler = compiler
         self._parser_factory = parser_factory
         self._controller = controller
         self._tool_constraint_factory = tool_constraint_factory
+        self._tool_call_fanout_limit = tool_call_fanout_limit
         self._compile_lock = asyncio.Lock()
 
     def _compile_request(self, request: ServingRequest) -> CompiledPrompt:
@@ -389,6 +395,7 @@ class ServingEngine:
                     tool_constraint.eos_after_completed,
                 )
             ),
+            use_native_eos=compiled.use_native_eos,
         )
         try:
             controlled = await self._controller.submit(runtime_request)
@@ -419,6 +426,7 @@ class ServingEngine:
             request.tools,
             request.structured_output,
             request.stop_conditions,
+            self._tool_call_fanout_limit,
         )
 
 
@@ -434,7 +442,12 @@ class ServingSession:
         tool_policy: ToolPolicy,
         structured_output: StructuredOutputSpec | None,
         requested_stop_conditions: tuple[str | int, ...] = (),
+        tool_call_fanout_limit: int = 32,
     ) -> None:
+        if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
+            raise TypeError("tool_call_fanout_limit must be an integer")
+        if tool_call_fanout_limit <= 0:
+            raise ValueError("tool_call_fanout_limit must be positive")
         self._request_id = request_id
         self._controlled = controlled
         self._runtime_iterator = controlled.__aiter__()
@@ -445,6 +458,7 @@ class ServingSession:
         self._requested_stop_sequences = frozenset(
             condition for condition in requested_stop_conditions if isinstance(condition, str)
         )
+        self._tool_call_fanout_limit = tool_call_fanout_limit
         self._pending: deque[GenerationEvent] = deque()
         self._terminal = False
         self._parser_finished = False
@@ -507,6 +521,17 @@ class ServingSession:
                 await self._model_failure(
                     "tool_call_stream_invalid",
                     "Model produced a duplicate tool-call start event.",
+                )
+                return
+            if len(self._accepted_call_ids) >= self._tool_call_fanout_limit:
+                logger.warning(
+                    "model exceeded tool-call fanout limit request_id=%s limit=%d",
+                    self._request_id,
+                    self._tool_call_fanout_limit,
+                )
+                await self._model_failure(
+                    "tool_policy_violation",
+                    "Model output exceeded the server tool-call policy.",
                 )
                 return
             self._accepted_call_ids.add(event.call_id)

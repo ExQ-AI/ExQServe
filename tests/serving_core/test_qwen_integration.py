@@ -114,6 +114,7 @@ def test_actual_qwen_compiler_parser_flow_through_serving_core_without_cuda() ->
             lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
                 request_id,
                 start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
+                tool_policy=tool_policy,
             ),
             controller,
         )
@@ -134,7 +135,8 @@ def test_actual_qwen_compiler_parser_flow_through_serving_core_without_cuda() ->
         assert renderer.tools is not None and renderer.tools[0]["function"]["name"] == "lookup"  # type: ignore[index]
         assert renderer.kwargs == {"enable_thinking": True}
         assert controller.requests[0].input_ids == (11, 22, 33)
-        assert controller.requests[0].stop_conditions == ("<|im_end|>",)
+        assert controller.requests[0].stop_conditions == ()
+        assert controller.requests[0].use_native_eos is True
         assert any(isinstance(event, ReasoningDelta) and event.text == "Need lookup." for event in events)
         completed_calls = [event for event in events if isinstance(event, ToolCallCompleted)]
         assert len(completed_calls) == 1

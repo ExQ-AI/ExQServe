@@ -628,3 +628,29 @@ def test_yaml_model_dialect_is_supported_and_cli_overrides_it(tmp_path: Path) ->
 
     assert yaml_config.model_dialect == "yaml-agent"
     assert cli_config.model_dialect == "cli-agent"
+
+
+def test_cli_tool_call_fanout_limit_defaults_and_overrides(tmp_path: Path) -> None:
+    default_config = cli.parse_config([str(tmp_path)])
+    explicit_config = cli.parse_config(
+        [str(tmp_path), "--max-tool-calls-per-generation", "7"]
+    )
+
+    assert default_config.tool_call_fanout_limit == 32
+    assert explicit_config.tool_call_fanout_limit == 7
+
+
+def test_yaml_tool_call_fanout_limit_is_supported_and_cli_overrides_it(tmp_path: Path) -> None:
+    config_path = tmp_path / "fanout.yaml"
+    config_path.write_text(
+        f"model-directory: {tmp_path}\nmax-tool-calls-per-generation: 11\n",
+        encoding="utf-8",
+    )
+
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    cli_config = cli.parse_config(
+        ["--config", str(config_path), "--max-tool-calls-per-generation", "5"]
+    )
+
+    assert yaml_config.tool_call_fanout_limit == 11
+    assert cli_config.tool_call_fanout_limit == 5

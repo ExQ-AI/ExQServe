@@ -231,6 +231,7 @@ class CompiledPrompt:
     runtime_attachments: tuple[object, ...] = ()
     raw_output_is_text_only: bool = False
     structured_output_trigger: str | None = None
+    use_native_eos: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
@@ -259,6 +260,7 @@ class CompiledPrompt:
         if not isinstance(self.runtime_attachments, tuple):
             raise TypeError("runtime_attachments must be a tuple")
         _validate_bool("raw_output_is_text_only", self.raw_output_is_text_only)
+        _validate_bool("use_native_eos", self.use_native_eos)
         if self.structured_output_trigger is not None:
             if not isinstance(self.structured_output_trigger, str):
                 raise TypeError("structured_output_trigger must be a string or None")

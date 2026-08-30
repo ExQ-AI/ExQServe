@@ -412,6 +412,7 @@ class RuntimeGenerationRequest:
     output_json_schema: str | None = None
     output_json_trigger: str | None = None
     generation_constraint: RuntimeGenerationConstraint | None = None
+    use_native_eos: bool = False
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -453,6 +454,7 @@ class RuntimeGenerationRequest:
             self.generation_constraint, RuntimeGenerationConstraint
         ):
             raise TypeError("generation_constraint must be a RuntimeGenerationConstraint or None")
+        _validate_bool("use_native_eos", self.use_native_eos)
         if self.generation_constraint is not None and self.output_json_schema is not None:
             raise ValueError("generation_constraint cannot be combined with output_json_schema")
 

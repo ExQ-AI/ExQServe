@@ -299,7 +299,8 @@ def test_compile_calls_adapter_and_hashes_final_token_ids_stably() -> None:
     assert first.text == "rendered:1"
     assert first.input_ids == (1, 23, 456)
     assert len(first.prompt_hash) == 64
-    assert first.stop_conditions == ("<|im_end|>",)
+    assert first.stop_conditions == ()
+    assert first.use_native_eos is True
     assert adapter.requests == [first.template_request, second.template_request]
 
 

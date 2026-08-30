@@ -72,6 +72,7 @@ class ServerConfig:
     ngram_draft_size: int = 4
     moe_cpu_offload_layers: int = 0
     moe_cpu_threads: int | None = None
+    tool_call_fanout_limit: int = 32
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -174,6 +175,7 @@ class ServerConfig:
             "ngram_match_min",
             "ngram_draft_size",
             "moe_cpu_offload_layers",
+            "tool_call_fanout_limit",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):

@@ -103,10 +103,10 @@ class QwenDialect:
         reasoning: ReasoningPolicy,
         tool_policy: ToolPolicy,
     ) -> QwenIncrementalParser:
-        del tool_policy
         return QwenIncrementalParser(
             request_id,
             start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
+            tool_policy=tool_policy,
         )
 
     def create_tool_constraint(

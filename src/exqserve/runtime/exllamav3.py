@@ -1028,10 +1028,16 @@ def _create_backend_job(
     max_requeue_tokens: int | None,
     embeddings: list[object] | None = None,
     filters: list[object] | None = None,
+    native_eos_token_ids: tuple[int, ...] = (),
 ) -> Any:
     # Supported ExLlamaV3 Job contract places these controls positionally after input_ids:
     # max_new_tokens, min_new_tokens, max_skips, sampler, seed.
-    kwargs: dict[str, object] = {"stop_conditions": request.stop_conditions}
+    stop_conditions = request.stop_conditions
+    if request.use_native_eos:
+        if not native_eos_token_ids:
+            raise RuntimeError("model-native EOS/EOG token IDs are unavailable")
+        stop_conditions = tuple(dict.fromkeys((*native_eos_token_ids, *stop_conditions)))
+    kwargs: dict[str, object] = {"stop_conditions": stop_conditions}
     if max_requeue_tokens is not None:
         kwargs["max_rq_tokens"] = max_requeue_tokens
     if embeddings:
@@ -1075,6 +1081,7 @@ class ExLlamaV3Runtime:
         self._generator: Any | None = None
         self._backend_failed = False
         self._model_metadata = RuntimeModelMetadata()
+        self._native_eos_token_ids: tuple[int, ...] = ()
 
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
@@ -1210,6 +1217,16 @@ class ExLlamaV3Runtime:
                 _backend_architecture(backend_config),
             )
             text_codec = backend.Tokenizer.from_config(backend_config)
+            raw_eos_token_ids = getattr(backend_config, "eos_token_id_list", ())
+            self._native_eos_token_ids = tuple(
+                dict.fromkeys(
+                    token_id
+                    for token_id in raw_eos_token_ids
+                    if isinstance(token_id, int)
+                    and not isinstance(token_id, bool)
+                    and token_id >= 0
+                )
+            )
             model = backend.Model.from_config(backend_config)
             if config.vision_enabled:
                 if _backend_component_available(backend_config, "vision") is False:
@@ -1345,6 +1362,7 @@ class ExLlamaV3Runtime:
             self._loras = []
             self._generator = None
             self._model_metadata = RuntimeModelMetadata()
+            self._native_eos_token_ids = ()
             raise
 
         self._backend = backend
@@ -1496,6 +1514,7 @@ class ExLlamaV3Runtime:
                 config.max_requeue_tokens,
                 embeddings or None,
                 output_filters,
+                self._native_eos_token_ids,
             ),
             self._mark_backend_failed,
         )
@@ -1554,6 +1573,7 @@ class ExLlamaV3Runtime:
         self._loras = []
         self._generator = None
         self._model_metadata = RuntimeModelMetadata()
+        self._native_eos_token_ids = ()
 
         if close_error is not None:
             raise RuntimeError("Failed to close ExLlamaV3 runtime cleanly.") from close_error

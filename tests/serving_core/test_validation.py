@@ -253,6 +253,81 @@ def test_parallel_false_accepts_first_call_then_fails_second_completion() -> Non
     asyncio.run(scenario())
 
 
+def test_tool_call_fanout_limit_allows_small_parallel_batch() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        second = ToolCallItem("call-2", "lookup", '{"id":2}', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+                ToolCallCompleted("req", second),
+            )
+        )
+        controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            tool_call_fanout_limit=2,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert ToolCallCompleted("req", first) in events
+        assert ToolCallCompleted("req", second) in events
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+        assert controlled.cancel_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_tool_call_fanout_limit_rejects_call_before_exposing_extra_start() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        second = ToolCallItem("call-2", "lookup", '{"id":2}', 1)
+        third = ToolCallItem("call-3", "lookup", '{"id":3}', 2)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1),
+                ToolCallCompleted("req", second),
+                ToolCallStarted("req", "call-3", "lookup", 2),
+                ToolCallArgumentsDelta("req", "call-3", '{"id":3}', 2),
+                ToolCallCompleted("req", third),
+            )
+        )
+        controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            tool_call_fanout_limit=2,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert ToolCallCompleted("req", first) in events
+        assert ToolCallCompleted("req", second) in events
+        assert ToolCallStarted("req", "call-3", "lookup", 2) not in events
+        assert ToolCallArgumentsDelta("req", "call-3", '{"id":3}', 2) not in events
+        assert ToolCallCompleted("req", third) not in events
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
 def test_schema_invalid_completed_call_fails_before_completion_is_released() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)

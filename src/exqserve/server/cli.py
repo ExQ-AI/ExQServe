@@ -28,6 +28,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "model_root": None,
     "model_dialect": "auto",
     "tool_constraint_mode": ToolConstraintMode.OFF.value,
+    "tool_call_fanout_limit": 32,
     "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,
@@ -151,6 +152,12 @@ def _build_parser(
         "--tool-constraint-mode",
         choices=tuple(mode.value for mode in ToolConstraintMode),
         help="Generation-time tool constraints: off (default), format, or schema.",
+    )
+    parser.add_argument(
+        "--max-tool-calls-per-generation",
+        dest="tool_call_fanout_limit",
+        type=int,
+        help="Maximum protocol-visible tool calls allowed in one assistant generation.",
     )
     parser.add_argument(
         "--chat-template",
@@ -382,6 +389,8 @@ def _config_tokens(raw: Mapping[object, object]) -> list[str]:
     }
     allowed_keys.discard("ngram-draft-size")
     allowed_keys.add("ngram-draft-tokens")
+    allowed_keys.discard("tool-call-fanout-limit")
+    allowed_keys.add("max-tool-calls-per-generation")
     tokens: list[str] = []
 
     model_value = raw.get("model-directory")
@@ -608,6 +617,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.ngram_draft_size,
         args.moe_cpu_offload_layers,
         args.moe_cpu_threads,
+        args.tool_call_fanout_limit,
     )
 
 

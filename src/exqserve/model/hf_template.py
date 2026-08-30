@@ -28,6 +28,7 @@ class HFTemplatePromptCompiler(ABC):
     """
 
     stop_conditions: tuple[str | int, ...] = ()
+    use_native_eos: bool = False
 
     def __init__(self, template_adapter: ChatTemplateAdapter) -> None:
         self._template_adapter = template_adapter
@@ -85,4 +86,5 @@ class HFTemplatePromptCompiler(ABC):
                 reasoning,
                 tool_policy,
             ),
+            use_native_eos=self.use_native_eos,
         )

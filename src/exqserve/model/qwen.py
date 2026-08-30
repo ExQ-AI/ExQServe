@@ -5,7 +5,12 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-from exqserve.agent._json import InvalidJsonError, canonical_json_dumps, parse_json_strict
+from exqserve.agent._json import (
+    InvalidJsonError,
+    JsonValue,
+    canonical_json_dumps,
+    parse_json_strict,
+)
 from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode, ReasoningPolicy
 from exqserve.agent.tools import FunctionTool, ToolChoiceMode, ToolPolicy
 from exqserve.core.events import (
@@ -63,8 +68,71 @@ QWEN38_CAPABILITIES = ModelCapabilities(
     vision=True,
 )
 
-_QWEN_STOP_CONDITIONS = ("<|im_end|>",)
 _QWEN_TOOL_TRIGGER = "<tool_call>"
+_QWEN_STRUCTURAL_WS_MAX = 8
+_QWEN_NATIVE_STRING_ALLOWED_KEYS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "type",
+        "enum",
+        "const",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    }
+)
+_QWEN_PARAMETER_CLOSE = "</parameter>"
+_QWEN_RAW_STRING_RULE = 'qwen_raw_string[suffix="</parameter>"]: /[\\s\\S]*/'
+
+
+def _qwen_native_string_lark(schema: dict[str, JsonValue]) -> tuple[str | None, bool]:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        if "string" in schema_type:
+            raise ToolConstraintUnsupported(
+                "mixed string/non-string unions are not supported in Qwen schema mode"
+            )
+        return None, False
+    if schema_type != "string":
+        return None, False
+
+    unsupported = sorted(set(schema) - _QWEN_NATIVE_STRING_ALLOWED_KEYS)
+    if unsupported:
+        raise ToolConstraintUnsupported(
+            "unsupported Qwen native string schema keyword: " + unsupported[0]
+        )
+
+    allowed_values: set[str] | None = None
+    if "enum" in schema:
+        enum = schema["enum"]
+        if not isinstance(enum, list):
+            raise ToolConstraintUnsupported("Qwen string enum must be an array")
+        allowed_values = {item for item in enum if isinstance(item, str)}
+        if not allowed_values:
+            raise ToolConstraintUnsupported("Qwen string enum has no string values")
+
+    if "const" in schema:
+        const = schema["const"]
+        if not isinstance(const, str):
+            raise ToolConstraintUnsupported("Qwen string const must be a string")
+        allowed_values = {const} if allowed_values is None else allowed_values & {const}
+        if not allowed_values:
+            raise ToolConstraintUnsupported("Qwen string enum and const have no common value")
+
+    if allowed_values is not None:
+        for value in allowed_values:
+            if value != value.strip() or _QWEN_PARAMETER_CLOSE in value:
+                raise ToolConstraintUnsupported(
+                    "Qwen native string enum/const value cannot be represented losslessly"
+                )
+        alternatives = " | ".join(lark_literal(value) for value in sorted(allowed_values))
+        return f"({alternatives})", False
+    return "qwen_raw_string", True
 
 
 def qwen_tool_constraint(
@@ -82,6 +150,7 @@ def qwen_tool_constraint(
 
     lines = ["%llguidance {}", 'start: WS? function WS? "</tool_call>"']
     lines.append("function: " + " | ".join(f"function_{index}" for index in range(len(tools))))
+    uses_raw_string = False
 
     if mode is ToolConstraintMode.FORMAT:
         lines.extend(
@@ -118,19 +187,31 @@ def qwen_tool_constraint(
             property_schema = properties[name]
             assert isinstance(property_schema, dict)
             property_schema = qwen_property_schema(schema, property_schema)
+            value_lark, raw_string = _qwen_native_string_lark(property_schema)
+            uses_raw_string = uses_raw_string or raw_string
+            if value_lark is None:
+                value_lark = schema_lark(property_schema)
             rule_name = f"function_{index}_parameter_{parameter_index}"
             suffix = "" if name in required_names else "?"
             parameter_rules.append(rule_name + suffix)
-            lines.append(
-                f"{rule_name}: {lark_literal(f'<parameter={name}>')} WS? "
-                f'{schema_lark(property_schema)} WS? "</parameter>" WS?'
-            )
+            if raw_string:
+                lines.append(
+                    f"{rule_name}: {lark_literal(f'<parameter={name}>')} WS? "
+                    f"{value_lark} WS?"
+                )
+            else:
+                lines.append(
+                    f"{rule_name}: {lark_literal(f'<parameter={name}>')} WS? "
+                    f'{value_lark} WS? "</parameter>" WS?'
+                )
         parameter_body = " ".join(parameter_rules)
         if parameter_body:
             parameter_body += " "
         lines.append(f'function_{index}: {open_tag} WS? {parameter_body}"</function>"')
 
-    lines.append("WS: /[ \\t\\r\\n]+/")
+    if uses_raw_string:
+        lines.append(_QWEN_RAW_STRING_RULE)
+    lines.append(f"WS: /[ \\t\\r\\n]{{1,{_QWEN_STRUCTURAL_WS_MAX}}}/")
     return ToolGenerationConstraint(
         trigger=_QWEN_TOOL_TRIGGER,
         lark_grammar="\n".join(lines),
@@ -186,7 +267,7 @@ def _exposed_tools(policy: ToolPolicy) -> tuple[TemplateTool, ...]:
 
 class QwenPromptCompiler(HFTemplatePromptCompiler):
     capabilities = QWEN38_CAPABILITIES
-    stop_conditions = _QWEN_STOP_CONDITIONS
+    use_native_eos = True
 
     def prepare(
         self,
@@ -460,12 +541,15 @@ def _deterministic_call_id(request_id: str, index: int) -> str:
     return f"call_{digest[:24]}"
 
 
-def _parameter_value_json(value_text: str) -> str:
+def _parameter_value_json(value_text: str, *, string_parameter: bool = False) -> str:
     stripped = value_text.strip()
     try:
         value = parse_json_strict(stripped)
     except InvalidJsonError:
         value = stripped
+    else:
+        if string_parameter and not isinstance(value, str):
+            value = stripped
     return canonical_json_dumps(value)
 
 
@@ -496,16 +580,49 @@ def _find_parameter_close(text: str, value_start: int) -> int:
     return -1
 
 
+def _qwen_string_parameters(tool_policy: ToolPolicy | None) -> dict[str, frozenset[str]]:
+    if tool_policy is None:
+        return {}
+    if not isinstance(tool_policy, ToolPolicy):
+        raise TypeError("tool_policy must be a ToolPolicy or None")
+
+    result: dict[str, frozenset[str]] = {}
+    for tool in tool_policy.tools:
+        schema = parse_json_strict(tool.parameters.canonical_json)
+        if not isinstance(schema, dict):
+            continue
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        names = frozenset(
+            name
+            for name, property_schema in properties.items()
+            if isinstance(name, str)
+            and isinstance(property_schema, dict)
+            and property_schema.get("type") == "string"
+        )
+        if names:
+            result[tool.name] = names
+    return result
+
+
 class QwenIncrementalParser:
     """Incrementally convert Qwen model-native text into canonical semantic events."""
 
-    def __init__(self, request_id: str, *, start_in_reasoning: bool = False) -> None:
+    def __init__(
+        self,
+        request_id: str,
+        *,
+        start_in_reasoning: bool = False,
+        tool_policy: ToolPolicy | None = None,
+    ) -> None:
         if not isinstance(request_id, str):
             raise TypeError("request_id must be a string")
         if not request_id.strip():
             raise ValueError("request_id must not be empty")
         if not isinstance(start_in_reasoning, bool):
             raise TypeError("start_in_reasoning must be a bool")
+        self._string_parameters = _qwen_string_parameters(tool_policy)
         self._request_id = request_id
         self._buffer = ""
         self._mode = "reasoning" if start_in_reasoning else "text"
@@ -744,7 +861,14 @@ class QwenIncrementalParser:
             close_at = _find_parameter_close(self._buffer, value_start)
             if close_at < 0:
                 return False
-            value_json = _parameter_value_json(self._buffer[value_start:close_at])
+            assert self._tool_name is not None
+            string_parameter = parameter_name in self._string_parameters.get(
+                self._tool_name, frozenset()
+            )
+            value_json = _parameter_value_json(
+                self._buffer[value_start:close_at],
+                string_parameter=string_parameter,
+            )
             prefix = "{" if not self._tool_argument_parts else ","
             fragment = f"{prefix}{canonical_json_dumps(parameter_name)}:{value_json}"
             self._ensure_tool_started(events)
