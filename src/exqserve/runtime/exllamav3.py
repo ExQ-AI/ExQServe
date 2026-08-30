@@ -1158,6 +1158,69 @@ class _ExLlamaV3Resources:
     output_native_piece_ids: frozenset[int] | None
 
 
+def _create_draft_generator(
+    resources: _ExLlamaV3Resources,
+    options: Mapping[str, object],
+) -> Any:
+    backend = resources.backend
+    text_codec = resources.tokenizer
+    config = resources.config
+    assert resources.draft_model is not None
+    assert resources.draft_cache is not None
+    return backend.AsyncGenerator(
+        resources.model,
+        resources.cache,
+        text_codec,
+        config.max_batch_size,
+        config.max_chunk_size,
+        8,
+        resources.draft_model,
+        resources.draft_cache,
+        config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
+        **options,
+    )
+
+
+def _create_async_generator(
+    resources: _ExLlamaV3Resources,
+    draft_options: Mapping[str, object] | None = None,
+) -> Any:
+    backend = resources.backend
+    text_codec = resources.tokenizer
+    config = resources.config
+    draft_enabled = config.mtp_enabled or config.draft_model_directory is not None
+    if draft_enabled:
+        if resources.draft_model is None or resources.draft_cache is None:
+            raise RuntimeError("ExLlamaV3 draft runtime is not ready")
+        if draft_options is None:
+            raise RuntimeError("ExLlamaV3 draft generator options are unavailable")
+        return _create_draft_generator(resources, draft_options)
+    if config.ngram_match_min:
+        return backend.AsyncGenerator(
+            resources.model,
+            resources.cache,
+            text_codec,
+            config.max_batch_size,
+            config.max_chunk_size,
+            8,
+            None,
+            None,
+            config.ngram_draft_size,
+            cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
+            recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
+            ngram_match_min=config.ngram_match_min,
+        )
+    return backend.AsyncGenerator(
+        resources.model,
+        resources.cache,
+        text_codec,
+        max_batch_size=config.max_batch_size,
+        max_chunk_size=config.max_chunk_size,
+        cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
+        recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
+    )
+
+
 class ExLlamaV3Runtime:
     capabilities = RuntimeCapabilities(
         cancellation=True,
@@ -1211,8 +1274,6 @@ class ExLlamaV3Runtime:
         if self._generator is not None:
             return self._generator
         resources = self._require_resources()
-        backend = resources.backend
-        text_codec = resources.tokenizer
         try:
             asyncio.get_running_loop()
         except RuntimeError as exc:
@@ -1229,46 +1290,9 @@ class ExLlamaV3Runtime:
                 "cpu_cache_size": config.sysmem_kv_cache_mb * 1024**2,
                 "recurrent_cache_size": config.sysmem_recurrent_cache_mb * 1024**2,
             }
-            # Supported ExLlamaV3 Generator contract keeps draft construction positional through
-            # the draft-token count: model, cache, tokenizer, batch/chunk limits, queue size,
-            # draft model, draft cache, draft-token count.
-            self._generator = backend.AsyncGenerator(
-                resources.model,
-                resources.cache,
-                text_codec,
-                config.max_batch_size,
-                config.max_chunk_size,
-                8,
-                resources.draft_model,
-                resources.draft_cache,
-                config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
-                **generator_options,
-            )
-        elif config.ngram_match_min:
-            self._generator = backend.AsyncGenerator(
-                resources.model,
-                resources.cache,
-                text_codec,
-                config.max_batch_size,
-                config.max_chunk_size,
-                8,
-                None,
-                None,
-                config.ngram_draft_size,
-                cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
-                recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
-                ngram_match_min=config.ngram_match_min,
-            )
+            self._generator = _create_async_generator(resources, generator_options)
         else:
-            self._generator = backend.AsyncGenerator(
-                resources.model,
-                resources.cache,
-                text_codec,
-                max_batch_size=config.max_batch_size,
-                max_chunk_size=config.max_chunk_size,
-                cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
-                recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
-            )
+            self._generator = _create_async_generator(resources)
         return self._generator
 
     def load(self, config: ExLlamaV3LoadConfig) -> None:
