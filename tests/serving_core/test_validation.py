@@ -101,6 +101,15 @@ class _Controlled:
             self.terminal_reason = reason
 
 
+class _CancelRaises(_Controlled):
+    async def cancel(
+        self,
+        reason: RequestTerminalReason = RequestTerminalReason.CLIENT_CANCELLED,
+    ) -> None:
+        await super().cancel(reason)
+        raise RuntimeError("cancel transport failed")
+
+
 class _Controller:
     def __init__(self, controlled: _Controlled) -> None:
         self.controlled = controlled
@@ -384,6 +393,36 @@ def test_atomic_constrained_parallel_buffers_unique_calls_until_terminal() -> No
     asyncio.run(scenario())
 
 
+def test_atomic_constrained_parallel_double_terminal_does_not_double_flush() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", call),
+            )
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(_Controlled([])),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        await session._process_runtime(_finished())
+        await session._process_runtime(_finished())
+        events = [event async for event in session]
+
+        assert sum(isinstance(event, ToolCallCompleted) for event in events) == 1
+        assert sum(isinstance(event, GenerationCompleted) for event in events) == 1
+        assert not session._tool_batch.has_buffered_events
+
+    asyncio.run(scenario())
+
+
 def test_atomic_constrained_parallel_rejects_canonical_duplicate_without_publication() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
@@ -532,6 +571,44 @@ def test_atomic_constrained_parallel_limit_uses_lower_global_fanout() -> None:
         )
         assert isinstance(events[-1], GenerationFailed)
         assert events[-1].error.code == "tool_policy_violation"
+        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+
+    asyncio.run(scenario())
+
+
+def test_atomic_constrained_parallel_cancel_failure_cannot_resurrect_aborted_batch() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
+        repeated = ToolCallItem("call-2", "lookup", '{ "id" : 1 }', 1)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+                ToolCallCompleted("req", first),
+                ToolCallStarted("req", "call-2", "lookup", 1),
+                ToolCallArgumentsDelta("req", "call-2", '{ "id" : 1 }', 1),
+                ToolCallCompleted("req", repeated),
+            )
+        )
+        controlled = _CancelRaises([])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            _tool_constraint_factory,
+        ).submit(_request(policy))
+
+        await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+        assert not session._tool_batch.has_buffered_events
         assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
 
     asyncio.run(scenario())

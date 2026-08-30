@@ -517,15 +517,17 @@ class ServingSession:
     async def _model_failure(self, code: str, message: str) -> None:
         if self._terminal:
             return
-        await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        error = _safe_error(ErrorCategory.MODEL_FAILURE, code, message)
         self._discard_atomic_tool_batch()
-        self._pending.append(
-            GenerationFailed(
-                self._request_id,
-                _safe_error(ErrorCategory.MODEL_FAILURE, code, message),
-            )
-        )
         self._terminal = True
+        try:
+            await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        except Exception:
+            logger.exception(
+                "runtime cancellation failed after local model failure request_id=%s",
+                self._request_id,
+            )
+        self._pending.append(GenerationFailed(self._request_id, error))
 
     async def _process_semantic(self, event: GenerationEvent) -> None:
         if self._terminal:
@@ -558,20 +560,22 @@ class ServingSession:
         self._pending.append(event)
 
     async def _fail_native_token_provenance(self) -> None:
-        await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
-        self._discard_atomic_tool_batch()
-        self._pending.append(
-            GenerationFailed(
-                self._request_id,
-                _safe_error(
-                    ErrorCategory.RUNTIME_FAILURE,
-                    "output_token_provenance_unavailable",
-                    "Inference output provenance was insufficient to classify a Qwen structural marker safely.",
-                    retryable=True,
-                ),
-            )
+        error = _safe_error(
+            ErrorCategory.RUNTIME_FAILURE,
+            "output_token_provenance_unavailable",
+            "Inference output provenance was insufficient to classify a Qwen structural marker safely.",
+            retryable=True,
         )
+        self._discard_atomic_tool_batch()
         self._terminal = True
+        try:
+            await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        except Exception:
+            logger.exception(
+                "runtime cancellation failed after local provenance failure request_id=%s",
+                self._request_id,
+            )
+        self._pending.append(GenerationFailed(self._request_id, error))
 
     async def _finish_parser_events(self) -> bool:
         if self._parser_finished:
