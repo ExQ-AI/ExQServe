@@ -763,8 +763,6 @@ def _find_parameter_close(text: str, value_start: int) -> int:
 def _qwen_string_parameters(tool_policy: ToolPolicy | None) -> dict[str, frozenset[str]]:
     if tool_policy is None:
         return {}
-    if not isinstance(tool_policy, ToolPolicy):
-        raise TypeError("tool_policy must be a ToolPolicy or None")
 
     result: dict[str, frozenset[str]] = {}
     for tool in tool_policy.tools:
@@ -1027,6 +1025,8 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             raise ValueError("request_id must not be empty")
         if not isinstance(start_in_reasoning, bool):
             raise TypeError("start_in_reasoning must be a bool")
+        if tool_policy is not None and not isinstance(tool_policy, ToolPolicy):
+            raise TypeError("tool_policy must be a ToolPolicy or None")
         self._string_parameters = _qwen_string_parameters(tool_policy)
         self._request_id = request_id
         self._buffer = ""

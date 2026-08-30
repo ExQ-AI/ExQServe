@@ -53,6 +53,11 @@ def _completed_calls(events: Iterable[GenerationEvent]) -> list[ToolCallComplete
     return [event for event in events if isinstance(event, ToolCallCompleted)]
 
 
+def test_parser_validates_tool_policy_at_public_boundary() -> None:
+    with pytest.raises(TypeError, match="tool_policy"):
+        QwenIncrementalParser("req-invalid", tool_policy="bad")  # type: ignore[arg-type]
+
+
 def test_preopened_reasoning_from_generation_prompt_is_separated() -> None:
     parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
     events = list(parser.feed("reason from preopened think</think>answer"))
