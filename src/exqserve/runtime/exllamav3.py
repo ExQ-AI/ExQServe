@@ -1221,6 +1221,142 @@ def _create_async_generator(
     )
 
 
+class _ExLlamaV3PromptRenderer:
+    def __init__(self, resources: _ExLlamaV3Resources) -> None:
+        self._resources = resources
+
+    def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
+        text_codec = self._resources.tokenizer
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        encoded = text_codec.encode(
+            text,
+            add_bos=True,
+            add_eos=False,
+            encode_special_tokens=True,
+        )
+        return RuntimeRenderedPrompt(text, _tensor_to_token_ids(encoded))
+
+    def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
+        text_codec = self._resources.tokenizer
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        encoded = text_codec.encode(
+            text,
+            add_bos=False,
+            add_eos=False,
+            encode_special_tokens=True,
+        )
+        return RuntimeRenderedPrompt(text, _tensor_to_token_ids(encoded))
+
+    def render_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None,
+        template_kwargs: dict[str, object],
+        *,
+        add_generation_prompt: bool,
+        protect_literal_tokens: bool,
+    ) -> RuntimeRenderedPrompt:
+        resources = self._resources
+        text_codec = resources.tokenizer
+        if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+            raise TypeError("messages must be a list of dictionaries")
+        if tools is not None and (
+            not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools)
+        ):
+            raise TypeError("tools must be a list of dictionaries or None")
+        if not isinstance(template_kwargs, dict):
+            raise TypeError("template_kwargs must be a dictionary")
+        if "tools" in template_kwargs:
+            raise ValueError("template_kwargs must not contain reserved key 'tools'")
+        if not isinstance(add_generation_prompt, bool):
+            raise TypeError("add_generation_prompt must be a bool")
+        if not isinstance(protect_literal_tokens, bool):
+            raise TypeError("protect_literal_tokens must be a bool")
+
+        sentinels: dict[str, str] = {}
+        render_messages = messages
+        render_tools = tools
+        if protect_literal_tokens:
+            marker_texts = discover_marker_texts(text_codec)
+            sentinels = marker_sentinels(messages, tools, marker_texts)
+            render_messages = protect_messages(messages, sentinels)
+            render_tools = protect_tools(tools, sentinels)
+
+        kwargs = dict(template_kwargs)
+        config = resources.config
+        if config.chat_template is not None:
+            kwargs["chat_template"] = config.chat_template
+        if render_tools is not None:
+            kwargs["tools"] = render_tools
+        rendered_text = text_codec.hf_render_chat_template(
+            render_messages,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+        if not isinstance(rendered_text, str):
+            raise TypeError("backend chat template must render text")
+        visible_text = restore_text(rendered_text, sentinels) if sentinels else rendered_text
+
+        sources = _image_sources(messages)
+        attachments: tuple[object, ...] = ()
+        if sources:
+            vision_model = resources.vision_model
+            if not config.vision_enabled or vision_model is None:
+                raise ValueError("vision input requires a vision-enabled runtime")
+            vision_cache = resources.vision_cache
+            embeddings: list[object] = []
+            for source in sources:
+                data = _load_image_bytes(
+                    source,
+                    allow_remote=config.allow_remote_images,
+                    max_bytes=config.max_image_bytes,
+                )
+                cache_key = hashlib.sha256(data).hexdigest()
+                embedding = None if vision_cache is None else vision_cache.get(cache_key)
+                if embedding is None:
+                    image = _decode_image_bytes(data)
+                    embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
+                    if vision_cache is not None:
+                        vision_cache.put(cache_key, embedding)
+                embeddings.append(embedding)
+            encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
+            if sentinels:
+                _, input_ids = encode_protected_prompt(
+                    text_codec,
+                    encoded_text,
+                    sentinels,
+                    embeddings,
+                )
+            else:
+                encoded = text_codec.encode(
+                    encoded_text,
+                    add_bos=False,
+                    add_eos=False,
+                    encode_special_tokens=True,
+                    embeddings=embeddings,
+                )
+                input_ids = _tensor_to_token_ids(encoded)
+            attachments = tuple(_VisionAttachment(embedding) for embedding in embeddings)
+        elif sentinels:
+            _, input_ids = encode_protected_prompt(
+                text_codec,
+                rendered_text,
+                sentinels,
+                None,
+            )
+        else:
+            encoded = text_codec.encode(
+                rendered_text,
+                add_bos=False,
+                add_eos=False,
+                encode_special_tokens=True,
+            )
+            input_ids = _tensor_to_token_ids(encoded)
+        return RuntimeRenderedPrompt(visible_text, input_ids, attachments)
+
+
 class ExLlamaV3Runtime:
     capabilities = RuntimeCapabilities(
         cancellation=True,
@@ -1495,29 +1631,11 @@ class ExLlamaV3Runtime:
 
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         """Tokenize a raw document-continuation prompt without applying a chat template."""
-        _, text_codec = self._require_loaded()
-        if not isinstance(text, str):
-            raise TypeError("text must be a string")
-        encoded = text_codec.encode(
-            text,
-            add_bos=True,
-            add_eos=False,
-            encode_special_tokens=True,
-        )
-        return RuntimeRenderedPrompt(text, _tensor_to_token_ids(encoded))
+        return _ExLlamaV3PromptRenderer(self._require_resources()).tokenize_text(text)
 
     def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
         """Tokenize a complete model-native prompt without adding another BOS token."""
-        _, text_codec = self._require_loaded()
-        if not isinstance(text, str):
-            raise TypeError("text must be a string")
-        encoded = text_codec.encode(
-            text,
-            add_bos=False,
-            add_eos=False,
-            encode_special_tokens=True,
-        )
-        return RuntimeRenderedPrompt(text, _tensor_to_token_ids(encoded))
+        return _ExLlamaV3PromptRenderer(self._require_resources()).tokenize_encoded_prompt(text)
 
     def render_chat_template(
         self,
@@ -1528,103 +1646,13 @@ class ExLlamaV3Runtime:
         add_generation_prompt: bool = True,
         protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
-        resources = self._require_resources()
-        text_codec = resources.tokenizer
-        if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
-            raise TypeError("messages must be a list of dictionaries")
-        if tools is not None and (
-            not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools)
-        ):
-            raise TypeError("tools must be a list of dictionaries or None")
-        if not isinstance(template_kwargs, dict):
-            raise TypeError("template_kwargs must be a dictionary")
-        if "tools" in template_kwargs:
-            raise ValueError("template_kwargs must not contain reserved key 'tools'")
-        if not isinstance(add_generation_prompt, bool):
-            raise TypeError("add_generation_prompt must be a bool")
-        if not isinstance(protect_literal_tokens, bool):
-            raise TypeError("protect_literal_tokens must be a bool")
-
-        sentinels: dict[str, str] = {}
-        render_messages = messages
-        render_tools = tools
-        if protect_literal_tokens:
-            marker_texts = discover_marker_texts(text_codec)
-            sentinels = marker_sentinels(messages, tools, marker_texts)
-            render_messages = protect_messages(messages, sentinels)
-            render_tools = protect_tools(tools, sentinels)
-
-        kwargs = dict(template_kwargs)
-        config = resources.config
-        if config.chat_template is not None:
-            kwargs["chat_template"] = config.chat_template
-        if render_tools is not None:
-            kwargs["tools"] = render_tools
-        rendered_text = text_codec.hf_render_chat_template(
-            render_messages,
+        return _ExLlamaV3PromptRenderer(self._require_resources()).render_chat_template(
+            messages,
+            tools,
+            template_kwargs,
             add_generation_prompt=add_generation_prompt,
-            **kwargs,
+            protect_literal_tokens=protect_literal_tokens,
         )
-        if not isinstance(rendered_text, str):
-            raise TypeError("backend chat template must render text")
-        visible_text = restore_text(rendered_text, sentinels) if sentinels else rendered_text
-
-        sources = _image_sources(messages)
-        attachments: tuple[object, ...] = ()
-        if sources:
-            vision_model = resources.vision_model
-            if not config.vision_enabled or vision_model is None:
-                raise ValueError("vision input requires a vision-enabled runtime")
-            vision_cache = resources.vision_cache
-            embeddings: list[object] = []
-            for source in sources:
-                data = _load_image_bytes(
-                    source,
-                    allow_remote=config.allow_remote_images,
-                    max_bytes=config.max_image_bytes,
-                )
-                cache_key = hashlib.sha256(data).hexdigest()
-                embedding = None if vision_cache is None else vision_cache.get(cache_key)
-                if embedding is None:
-                    image = _decode_image_bytes(data)
-                    embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
-                    if vision_cache is not None:
-                        vision_cache.put(cache_key, embedding)
-                embeddings.append(embedding)
-            encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
-            if sentinels:
-                _, input_ids = encode_protected_prompt(
-                    text_codec,
-                    encoded_text,
-                    sentinels,
-                    embeddings,
-                )
-            else:
-                encoded = text_codec.encode(
-                    encoded_text,
-                    add_bos=False,
-                    add_eos=False,
-                    encode_special_tokens=True,
-                    embeddings=embeddings,
-                )
-                input_ids = _tensor_to_token_ids(encoded)
-            attachments = tuple(_VisionAttachment(embedding) for embedding in embeddings)
-        elif sentinels:
-            _, input_ids = encode_protected_prompt(
-                text_codec,
-                rendered_text,
-                sentinels,
-                None,
-            )
-        else:
-            encoded = text_codec.encode(
-                rendered_text,
-                add_bos=False,
-                add_eos=False,
-                encode_special_tokens=True,
-            )
-            input_ids = _tensor_to_token_ids(encoded)
-        return RuntimeRenderedPrompt(visible_text, input_ids, attachments)
 
     def submit(self, request: RuntimeGenerationRequest) -> RuntimeSession:
         resources = self._require_resources()
