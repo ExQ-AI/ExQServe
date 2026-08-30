@@ -4,12 +4,19 @@
 
 ExQServe 是面向 ExLlamaV3 / EXL3 的推理服务，兼容 OpenAI 和 Anthropic API，重点面向 Agent 场景。
 
+ExQServe 是服务/API 层，ExLlamaV3 提供底层推理后端。
+
+## 为什么选择 ExQServe？
+
+ExQServe 重点处理 Agent 场景的服务语义，而不是把不同模型都当成同一种 chat template。它在兼容 OpenAI 和 Anthropic 的 API 后保留各模型原生的思考与工具调用协议，并通过基于 LLGuidance 的 Constrained Decoding 在生成阶段约束工具调用格式和参数 Schema。
+
 ## 主要功能
 
 - 同时兼容 OpenAI 和 Anthropic API，包括 Chat Completions、Responses、Messages、Completions、Models 和 token 计数
-- 面向 Agent 场景支持思考内容与最终回答分离、工具调用、并行工具调用、结构化输出、流式响应、请求取消和连续调用
-- 已适配 Qwen3.5 架构系列、Gemma 4、Muse Glimmer 等模型系列；其他兼容 Hugging Face 模型可走通用兼容路径
-- 支持长上下文、量化 KV Cache、MTP、外部 draft model、CUDA 设备选择和 ExLlamaV3 Tensor Parallel
+- 面向 Agent 场景支持思考内容与最终回答分离、工具调用、并行工具调用、OpenAI `strict:true` Function Tools、基于 LLGuidance 的 Constrained Decoding、Structured Outputs、流式响应、请求取消和连续调用
+- 已针对 Qwen3.5 架构系列、Gemma 4、Muse Glimmer、DeepSeek V4 和 GLM-5 实现模型原生 Agent 适配；其他兼容 Hugging Face 模型可走保守的通用兼容路径
+- 提供可插拔的 Model Dialect API，用于扩展模型原生的思考与工具调用协议
+- 支持长上下文、量化 KV Cache、系统内存 KV/Recurrent Cache、MTP、n-gram drafting、外部 draft model、MoE CPU offload、CUDA 设备选择和 ExLlamaV3 Tensor Parallel
 - 支持模型切换、PEFT LoRA、YAML 配置、Prometheus Metrics 和可选 API Key
 
 ## 模型支持
@@ -29,8 +36,8 @@ ExQServe 是面向 ExLlamaV3 / EXL3 的推理服务，兼容 OpenAI 和 Anthropi
 
 ExQServe 仍在持续开发中，目前主要关注：
 
-- [ ] Dialect 插件系统，降低模型原生 Agent 协议的扩展与维护成本
-- [ ] 基于 LLGuidance 的 Constrained Decoding，用于 Tool Calling 与 Structured Outputs
+- [x] Dialect 插件系统，降低模型原生 Agent 协议的扩展与维护成本
+- [x] 基于 LLGuidance 的 Constrained Decoding，用于 Tool Calling 与 Structured Outputs
 - [ ] 更多模型系列适配
 
 ## 安装
@@ -160,6 +167,10 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 |---|---|
 | `--served-model-id` | API 对外显示的模型名称 |
 | `--model-root` | 可切换模型所在目录 |
+| `--model-dialect` | 选择内置或已安装的 Model Dialect；`auto` 会自动发现兼容 Dialect |
+| `--tool-constraint-mode` | 生成阶段工具约束：`off`、`format` 或 `schema` |
+| `--max-tool-calls-per-generation` | 限制一次 assistant 生成中对外可见的工具调用数量 |
+| `--max-constrained-parallel-tool-calls` | 限制一次原子化受约束并行工具调用批次的大小 |
 | `--chat-template` | 使用 UTF-8 Jinja 文件覆盖模型自带的 HF chat template |
 | `--vision` | 加载模型的视觉组件并接受图片输入；模型或后端不支持时会直接报错 |
 | `--allow-remote-images` | 允许 HTTP(S) 图片地址；data URL 只需要开启 `--vision` |
@@ -167,6 +178,8 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--max-injection-body-bytes` | 生成中注入接口的 JSON body 上限，默认 64 KiB |
 | `--cache-tokens` | KV Cache 容量 |
 | `--kv-cache-bits` | KV Cache 精度 |
+| `--sysmem-kv-cache-mb` | ExLlamaV3 二级 K/V page cache 使用的 pinned 系统内存预算 |
+| `--sysmem-recurrent-cache-mb` | ExLlamaV3 recurrent-state checkpoint 的系统内存预算 |
 | `--max-batch-size` | 最大 batch size |
 | `--max-chunk-size` | Prefill chunk size |
 | `--mtp` | 开启 MTP 投机解码 |
@@ -174,7 +187,11 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--mtp-cache-bits` | MTP draft cache 精度 |
 | `--dynamic-draft` | 开启 ExLlamaV3 动态 draft 长度 |
 | `--draft-confidence` | Dynamic Draft 的目标接受概率 |
+| `--ngram-match-min` | 开启 ExLlamaV3 n-gram drafting 并设置最小历史匹配长度；`0` 表示关闭 |
+| `--ngram-draft-tokens` | n-gram drafting 每次最多提出的 speculative token 数 |
 | `--draft-model` | 外部 draft model |
+| `--moe-cpu-offload-layers` | 将前 N 个符合条件的 block-sparse MoE 层交给 CPU 执行 |
+| `--moe-cpu-threads` | ExLlamaV3 MoE CPU offload 的工作线程数 |
 | `--device-ids` | 当前进程可见的 CUDA 设备，例如 `0,1` |
 | `--tensor-parallel` | 开启 ExLlamaV3 Tensor Parallel |
 | `--lora` | 加载 PEFT LoRA |

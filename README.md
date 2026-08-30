@@ -4,12 +4,19 @@
 
 Agent-focused OpenAI- and Anthropic-compatible serving for ExLlamaV3 / EXL3.
 
+ExQServe is the serving/API layer; ExLlamaV3 provides the inference backend.
+
+## Why ExQServe?
+
+ExQServe focuses on Agent-facing serving semantics rather than treating every model family as the same chat template. It preserves model-native reasoning and Tool Calling protocols behind OpenAI- and Anthropic-compatible APIs. LLGuidance-backed constrained decoding can enforce tool-call formats and schemas during generation.
+
 ## Features
 
 - OpenAI and Anthropic compatible APIs, including Chat Completions, Responses, Messages, Completions, Models, and token counting
-- Agent workflows with reasoning, tool calling, parallel tool calls, structured output, streaming, cancellation, and continuation
-- Agent adaptations for the Qwen3.5 architecture family, Gemma 4, and Muse Glimmer, plus a conservative Generic HF fallback
-- Long-context and runtime controls including quantized KV cache, MTP, external draft models, CUDA device selection, and ExLlamaV3 tensor parallelism
+- Agent workflows with reasoning, tool calling, parallel tool calls, OpenAI `strict:true` function tools, LLGuidance-backed constrained decoding, Structured Outputs, streaming, cancellation, and continuation
+- Model-native Agent adaptations for the Qwen3.5 architecture family, Gemma 4, Muse Glimmer, DeepSeek V4, and GLM-5, plus a conservative Generic HF fallback
+- Pluggable model-dialect API for extending model-native reasoning and Tool Calling protocols
+- Long-context and runtime controls including quantized KV cache, system-memory KV/recurrent caches, MTP, n-gram drafting, external draft models, MoE CPU offload, CUDA device selection, and ExLlamaV3 tensor parallelism
 - Model switching, PEFT LoRA, YAML configuration, Prometheus metrics, and optional API-key authentication
 
 ## Model support
@@ -29,8 +36,8 @@ Adapted families preserve their model-native reasoning and tool protocols. Visio
 
 ExQServe is under active development. Current priorities include:
 
-- [ ] Pluggable model dialects for easier model-native Agent protocol extensions
-- [ ] LLGuidance-backed constrained decoding for Tool Calling and Structured Outputs
+- [x] Pluggable model dialects for easier model-native Agent protocol extensions
+- [x] LLGuidance-backed constrained decoding for Tool Calling and Structured Outputs
 - [ ] Broader model-family adaptations
 
 ## Installation
@@ -160,6 +167,10 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 |---|---|
 | `--served-model-id` | Model name exposed by the API |
 | `--model-root` | Directory containing switchable models |
+| `--model-dialect` | Select a built-in or installed model Agent dialect; `auto` discovers compatible dialects |
+| `--tool-constraint-mode` | Generation-time tool constraints: `off`, `format`, or `schema` |
+| `--max-tool-calls-per-generation` | Limit protocol-visible tool calls in one assistant generation |
+| `--max-constrained-parallel-tool-calls` | Limit one atomic constrained-parallel tool batch |
 | `--chat-template` | Override the model's HF chat template with a UTF-8 Jinja file |
 | `--vision` | Load the model's vision component and accept image input; fails clearly if the selected model/backend cannot provide it |
 | `--allow-remote-images` | Allow HTTP(S) image URLs; data-image URLs only require `--vision` |
@@ -167,6 +178,8 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--max-injection-body-bytes` | Maximum JSON body size for output injection (default 64 KiB) |
 | `--cache-tokens` | KV-cache capacity |
 | `--kv-cache-bits` | KV-cache precision |
+| `--sysmem-kv-cache-mb` | Pinned system-memory budget for ExLlamaV3's second-tier K/V page cache |
+| `--sysmem-recurrent-cache-mb` | System-memory budget for ExLlamaV3 recurrent-state checkpoints |
 | `--max-batch-size` | Maximum batch size |
 | `--max-chunk-size` | Prefill chunk size |
 | `--mtp` | Enable MTP speculative decoding |
@@ -174,7 +187,11 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--mtp-cache-bits` | MTP draft-cache precision |
 | `--dynamic-draft` | Enable ExLlamaV3 confidence-calibrated dynamic draft sizing |
 | `--draft-confidence` | Target acceptance probability for dynamic draft sizing |
+| `--ngram-match-min` | Enable ExLlamaV3 n-gram drafting with the specified minimum history-match length; `0` disables it |
+| `--ngram-draft-tokens` | Maximum speculative tokens proposed by n-gram drafting |
 | `--draft-model` | External draft model |
+| `--moe-cpu-offload-layers` | Run the first N eligible block-sparse MoE layers on CPU |
+| `--moe-cpu-threads` | Worker-thread count for ExLlamaV3 MoE CPU offload |
 | `--device-ids` | Process-visible CUDA device allowlist, e.g. `0,1` |
 | `--tensor-parallel` | Enable ExLlamaV3 tensor parallelism |
 | `--lora` | Load a PEFT LoRA adapter |
