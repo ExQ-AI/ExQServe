@@ -947,6 +947,32 @@ def test_incomplete_tool_syntax_is_model_failure() -> None:
     asyncio.run(scenario())
 
 
+def test_length_limited_incomplete_tool_reports_output_limit_cause() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        parser = _ScriptedParser((), _Finish((), incomplete_tool_call=True))
+        length_finished = RuntimeFinished(
+            "req",
+            RuntimeStopReason.LENGTH,
+            TokenUsage(input_tokens=2, output_tokens=5),
+            RuntimeTiming(),
+        )
+        controlled = _Controlled([length_finished])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_incomplete"
+        assert "output token limit" in events[-1].error.message
+
+    asyncio.run(scenario())
+
+
 def test_incomplete_tool_attempt_takes_precedence_over_structured_output_validation() -> None:
     async def scenario() -> None:
         structured = StructuredOutputSpec(JsonSchema('{"type":"object","required":["ok"]}'))

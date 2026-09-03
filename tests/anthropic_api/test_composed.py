@@ -42,7 +42,7 @@ class _Session:
                 text = "<think>local reason</think>answer"
             else:
                 text = "hello"
-            return RuntimeTextDelta(self._request.request_id, text)
+            return RuntimeTextDelta(self._request.request_id, text, (2,))
         if self._index == 2:
             self._index += 1
             return RuntimeFinished(
@@ -71,6 +71,9 @@ class _Runtime:
 
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         return RuntimeRenderedPrompt(text, (1,))
+
+    def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
+        return RuntimeRenderedPrompt(text, (99,) if text == "</think>" else (1,))
 
     def render_chat_template(
         self,

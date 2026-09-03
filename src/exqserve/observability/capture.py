@@ -310,7 +310,11 @@ def _encode_item(item: CanonicalItem | RawPromptItem) -> dict[str, object]:
             "token_ids": list(item.token_ids) if item.token_ids is not None else None,
         }
     if isinstance(item, ReasoningItem):
-        return {"type": "reasoning", "text": item.text}
+        return {
+            "type": "reasoning",
+            "text": item.text,
+            "starts_new_assistant_segment": item.starts_new_assistant_segment,
+        }
     if isinstance(item, ToolCallItem):
         return {
             "type": "tool_call",
@@ -360,7 +364,10 @@ def _decode_item(value: object) -> CanonicalItem | RawPromptItem:
             raise TypeError("captured raw token prompt is malformed")
         return RawPromptItem(token_ids=tuple(token_ids))
     if kind == "reasoning":
-        return ReasoningItem(cast(str, value.get("text")))
+        return ReasoningItem(
+            cast(str, value.get("text")),
+            cast(bool, value.get("starts_new_assistant_segment", False)),
+        )
     if kind == "tool_call":
         return ToolCallItem(
             cast(str, value.get("call_id")),

@@ -11,6 +11,14 @@ from exqserve.server import cli
 from exqserve.server.app import RuntimeUnavailableError
 
 
+def test_cli_defaults_to_auto_output_tokens_and_accepts_explicit_auto(tmp_path: Path) -> None:
+    defaulted = cli.parse_config([str(tmp_path)])
+    explicit = cli.parse_config([str(tmp_path), "--default-output-tokens", "auto"])
+
+    assert defaulted.default_api_output_tokens is None
+    assert explicit.default_api_output_tokens is None
+
+
 def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
     capture = tmp_path / "captures.jsonl"
     config = cli.parse_config(
@@ -680,3 +688,48 @@ def test_yaml_tool_call_fanout_limit_is_supported_and_cli_overrides_it(tmp_path:
 
     assert yaml_config.tool_call_fanout_limit == 11
     assert cli_config.tool_call_fanout_limit == 5
+
+
+def test_cli_and_yaml_reasoning_budget_defaults_and_precedence(tmp_path: Path) -> None:
+    config_path = tmp_path / "reasoning-budget.yaml"
+    config_path.write_text(
+        f"model-directory: {tmp_path}\nreasoning-budget-tokens: 256\nreasoning-budget-message: yaml close \n",
+        encoding="utf-8",
+    )
+
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    assert yaml_config.reasoning_budget_tokens == 256
+    assert yaml_config.reasoning_budget_message == "yaml close"
+
+    cli_config = cli.parse_config(
+        [
+            "--config",
+            str(config_path),
+            "--reasoning-budget",
+            "64",
+            "--reasoning-budget-message",
+            "cli close ",
+        ]
+    )
+    assert cli_config.reasoning_budget_tokens == 64
+    assert cli_config.reasoning_budget_message == "cli close "
+
+    disabled = cli.parse_config([str(tmp_path), "--reasoning-budget", "-1"])
+    assert disabled.reasoning_budget_tokens is None
+
+
+def test_cli_and_yaml_anthropic_compatibility_profile(tmp_path: Path) -> None:
+    default_config = cli.parse_config([str(tmp_path)])
+    explicit_config = cli.parse_config(
+        [str(tmp_path), "--anthropic-compatibility-profile", "claude-code-2.1.251"]
+    )
+    assert default_config.anthropic_compatibility_profile is None
+    assert explicit_config.anthropic_compatibility_profile == "claude-code-2.1.251"
+
+    config_path = tmp_path / "anthropic-compat.yaml"
+    config_path.write_text(
+        f"model-directory: {tmp_path}\nanthropic-compatibility-profile: claude-code-2.1.251\n",
+        encoding="utf-8",
+    )
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    assert yaml_config.anthropic_compatibility_profile == "claude-code-2.1.251"

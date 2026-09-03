@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode
+from exqserve.agent.reasoning import ReasoningBudgetMode, ReasoningEffort, ReasoningMode
 from exqserve.agent.tools import ToolChoiceMode
 from exqserve.core.items import (
     ImageContentPart,
@@ -134,6 +134,12 @@ def test_chat_max_tokens_alias_and_default_output_limit() -> None:
     )
     assert defaulted.serving.max_output_tokens == 12
 
+    automatic = ChatRequestAdapter().parse(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        request_id="r3",
+    )
+    assert automatic.serving.max_output_tokens is None
+
 
 def test_chat_reasoning_compatibility_values_map_explicitly() -> None:
     base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
@@ -263,3 +269,58 @@ def test_chat_rejects_invalid_strict_function_schema() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.code == "invalid_json_schema"
+
+
+def test_chat_reasoning_budget_extensions_normalize_to_protocol_neutral_override() -> None:
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+    explicit = ChatRequestAdapter().parse(
+        {**base, "reasoning_budget_tokens": 17, "reasoning_budget_message": "answer now "},
+        request_id="rb-explicit",
+    )
+    assert explicit.serving.reasoning_budget.mode is ReasoningBudgetMode.EXPLICIT
+    assert explicit.serving.reasoning_budget.max_tokens == 17
+    assert explicit.serving.reasoning_budget.message == "answer now "
+
+    alias = ChatRequestAdapter().parse(
+        {**base, "thinking_token_budget": 23}, request_id="rb-alias"
+    )
+    assert alias.serving.reasoning_budget.mode is ReasoningBudgetMode.EXPLICIT
+    assert alias.serving.reasoning_budget.max_tokens == 23
+
+    equal_aliases = ChatRequestAdapter().parse(
+        {**base, "reasoning_budget_tokens": 9, "thinking_token_budget": 9},
+        request_id="rb-equal",
+    )
+    assert equal_aliases.serving.reasoning_budget.max_tokens == 9
+
+    disabled = ChatRequestAdapter().parse(
+        {**base, "reasoning_budget_tokens": -1}, request_id="rb-disabled"
+    )
+    assert disabled.serving.reasoning_budget.mode is ReasoningBudgetMode.DISABLE
+
+
+@pytest.mark.parametrize(
+    ("patch", "code"),
+    [
+        ({"reasoning_budget_tokens": 4, "thinking_token_budget": 5}, "conflicting_reasoning_budget"),
+        ({"reasoning_budget_tokens": True}, "invalid_reasoning_budget"),
+        ({"reasoning_budget_tokens": -2}, "invalid_reasoning_budget"),
+        ({"reasoning_budget_message": "answer"}, "reasoning_budget_message_requires_budget"),
+        (
+            {"reasoning_budget_tokens": -1, "reasoning_budget_message": "answer"},
+            "reasoning_budget_message_with_disabled_budget",
+        ),
+    ],
+)
+def test_chat_invalid_reasoning_budget_extensions_fail_explicitly(
+    patch: dict[str, object], code: str
+) -> None:
+    body: dict[str, object] = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8,
+    }
+    body.update(patch)
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        ChatRequestAdapter().parse(body, request_id="rb-invalid")
+    assert exc_info.value.code == code

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from exqserve.agent.reasoning import ReasoningBudgetDefault
 from exqserve.control.request import RequestControlConfig
 from exqserve.core.sampling import SamplingOverridePolicy
 from exqserve.model.contracts import ToolConstraintMode
@@ -29,7 +30,7 @@ class ServerConfig:
     max_output_tokens: int | None = None
     max_total_tokens: int | None = None
     timeout_seconds: float | None = None
-    default_api_output_tokens: int = 4096
+    default_api_output_tokens: int | None = None
     response_store_max_records: int = 1024
     capture_mode: CaptureMode = CaptureMode.OFF
     capture_path: Path | None = None
@@ -46,7 +47,7 @@ class ServerConfig:
     max_image_bytes: int = 20 * 1024 * 1024
     api_keys: tuple[str, ...] = field(default_factory=tuple, repr=False)
     protect_metrics: bool = True
-    max_request_body_bytes: int = 16 * 1024 * 1024
+    max_request_body_bytes: int = 32 * 1024 * 1024
     response_store_ttl_seconds: float = 3600.0
     response_store_max_bytes: int = 64 * 1024 * 1024
     model_root: Path | None = None
@@ -75,6 +76,9 @@ class ServerConfig:
     moe_cpu_threads: int | None = None
     tool_call_fanout_limit: int = 32
     constrained_parallel_tool_call_limit: int = 8
+    reasoning_budget_tokens: int | None = None
+    reasoning_budget_message: str = ""
+    anthropic_compatibility_profile: str | None = None
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -114,6 +118,10 @@ class ServerConfig:
             raise TypeError("host must be a string")
         if not self.host.strip():
             raise ValueError("host must not be empty")
+        if self.anthropic_compatibility_profile not in {None, "claude-code-2.1.251"}:
+            raise ValueError(
+                "anthropic_compatibility_profile must be claude-code-2.1.251 or None"
+            )
         if not isinstance(self.model_dialect, str):
             raise TypeError("model_dialect must be a string")
         normalized_dialect = self.model_dialect.strip()
@@ -122,16 +130,28 @@ class ServerConfig:
         object.__setattr__(self, "model_dialect", normalized_dialect)
         if not isinstance(self.tool_constraint_mode, ToolConstraintMode):
             raise TypeError("tool_constraint_mode must be a ToolConstraintMode")
+        if self.reasoning_budget_tokens is not None:
+            if not isinstance(self.reasoning_budget_tokens, int) or isinstance(
+                self.reasoning_budget_tokens, bool
+            ):
+                raise TypeError("reasoning_budget_tokens must be an integer or None")
+            if self.reasoning_budget_tokens < -1:
+                raise ValueError("reasoning_budget_tokens must be -1 or non-negative")
+            if self.reasoning_budget_tokens == -1:
+                object.__setattr__(self, "reasoning_budget_tokens", None)
+        if not isinstance(self.reasoning_budget_message, str):
+            raise TypeError("reasoning_budget_message must be a string")
         if not isinstance(self.port, int) or isinstance(self.port, bool):
             raise TypeError("port must be an integer")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be in the range 1..65535")
-        if not isinstance(self.default_api_output_tokens, int) or isinstance(
-            self.default_api_output_tokens, bool
-        ):
-            raise TypeError("default_api_output_tokens must be an integer")
-        if self.default_api_output_tokens <= 0:
-            raise ValueError("default_api_output_tokens must be positive")
+        if self.default_api_output_tokens is not None:
+            if not isinstance(self.default_api_output_tokens, int) or isinstance(
+                self.default_api_output_tokens, bool
+            ):
+                raise TypeError("default_api_output_tokens must be an integer or None")
+            if self.default_api_output_tokens <= 0:
+                raise ValueError("default_api_output_tokens must be positive or None")
         if not isinstance(self.response_store_max_records, int) or isinstance(
             self.response_store_max_records, bool
         ):
@@ -279,6 +299,9 @@ class ServerConfig:
                 for index, path in enumerate(self.loras)
             ),
         )
+
+    def reasoning_budget_default(self) -> ReasoningBudgetDefault:
+        return ReasoningBudgetDefault(self.reasoning_budget_tokens, self.reasoning_budget_message)
 
     def response_store_options(self) -> ResponseStoreOptions:
         return ResponseStoreOptions(

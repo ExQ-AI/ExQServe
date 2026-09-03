@@ -41,6 +41,28 @@ def test_timeout_must_be_positive_and_finite() -> None:
         RequestControlConfig(1, timeout_seconds=float("inf"))
 
 
+def test_auto_output_limit_uses_remaining_context_and_operator_cap() -> None:
+    context_limited = RequestControlConfig(max_in_flight=1, max_total_tokens=100)
+    capped = RequestControlConfig(max_in_flight=1, max_output_tokens=20, max_total_tokens=100)
+
+    assert context_limited.resolve_output_limit(prompt_tokens=30, requested=None) == 69
+    assert capped.resolve_output_limit(prompt_tokens=30, requested=None) == 20
+    assert capped.resolve_output_limit(prompt_tokens=30, requested=7) == 7
+
+
+def test_auto_output_limit_rejects_exhausted_or_unbounded_context() -> None:
+    with pytest.raises(RequestRejected, match="no room"):
+        RequestControlConfig(max_in_flight=1, max_total_tokens=10).resolve_output_limit(
+            prompt_tokens=9,
+            requested=None,
+        )
+    with pytest.raises(ValueError, match="requires max_total_tokens or max_output_tokens"):
+        RequestControlConfig(max_in_flight=1).resolve_output_limit(
+            prompt_tokens=1,
+            requested=None,
+        )
+
+
 def test_terminal_reason_is_closed_protocol_neutral_vocabulary() -> None:
     assert {reason.value for reason in RequestTerminalReason} == {
         "completed",

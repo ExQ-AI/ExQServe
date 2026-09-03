@@ -333,7 +333,7 @@ def create_openai_router(
     responses_adapter: ResponsesRequestAdapter | None = None,
     response_store: ResponseStore | None = None,
     served_model: ServedModelSource | None = None,
-    max_request_body_bytes: int = 16 * 1024 * 1024,
+    max_request_body_bytes: int = 32 * 1024 * 1024,
     response_lifecycle_store: InMemoryResponseLifecycleStore | None = None,
     completion_engine: RawServingEngineLike | None = None,
     completions_adapter: CompletionsRequestAdapter | None = None,

@@ -208,6 +208,26 @@ def test_whitespace_only_assistant_fragment_does_not_block_retry_reasoning() -> 
     assert assistant.reasoning_content == "first reasoningretry reasoning"
 
 
+def test_responses_retry_boundary_preserves_two_assistant_segments() -> None:
+    compiler = QwenPromptCompiler(_FakeTemplateAdapter())
+    prepared = compiler.prepare(
+        _request(
+            MessageItem(MessageRole.USER, "inspect"),
+            ReasoningItem("first reasoning"),
+            MessageItem(MessageRole.ASSISTANT, "partial answer"),
+            ReasoningItem("retry reasoning", starts_new_assistant_segment=True),
+            MessageItem(MessageRole.ASSISTANT, "final answer"),
+        ),
+        ReasoningPolicy(),
+        _policy(),
+    )
+
+    assert prepared.messages[1].reasoning_content == "first reasoning"
+    assert prepared.messages[1].content == "partial answer"
+    assert prepared.messages[2].reasoning_content == "retry reasoning"
+    assert prepared.messages[2].content == "final answer"
+
+
 def test_unknown_tool_result_and_ambiguous_assistant_order_are_rejected() -> None:
     compiler = QwenPromptCompiler(_FakeTemplateAdapter())
 

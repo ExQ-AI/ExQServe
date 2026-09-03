@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
-from exqserve.agent.reasoning import ReasoningPolicy
+from exqserve.agent.reasoning import ReasoningBudgetOverride, ReasoningPolicy
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import ToolPolicy
 from exqserve.core.errors import CanonicalError
@@ -34,11 +34,12 @@ class ServingRequest:
     input: CanonicalRequest
     reasoning: ReasoningPolicy
     tools: ToolPolicy
-    max_output_tokens: int
+    max_output_tokens: int | None
     structured_output: StructuredOutputSpec | None = None
     seed: int | None = None
     sampling: RuntimeSamplingConfig | None = None
     stop_conditions: tuple[str | int, ...] = ()
+    reasoning_budget: ReasoningBudgetOverride = field(default_factory=ReasoningBudgetOverride)
 
     def __post_init__(self) -> None:
         if not isinstance(self.input, CanonicalRequest):
@@ -47,10 +48,13 @@ class ServingRequest:
             raise TypeError("reasoning must be a ReasoningPolicy")
         if not isinstance(self.tools, ToolPolicy):
             raise TypeError("tools must be a ToolPolicy")
-        if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
-            raise TypeError("max_output_tokens must be an integer")
-        if self.max_output_tokens <= 0:
-            raise ValueError("max_output_tokens must be positive")
+        if self.max_output_tokens is not None:
+            if not isinstance(self.max_output_tokens, int) or isinstance(
+                self.max_output_tokens, bool
+            ):
+                raise TypeError("max_output_tokens must be an integer or None")
+            if self.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be positive or None")
         if self.structured_output is not None and not isinstance(
             self.structured_output, StructuredOutputSpec
         ):
@@ -59,6 +63,8 @@ class ServingRequest:
             raise TypeError("seed must be an integer or None")
         if self.sampling is not None and not isinstance(self.sampling, RuntimeSamplingConfig):
             raise TypeError("sampling must be RuntimeSamplingConfig or None")
+        if not isinstance(self.reasoning_budget, ReasoningBudgetOverride):
+            raise TypeError("reasoning_budget must be a ReasoningBudgetOverride")
         if not isinstance(self.stop_conditions, tuple):
             raise TypeError("stop_conditions must be a tuple")
         for condition in self.stop_conditions:
@@ -75,7 +81,7 @@ class ServingRequest:
 @dataclass(frozen=True, slots=True)
 class RawServingRequest:
     input: RawPromptRequest
-    max_output_tokens: int
+    max_output_tokens: int | None
     stop_conditions: tuple[str | int, ...] = ()
     seed: int | None = None
     sampling: RuntimeSamplingConfig | None = None
@@ -83,10 +89,13 @@ class RawServingRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.input, RawPromptRequest):
             raise TypeError("input must be a RawPromptRequest")
-        if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
-            raise TypeError("max_output_tokens must be an integer")
-        if self.max_output_tokens <= 0:
-            raise ValueError("max_output_tokens must be positive")
+        if self.max_output_tokens is not None:
+            if not isinstance(self.max_output_tokens, int) or isinstance(
+                self.max_output_tokens, bool
+            ):
+                raise TypeError("max_output_tokens must be an integer or None")
+            if self.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be positive or None")
         if not isinstance(self.stop_conditions, tuple):
             raise TypeError("stop_conditions must be a tuple")
         for condition in self.stop_conditions:

@@ -150,6 +150,29 @@ def test_raw_serving_token_ids_never_calls_text_tokenizer() -> None:
     asyncio.run(scenario())
 
 
+def test_raw_serving_resolves_auto_output_limit_after_tokenization() -> None:
+    async def scenario() -> None:
+        tokenizer = _Tokenizer()
+        controller = _Controller([])
+        engine = RawServingEngine(
+            tokenizer,
+            controller,
+            output_limit_resolver=lambda prompt_tokens, requested: 96 - prompt_tokens
+            if requested is None
+            else requested,
+        )
+        request = RawServingRequest(
+            RawPromptRequest("req_raw", "m", (RawPromptItem(text="PROMPT"),)),
+            None,
+        )
+
+        await engine.submit(request)
+
+        assert controller.requests[0].max_new_tokens == 93
+
+    asyncio.run(scenario())
+
+
 def test_raw_serving_close_cancels_unfinished_runtime_once() -> None:
     async def scenario() -> None:
         tokenizer = _Tokenizer()

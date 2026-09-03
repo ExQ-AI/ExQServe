@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 
-from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode, ReasoningPolicy
+from exqserve.agent.reasoning import (
+    ReasoningBudgetMode,
+    ReasoningBudgetOverride,
+    ReasoningEffort,
+    ReasoningMode,
+    ReasoningPolicy,
+)
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
@@ -26,6 +33,9 @@ from exqserve.protocol.anthropic.common import ParsedAnthropicRequest, invalid_r
 from exqserve.runtime.contracts import RuntimeSamplingConfig
 from exqserve.serving.contracts import ServingRequest
 
+CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE = "claude-code-2.1.251"
+_CLAUDE_CODE_TOTAL_TOKENS = re.compile(r"^<total_tokens>[0-9]+ tokens left</total_tokens>$")
+
 
 def _object(value: object, message: str) -> dict[str, object]:
     if not isinstance(value, dict):
@@ -46,6 +56,19 @@ def _text_blocks(value: object, *, field: str) -> str:
             raise invalid_request(f"{field} supports text blocks only.")
         parts.append(text)
     return "".join(parts)
+
+
+def _claude_code_total_tokens_marker(value: object) -> bool:
+    text: str | None = None
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list) and len(value) == 1:
+        block = value[0]
+        if isinstance(block, dict) and block.get("type") == "text":
+            candidate = block.get("text")
+            if isinstance(candidate, str):
+                text = candidate
+    return text is not None and _CLAUDE_CODE_TOTAL_TOKENS.fullmatch(text) is not None
 
 
 def _image_part(block: dict[str, object]) -> ImageContentPart:
@@ -183,7 +206,12 @@ def _parse_assistant_content(value: object, items: list[CanonicalItem]) -> None:
             raise invalid_request("Unsupported assistant content block type.")
 
 
-def _parse_messages(value: object, system: object) -> tuple[CanonicalItem, ...]:
+def _parse_messages(
+    value: object,
+    system: object,
+    *,
+    compatibility_profile: str | None = None,
+) -> tuple[CanonicalItem, ...]:
     if not isinstance(value, list) or not value:
         raise invalid_request("messages must be a non-empty array.")
     items: list[CanonicalItem] = []
@@ -196,6 +224,15 @@ def _parse_messages(value: object, system: object) -> tuple[CanonicalItem, ...]:
             _parse_user_content(message.get("content"), items)
         elif role == "assistant":
             _parse_assistant_content(message.get("content"), items)
+        elif (
+            role == "system"
+            and compatibility_profile == CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE
+        ):
+            if not _claude_code_total_tokens_marker(message.get("content")):
+                raise invalid_request(
+                    "Claude Code compatibility accepts only <total_tokens> bookkeeping system messages."
+                )
+            continue
         else:
             raise invalid_request("Messages API roles must be user or assistant.")
     return tuple(items)
@@ -304,24 +341,32 @@ def _parse_output_config(value: object) -> tuple[ReasoningEffort | None, Structu
 def _parse_reasoning(
     thinking_value: object,
     effort: ReasoningEffort | None,
-) -> tuple[ReasoningPolicy, bool]:
+) -> tuple[ReasoningPolicy, bool, ReasoningBudgetOverride]:
     if thinking_value is None:
-        return ReasoningPolicy(ReasoningMode.DEFAULT, effort), False
+        return ReasoningPolicy(ReasoningMode.DEFAULT, effort), False, ReasoningBudgetOverride()
     thinking = _object(thinking_value, "thinking must be an object.")
     thinking_type = thinking.get("type")
     if thinking_type == "disabled":
         if "display" in thinking:
             raise invalid_request("thinking.display is invalid when thinking is disabled.")
-        return ReasoningPolicy(ReasoningMode.DISABLED, effort), False
+        if "budget_tokens" in thinking:
+            raise invalid_request("thinking.budget_tokens is invalid when thinking is disabled.")
+        return (
+            ReasoningPolicy(ReasoningMode.DISABLED, effort),
+            False,
+            ReasoningBudgetOverride(ReasoningBudgetMode.DISABLE),
+        )
     if thinking_type in {"enabled", "adaptive"}:
+        budget_override = ReasoningBudgetOverride()
         if "budget_tokens" in thinking:
             budget = thinking.get("budget_tokens")
             if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
                 raise invalid_request("thinking.budget_tokens must be a positive integer.")
+            budget_override = ReasoningBudgetOverride(ReasoningBudgetMode.EXPLICIT, budget)
         display = thinking.get("display")
         if display not in {None, "summarized", "omitted"}:
             raise invalid_request("thinking.display is unsupported.")
-        return ReasoningPolicy(ReasoningMode.ENABLED, effort), display == "omitted"
+        return ReasoningPolicy(ReasoningMode.ENABLED, effort), display == "omitted", budget_override
     raise invalid_request("Unsupported thinking type.")
 
 
@@ -352,6 +397,11 @@ def _parse_stop_sequences(value: object) -> tuple[str, ...]:
 
 
 class AnthropicMessagesRequestAdapter:
+    def __init__(self, compatibility_profile: str | None = None) -> None:
+        if compatibility_profile not in {None, CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE}:
+            raise ValueError("unsupported Anthropic compatibility profile")
+        self._compatibility_profile = compatibility_profile
+
     def _identity_and_items(
         self,
         body: dict[str, object],
@@ -363,12 +413,16 @@ class AnthropicMessagesRequestAdapter:
         model = body.get("model")
         if not isinstance(model, str) or not model.strip():
             raise invalid_request("model must be a non-empty string.")
-        return model, _parse_messages(body.get("messages"), body.get("system"))
+        return model, _parse_messages(
+            body.get("messages"),
+            body.get("system"),
+            compatibility_profile=self._compatibility_profile,
+        )
 
     def parse(self, body: dict[str, object], *, request_id: str) -> ParsedAnthropicRequest:
         model, items = self._identity_and_items(body, request_id=request_id)
         effort, structured_output = _parse_output_config(body.get("output_config"))
-        reasoning, omit_thinking = _parse_reasoning(body.get("thinking"), effort)
+        reasoning, omit_thinking, reasoning_budget = _parse_reasoning(body.get("thinking"), effort)
         max_tokens = body.get("max_tokens")
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise invalid_request(
@@ -385,18 +439,20 @@ class AnthropicMessagesRequestAdapter:
             structured_output=structured_output,
             sampling=_parse_sampling(body),
             stop_conditions=_parse_stop_sequences(body.get("stop_sequences")),
+            reasoning_budget=reasoning_budget,
         )
         return ParsedAnthropicRequest(serving, model, stream, omit_thinking)
 
     def parse_count(self, body: dict[str, object], *, request_id: str) -> ParsedAnthropicRequest:
         model, items = self._identity_and_items(body, request_id=request_id)
         effort, structured_output = _parse_output_config(body.get("output_config"))
-        reasoning, omit_thinking = _parse_reasoning(body.get("thinking"), effort)
+        reasoning, omit_thinking, reasoning_budget = _parse_reasoning(body.get("thinking"), effort)
         serving = ServingRequest(
             CanonicalRequest(request_id, model, items),
             reasoning,
             _parse_tool_policy(body),
             1,
             structured_output=structured_output,
+            reasoning_budget=reasoning_budget,
         )
         return ParsedAnthropicRequest(serving, model, False, omit_thinking)

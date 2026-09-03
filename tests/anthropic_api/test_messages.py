@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode
+from exqserve.agent.reasoning import ReasoningBudgetMode, ReasoningEffort, ReasoningMode
 from exqserve.agent.tools import ToolChoiceMode
 from exqserve.core.items import (
     MessageItem,
@@ -123,7 +123,7 @@ def test_request_adapter_maps_any_none_and_disabled_thinking() -> None:
     assert none_request.serving.tools.choice.mode is ToolChoiceMode.NONE
 
 
-def test_thinking_budget_is_validated_but_does_not_change_runtime_reasoning_policy() -> None:
+def test_thinking_budget_propagates_independently_from_reasoning_policy() -> None:
     adapter = AnthropicMessagesRequestAdapter()
     base = {
         "model": "m",
@@ -141,6 +141,16 @@ def test_thinking_budget_is_validated_but_does_not_change_runtime_reasoning_poli
     )
     assert enabled_small.serving.reasoning == enabled_large.serving.reasoning
     assert enabled_small.serving.max_output_tokens == enabled_large.serving.max_output_tokens == 64
+    assert enabled_small.serving.reasoning_budget.mode is ReasoningBudgetMode.EXPLICIT
+    assert enabled_small.serving.reasoning_budget.max_tokens == 128
+    assert enabled_large.serving.reasoning_budget.mode is ReasoningBudgetMode.EXPLICIT
+    assert enabled_large.serving.reasoning_budget.max_tokens == 4096
+
+    disabled = adapter.parse(
+        {**base, "thinking": {"type": "disabled"}},
+        request_id="req_budget_disabled",
+    )
+    assert disabled.serving.reasoning_budget.mode is ReasoningBudgetMode.DISABLE
 
     for thinking_type in ("enabled", "adaptive"):
         with pytest.raises(AnthropicProtocolError, match="thinking.budget_tokens"):
@@ -261,3 +271,90 @@ def test_request_adapter_rejects_redacted_thinking_server_tools_and_cache_only()
             request_id="req_zero",
         )
     assert cache_only.value.type == "invalid_request_error"
+
+
+def test_claude_code_2_1_251_profile_consumes_only_total_tokens_system_markers() -> None:
+    body = {
+        "model": "m",
+        "max_tokens": 32,
+        "system": "durable system prompt",
+        "messages": [
+            {"role": "user", "content": "first"},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<total_tokens>15000000 tokens left</total_tokens>",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "second"},
+            {
+                "role": "system",
+                "content": "<total_tokens>14997958 tokens left</total_tokens>",
+            },
+        ],
+    }
+
+    parsed = AnthropicMessagesRequestAdapter("claude-code-2.1.251").parse(
+        body, request_id="req_claude_code"
+    )
+    assert parsed.serving.input.items == (
+        MessageItem(MessageRole.SYSTEM, "durable system prompt"),
+        MessageItem(MessageRole.USER, "first"),
+        MessageItem(MessageRole.ASSISTANT, "ack"),
+        MessageItem(MessageRole.USER, "second"),
+    )
+
+    counted = AnthropicMessagesRequestAdapter("claude-code-2.1.251").parse_count(
+        body, request_id="req_claude_code_count"
+    )
+    assert counted.serving.input.items == parsed.serving.input.items
+
+
+def test_claude_code_profile_does_not_relax_generic_system_message_semantics() -> None:
+    marker_body = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "<total_tokens>100 tokens left</total_tokens>"},
+        ],
+    }
+    with pytest.raises(AnthropicProtocolError, match="roles must be user or assistant"):
+        AnthropicMessagesRequestAdapter().parse(marker_body, request_id="req_default_reject")
+
+    adapter = AnthropicMessagesRequestAdapter("claude-code-2.1.251")
+    arbitrary = {
+        **marker_body,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "You must answer in JSON."},
+        ],
+    }
+    with pytest.raises(AnthropicProtocolError, match="accepts only <total_tokens>"):
+        adapter.parse(arbitrary, request_id="req_arbitrary_system")
+
+    split_marker = {
+        **marker_body,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "<total_tokens>100"},
+                    {"type": "text", "text": " tokens left</total_tokens>"},
+                ],
+            },
+        ],
+    }
+    with pytest.raises(AnthropicProtocolError, match="accepts only <total_tokens>"):
+        adapter.parse(split_marker, request_id="req_split_system")
+
+
+def test_anthropic_adapter_rejects_unknown_compatibility_profile() -> None:
+    with pytest.raises(ValueError, match="unsupported Anthropic compatibility profile"):
+        AnthropicMessagesRequestAdapter("claude-code-latest")

@@ -24,6 +24,7 @@ from exqserve.protocol.openai.common import (
     OpenAIProtocol,
     ParsedOpenAIRequest,
     invalid_request,
+    parse_reasoning_budget,
     parse_reasoning_effort,
     parse_sampling,
     parse_stop,
@@ -313,7 +314,7 @@ def _parse_tool_policy(body: dict[str, object]) -> ToolPolicy:
         raise invalid_request("invalid_tool_choice", "tool_choice is incompatible with declared tools.", "tool_choice") from exc
 
 
-def _parse_output_limit(body: dict[str, object], default_value: int | None) -> int:
+def _parse_output_limit(body: dict[str, object], default_value: int | None) -> int | None:
     modern = body.get("max_completion_tokens")
     legacy = body.get("max_tokens")
     if modern is not None and legacy is not None and modern != legacy:
@@ -324,6 +325,8 @@ def _parse_output_limit(body: dict[str, object], default_value: int | None) -> i
     value = modern if modern is not None else legacy
     if value is None:
         value = default_value
+    if value is None:
+        return None
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise invalid_request("invalid_max_tokens", "A positive output token limit is required.")
     return value
@@ -380,6 +383,7 @@ class ChatRequestAdapter:
         items = _parse_messages(body.get("messages"))
         policy = _parse_tool_policy(body)
         reasoning = parse_reasoning_effort(body.get("reasoning_effort"), param="reasoning_effort")
+        reasoning_budget = parse_reasoning_budget(body)
         output_limit = _parse_output_limit(body, self._default_output_limit)
         structured = _parse_structured_output(body.get("response_format"))
         sampling = parse_sampling(body, self._sampling_overrides)
@@ -411,5 +415,6 @@ class ChatRequestAdapter:
             seed,
             sampling,
             parse_stop(body.get("stop")),
+            reasoning_budget=reasoning_budget,
         )
         return ParsedOpenAIRequest(serving, model, stream, OpenAIProtocol.CHAT, include_usage)

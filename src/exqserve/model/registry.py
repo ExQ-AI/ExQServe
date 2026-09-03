@@ -15,6 +15,7 @@ from exqserve.model.contracts import (
     ModelCapabilities,
     ModelDialect,
     ModelDialectPluginRegistration,
+    ReasoningControlSpec,
     ToolConstraintMode,
     ToolGenerationConstraint,
 )
@@ -113,6 +114,14 @@ class QwenDialect:
             tool_policy=tool_policy,
         )
 
+    def create_reasoning_control(
+        self, reasoning_policy: ReasoningPolicy, tool_policy: ToolPolicy
+    ) -> ReasoningControlSpec | None:
+        del tool_policy
+        if reasoning_policy.mode is ReasoningMode.DISABLED:
+            return None
+        return ReasoningControlSpec("</think>", True)
+
     def create_tool_constraint(
         self,
         tool_policy: ToolPolicy,
@@ -151,6 +160,16 @@ class Gemma4Dialect:
             start_in_reasoning=reasoning.mode is ReasoningMode.ENABLED,
         )
 
+    def create_reasoning_control(
+        self, reasoning_policy: ReasoningPolicy, tool_policy: ToolPolicy
+    ) -> ReasoningControlSpec | None:
+        del tool_policy
+        if reasoning_policy.mode is ReasoningMode.DISABLED:
+            return None
+        return ReasoningControlSpec(
+            "<channel|>", reasoning_policy.mode is ReasoningMode.ENABLED
+        )
+
     def create_tool_constraint(
         self,
         tool_policy: ToolPolicy,
@@ -172,6 +191,14 @@ class Glm5Dialect:
 
     def create_compiler(self, template_adapter: ChatTemplateAdapter) -> Glm5PromptCompiler:
         return Glm5PromptCompiler(template_adapter)
+
+    def create_reasoning_control(
+        self, reasoning_policy: ReasoningPolicy, tool_policy: ToolPolicy
+    ) -> ReasoningControlSpec | None:
+        del tool_policy
+        if reasoning_policy.mode is ReasoningMode.DISABLED:
+            return None
+        return ReasoningControlSpec("</think>", True)
 
     def create_parser(
         self,
@@ -199,6 +226,14 @@ class DeepSeekV4Dialect:
 
     def create_compiler(self, template_adapter: ChatTemplateAdapter) -> DeepSeekV4PromptCompiler:
         return DeepSeekV4PromptCompiler(template_adapter)
+
+    def create_reasoning_control(
+        self, reasoning_policy: ReasoningPolicy, tool_policy: ToolPolicy
+    ) -> ReasoningControlSpec | None:
+        del tool_policy
+        if reasoning_policy.mode is ReasoningMode.DISABLED:
+            return None
+        return ReasoningControlSpec("</think>", True)
 
     def create_parser(
         self,

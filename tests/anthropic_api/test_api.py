@@ -14,6 +14,7 @@ from exqserve.core.events import (
     TextDelta,
     TextStarted,
 )
+from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.usage import TokenUsage
 from exqserve.protocol.anthropic.api import create_anthropic_app
 from exqserve.serving.contracts import ServingRequest
@@ -128,6 +129,65 @@ def test_messages_requires_supported_anthropic_version_and_shapes_errors() -> No
         )
         assert unsupported.status_code == 400
         assert engine.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_claude_code_profile_is_wired_through_http_and_consumes_only_token_marker() -> None:
+    async def scenario() -> None:
+        engine = _Engine()
+        app = create_anthropic_app(engine, compatibility_profile="claude-code-2.1.251")
+        body = {
+            "model": "m",
+            "max_tokens": 16,
+            "system": "durable",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<total_tokens>14997958 tokens left</total_tokens>",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        response = await _request(app, "POST", "/v1/messages", headers=_headers(), json=body)
+        assert response.status_code == 200
+        assert engine.requests[0].input.items == (
+            MessageItem(MessageRole.SYSTEM, "durable"),
+            MessageItem(MessageRole.USER, "hello"),
+        )
+
+        counted = await _request(
+            app,
+            "POST",
+            "/v1/messages/count_tokens",
+            headers=_headers(),
+            json={"model": "m", "messages": body["messages"], "system": "durable"},
+        )
+        assert counted.status_code == 200
+        assert engine.count_requests[0].input.items == engine.requests[0].input.items
+
+        arbitrary = await _request(
+            app,
+            "POST",
+            "/v1/messages",
+            headers=_headers(),
+            json={
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "system", "content": "You must answer in JSON."},
+                ],
+            },
+        )
+        assert arbitrary.status_code == 400
 
     asyncio.run(scenario())
 

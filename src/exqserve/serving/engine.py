@@ -7,14 +7,26 @@ import contextlib
 import logging
 from collections import deque
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, Self
 
 from exqserve.agent._json import InvalidJsonError, parse_json_strict
-from exqserve.agent.reasoning import ReasoningPolicy
+from exqserve.agent.reasoning import (
+    ReasoningBudgetDefault,
+    ReasoningBudgetMode,
+    ReasoningMode,
+    ReasoningPolicy,
+)
 from exqserve.agent.structured_output import StructuredOutputSpec, validate_structured_output
 from exqserve.agent.tools import ToolPolicy
 from exqserve.agent.validation import validate_tool_calls, validate_tool_history
-from exqserve.control.request import RequestRejected, RequestTerminalReason
+from exqserve.control.request import (
+    RequestInjectionConflict,
+    RequestInjectionTerminating,
+    RequestRejected,
+    RequestTerminalReason,
+)
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import (
     CompletionReason,
@@ -23,16 +35,20 @@ from exqserve.core.events import (
     GenerationEvent,
     GenerationFailed,
     GenerationStarted,
+    ReasoningCompleted,
+    ReasoningDelta,
     TextDelta,
     ToolCallArgumentsDelta,
     ToolCallCompleted,
     ToolCallStarted,
     UsageUpdated,
 )
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenAwareIncrementalParser,
     NativeTokenProvenanceError,
+    ReasoningControlSpec,
     RenderedPrompt,
     TemplateImagePart,
     TemplateMessage,
@@ -54,6 +70,7 @@ from exqserve.runtime.contracts import (
     RuntimeGenerationRequest,
     RuntimeRenderedPrompt,
     RuntimeStarted,
+    RuntimeStopReason,
     RuntimeTextDelta,
 )
 from exqserve.serving.contracts import (
@@ -194,6 +211,9 @@ class ControlledSessionLike(Protocol):
     def __aiter__(self) -> AsyncIterator[RuntimeEvent]:
         ...
 
+    def inject_text(self, text: str) -> None:
+        ...
+
     async def cancel(
         self,
         reason: RequestTerminalReason = RequestTerminalReason.CLIENT_CANCELLED,
@@ -208,6 +228,34 @@ class RequestControllerLike(Protocol):
 
 type ParserFactory = Callable[[str, ReasoningPolicy, ToolPolicy], IncrementalParserLike]
 type ToolConstraintFactory = Callable[[ToolPolicy], ToolGenerationConstraint | None]
+type ReasoningControlFactory = Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None]
+type ReasoningControlTokenizer = Callable[[str], tuple[int, ...]]
+type OutputLimitResolver = Callable[[int, int | None], int]
+
+
+class _ReasoningBudgetSource(str, Enum):
+    REQUEST = "request"
+    SERVER_DEFAULT = "server_default"
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveReasoningBudget:
+    max_tokens: int
+    message: str
+    source: _ReasoningBudgetSource
+    control: ReasoningControlSpec
+    close_token_id: int
+
+    @property
+    def forced_text(self) -> str:
+        return self.message + self.control.close_sequence
+
+
+class _ReasoningBudgetState(str, Enum):
+    DISABLED = "disabled"
+    COUNTING = "counting"
+    FORCE_REQUESTED = "force_requested"
+    DONE = "done"
 
 
 def _safe_error(
@@ -229,6 +277,10 @@ class ServingEngine:
         tool_constraint_factory: ToolConstraintFactory | None = None,
         tool_call_fanout_limit: int = 32,
         constrained_parallel_tool_call_limit: int = 8,
+        output_limit_resolver: OutputLimitResolver | None = None,
+        reasoning_control_factory: ReasoningControlFactory | None = None,
+        reasoning_control_tokenizer: ReasoningControlTokenizer | None = None,
+        reasoning_budget_default: ReasoningBudgetDefault | None = None,
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
@@ -245,8 +297,141 @@ class ServingEngine:
         self._controller = controller
         self._tool_constraint_factory = tool_constraint_factory
         self._tool_call_fanout_limit = tool_call_fanout_limit
+        if reasoning_budget_default is not None and not isinstance(
+            reasoning_budget_default, ReasoningBudgetDefault
+        ):
+            raise TypeError("reasoning_budget_default must be ReasoningBudgetDefault or None")
         self._constrained_parallel_tool_call_limit = constrained_parallel_tool_call_limit
+        self._output_limit_resolver = output_limit_resolver
+        self._reasoning_control_factory = reasoning_control_factory
+        self._reasoning_control_tokenizer = reasoning_control_tokenizer
+        self._reasoning_budget_default = reasoning_budget_default or ReasoningBudgetDefault()
         self._compile_lock = asyncio.Lock()
+
+    def _reasoning_budget_rejected(
+        self, code: str, message: str, *, unsupported: bool = False
+    ) -> ServingRejected:
+        return ServingRejected(
+            _safe_error(
+                ErrorCategory.UNSUPPORTED_CAPABILITY if unsupported else ErrorCategory.INVALID_REQUEST,
+                code,
+                message,
+            )
+        )
+
+    def _resolve_reasoning_budget(
+        self, request: ServingRequest, *, active_generation_constraint: bool
+    ) -> _EffectiveReasoningBudget | None:
+        override = request.reasoning_budget
+        if request.reasoning.mode is ReasoningMode.DISABLED:
+            if override.mode is ReasoningBudgetMode.EXPLICIT:
+                raise self._reasoning_budget_rejected(
+                    "reasoning_budget_requires_reasoning",
+                    "An explicit reasoning budget requires reasoning to be enabled.",
+                )
+            return None
+        if override.mode is ReasoningBudgetMode.DISABLE:
+            return None
+
+        if override.mode is ReasoningBudgetMode.EXPLICIT:
+            assert override.max_tokens is not None
+            source = _ReasoningBudgetSource.REQUEST
+            max_tokens = override.max_tokens
+            message = (
+                self._reasoning_budget_default.message
+                if override.message is None
+                else override.message
+            )
+        else:
+            if self._reasoning_budget_default.max_tokens is None:
+                return None
+            source = _ReasoningBudgetSource.SERVER_DEFAULT
+            max_tokens = self._reasoning_budget_default.max_tokens
+            message = self._reasoning_budget_default.message
+
+        if active_generation_constraint:
+            if source is _ReasoningBudgetSource.REQUEST:
+                raise self._reasoning_budget_rejected(
+                    "reasoning_budget_incompatible_with_constraint",
+                    "Reasoning budget fallback cannot be combined with an active generation constraint.",
+                )
+            logger.info(
+                "reasoning budget skipped request_id=%s source=server_default reason=active_generation_constraint",
+                request.input.request_id,
+            )
+            return None
+
+        if self._reasoning_control_factory is None or self._reasoning_control_tokenizer is None:
+            if source is _ReasoningBudgetSource.REQUEST:
+                raise self._reasoning_budget_rejected(
+                    "reasoning_budget_unsupported",
+                    "Reasoning budget is unsupported by the selected model/runtime.",
+                    unsupported=True,
+                )
+            logger.info(
+                "reasoning budget skipped request_id=%s source=server_default reason=no_control_capability",
+                request.input.request_id,
+            )
+            return None
+
+        try:
+            control = self._reasoning_control_factory(request.reasoning, request.tools)
+        except Exception as exc:
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INTERNAL,
+                    "serving_internal_error",
+                    "Reasoning-control initialization failed internally.",
+                )
+            ) from exc
+        if control is None or not control.initially_in_reasoning:
+            if source is _ReasoningBudgetSource.REQUEST:
+                raise self._reasoning_budget_rejected(
+                    "reasoning_budget_unsupported",
+                    "Reasoning budget fallback requires a generation that starts in reasoning.",
+                    unsupported=True,
+                )
+            logger.info(
+                "reasoning budget skipped request_id=%s source=server_default reason=not_initially_reasoning",
+                request.input.request_id,
+            )
+            return None
+
+        try:
+            close_ids = self._reasoning_control_tokenizer(control.close_sequence)
+        except Exception as exc:
+            if source is _ReasoningBudgetSource.REQUEST:
+                raise self._reasoning_budget_rejected(
+                    "reasoning_budget_unsupported",
+                    "Reasoning close sequence cannot be verified by the active tokenizer.",
+                    unsupported=True,
+                ) from exc
+            logger.warning(
+                "reasoning budget skipped request_id=%s source=server_default reason=close_tokenization_failed",
+                request.input.request_id,
+            )
+            return None
+        if len(close_ids) != 1:
+            if source is _ReasoningBudgetSource.REQUEST:
+                raise self._reasoning_budget_rejected(
+                    "reasoning_budget_unsupported",
+                    "Reasoning budget fallback requires an atomic single-token reasoning close.",
+                    unsupported=True,
+                )
+            logger.info(
+                "reasoning budget skipped request_id=%s source=server_default reason=non_atomic_close tokens=%d",
+                request.input.request_id,
+                len(close_ids),
+            )
+            return None
+
+        logger.info(
+            "reasoning budget enabled request_id=%s backend=fallback source=%s budget=%d",
+            request.input.request_id,
+            source.value,
+            max_tokens,
+        )
+        return _EffectiveReasoningBudget(max_tokens, message, source, control, close_ids[0])
 
     def _compile_request(self, request: ServingRequest) -> CompiledPrompt:
         if not isinstance(request, ServingRequest):
@@ -317,6 +502,22 @@ class ServingEngine:
                 )
             )
         compiled = await self._compile_request_async(request)
+        max_output_tokens = request.max_output_tokens
+        if max_output_tokens is None:
+            if self._output_limit_resolver is None:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INTERNAL,
+                        "serving_internal_error",
+                        "Automatic output token resolution is unavailable.",
+                    )
+                )
+            try:
+                max_output_tokens = self._output_limit_resolver(
+                    len(compiled.input_ids), max_output_tokens
+                )
+            except RequestRejected as exc:
+                raise ServingRejected(exc.error) from exc
 
         try:
             parser = self._parser_factory(
@@ -383,10 +584,15 @@ class ServingEngine:
                 )
             )
 
+        reasoning_budget = self._resolve_reasoning_budget(
+            request,
+            active_generation_constraint=schema_hint is not None or tool_constraint is not None,
+        )
+
         runtime_request = RuntimeGenerationRequest(
             request_id=request.input.request_id,
             input_ids=compiled.input_ids,
-            max_new_tokens=request.max_output_tokens,
+            max_new_tokens=max_output_tokens,
             seed=request.seed,
             stop_conditions=(*compiled.stop_conditions, *request.stop_conditions),
             sampling=request.sampling,
@@ -425,7 +631,7 @@ class ServingEngine:
                 )
             ) from exc
 
-        return ServingSession(
+        session = ServingSession(
             request.input.request_id,
             controlled,
             parser,
@@ -436,7 +642,10 @@ class ServingEngine:
             self._tool_call_fanout_limit,
             request.tools.allow_parallel and tool_constraint is not None,
             self._constrained_parallel_tool_call_limit,
+            reasoning_budget,
         )
+        await session._initialize_reasoning_budget()
+        return session
 
 
 class ServingSession:
@@ -454,6 +663,7 @@ class ServingSession:
         tool_call_fanout_limit: int = 32,
         atomic_parallel_tools: bool = False,
         constrained_parallel_tool_call_limit: int = 8,
+        reasoning_budget: _EffectiveReasoningBudget | None = None,
     ) -> None:
         self._request_id = request_id
         self._controlled = controlled
@@ -476,6 +686,287 @@ class ServingSession:
         self._parser_finished = False
         self._text_parts: list[str] = []
         self._runtime_trace: list[dict[str, object]] | None = None
+        self._reasoning_budget = reasoning_budget
+        self._reasoning_budget_state = (
+            _ReasoningBudgetState.COUNTING
+            if reasoning_budget is not None
+            else _ReasoningBudgetState.DISABLED
+        )
+        self._reasoning_budget_token_count = 0
+        self._reasoning_budget_overshoot_lower_bound = 0
+        self._reasoning_budget_duplicate_close_pending = False
+        self._reasoning_budget_duplicate_close_consumed_in_delta = False
+        self._reasoning_budget_post_force_reasoning_tail = ""
+
+    async def _reasoning_budget_failure(self, code: str, message: str) -> None:
+        if self._terminal:
+            return
+        error = _safe_error(ErrorCategory.RUNTIME_FAILURE, code, message)
+        self._discard_atomic_tool_batch()
+        self._terminal = True
+        self._reasoning_budget_state = _ReasoningBudgetState.DONE
+        try:
+            await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        except Exception:
+            logger.exception(
+                "runtime cancellation failed after reasoning-budget failure request_id=%s",
+                self._request_id,
+            )
+        self._pending.append(GenerationFailed(self._request_id, error))
+
+    def _disable_reasoning_budget(self, reason: str) -> None:
+        budget = self._reasoning_budget
+        if budget is not None:
+            logger.warning(
+                "reasoning budget disabled request_id=%s source=%s reason=%s observed_tokens=%d",
+                self._request_id,
+                budget.source.value,
+                reason,
+                self._reasoning_budget_token_count,
+            )
+        self._reasoning_budget_state = _ReasoningBudgetState.DISABLED
+
+    async def _force_reasoning_close(self) -> None:
+        if self._reasoning_budget_state is not _ReasoningBudgetState.COUNTING:
+            return
+        budget = self._reasoning_budget
+        if budget is None:
+            self._reasoning_budget_state = _ReasoningBudgetState.DISABLED
+            return
+        try:
+            self._controlled.inject_text(budget.forced_text)
+        except RequestInjectionTerminating:
+            logger.info(
+                "reasoning budget close lost terminal race request_id=%s source=%s observed_tokens=%d",
+                self._request_id,
+                budget.source.value,
+                self._reasoning_budget_token_count,
+            )
+            self._reasoning_budget_state = _ReasoningBudgetState.DONE
+            return
+        except RequestInjectionConflict:
+            if budget.source is _ReasoningBudgetSource.SERVER_DEFAULT:
+                self._disable_reasoning_budget("injection_conflict")
+                return
+            await self._reasoning_budget_failure(
+                "reasoning_budget_enforcement_failed",
+                "Reasoning budget close could not be applied safely.",
+            )
+            return
+        except Exception:
+            logger.exception("reasoning budget injection failed request_id=%s", self._request_id)
+            if budget.source is _ReasoningBudgetSource.SERVER_DEFAULT:
+                self._disable_reasoning_budget("injection_failed")
+                return
+            await self._reasoning_budget_failure(
+                "reasoning_budget_enforcement_failed",
+                "Reasoning budget close failed internally.",
+            )
+            return
+        self._reasoning_budget_state = _ReasoningBudgetState.FORCE_REQUESTED
+        logger.info(
+            "reasoning budget close queued request_id=%s source=%s budget=%d observed_tokens=%d",
+            self._request_id,
+            budget.source.value,
+            budget.max_tokens,
+            self._reasoning_budget_token_count,
+        )
+
+    async def _initialize_reasoning_budget(self) -> None:
+        budget = self._reasoning_budget
+        if budget is not None and budget.max_tokens == 0:
+            await self._force_reasoning_close()
+
+    def _reasoning_budget_close_spans(
+        self, event: RuntimeTextDelta
+    ) -> tuple[NativeTokenSpan, ...]:
+        budget = self._reasoning_budget
+        if (
+            budget is None
+            or not event.native_token_provenance
+            or event.native_token_spans is None
+        ):
+            return ()
+        return tuple(
+            span
+            for span in event.native_token_spans
+            if span.token_id == budget.close_token_id
+            and span.text == budget.control.close_sequence
+        )
+
+    def _strip_reasoning_budget_close(
+        self,
+        event: RuntimeTextDelta,
+        target: NativeTokenSpan,
+    ) -> RuntimeTextDelta | None:
+        budget = self._reasoning_budget
+        spans = event.native_token_spans
+        if budget is None or spans is None:
+            return event
+
+        target_occurrence = 0
+        found_target = False
+        for span in spans:
+            if span.token_id != budget.close_token_id:
+                continue
+            if span is target:
+                found_target = True
+                break
+            target_occurrence += 1
+        if not found_target:
+            return event
+
+        token_ids = list(event.token_ids)
+        seen = 0
+        remove_index: int | None = None
+        for index, token_id in enumerate(token_ids):
+            if token_id != budget.close_token_id:
+                continue
+            if seen == target_occurrence:
+                remove_index = index
+                break
+            seen += 1
+        if remove_index is None:
+            return event
+        del token_ids[remove_index]
+
+        removed_chars = target.end - target.start
+        text = event.text[: target.start] + event.text[target.end :]
+        if not text:
+            return None
+
+        adjusted_spans: list[NativeTokenSpan] = []
+        for span in spans:
+            if span is target:
+                continue
+            if span.start >= target.end:
+                adjusted_spans.append(
+                    NativeTokenSpan(
+                        span.start - removed_chars,
+                        span.end - removed_chars,
+                        span.token_id,
+                        span.text,
+                    )
+                )
+            else:
+                adjusted_spans.append(span)
+        return RuntimeTextDelta(
+            event.request_id,
+            text,
+            tuple(token_ids),
+            tuple(adjusted_spans),
+            True,
+        )
+
+    async def _prepare_reasoning_budget_delta(
+        self, event: RuntimeTextDelta
+    ) -> RuntimeTextDelta | None:
+        budget = self._reasoning_budget
+        self._reasoning_budget_duplicate_close_consumed_in_delta = False
+        if budget is None:
+            return event
+
+        close_spans = self._reasoning_budget_close_spans(event)
+        if (
+            self._reasoning_budget_state is _ReasoningBudgetState.FORCE_REQUESTED
+            and len(close_spans) >= 2
+        ):
+            self._reasoning_budget_duplicate_close_consumed_in_delta = True
+            logger.info(
+                "reasoning budget suppressed merged duplicate close request_id=%s token_id=%d",
+                self._request_id,
+                budget.close_token_id,
+            )
+            return self._strip_reasoning_budget_close(event, close_spans[1])
+
+        if not self._reasoning_budget_duplicate_close_pending:
+            return event
+
+        if close_spans:
+            self._reasoning_budget_duplicate_close_pending = False
+            logger.info(
+                "reasoning budget suppressed queued duplicate close request_id=%s token_id=%d",
+                self._request_id,
+                budget.close_token_id,
+            )
+            return self._strip_reasoning_budget_close(event, close_spans[0])
+
+        if (
+            event.text == budget.control.close_sequence
+            and event.token_ids == (budget.close_token_id,)
+        ):
+            self._reasoning_budget_duplicate_close_pending = False
+            logger.info(
+                "reasoning budget suppressed exact queued duplicate close request_id=%s token_id=%d",
+                self._request_id,
+                budget.close_token_id,
+            )
+            return None
+        return event
+
+    async def _apply_reasoning_budget(
+        self, event: RuntimeTextDelta, semantic_events: tuple[GenerationEvent, ...]
+    ) -> None:
+        budget = self._reasoning_budget
+        state = self._reasoning_budget_state
+        if budget is None or state in {
+            _ReasoningBudgetState.DISABLED,
+            _ReasoningBudgetState.DONE,
+        }:
+            return
+        if state is _ReasoningBudgetState.FORCE_REQUESTED and budget.message:
+            for semantic in semantic_events:
+                if isinstance(semantic, ReasoningDelta):
+                    self._reasoning_budget_post_force_reasoning_tail = (
+                        self._reasoning_budget_post_force_reasoning_tail + semantic.text
+                    )[-len(budget.message) :]
+        if any(isinstance(semantic, ReasoningCompleted) for semantic in semantic_events):
+            if state is _ReasoningBudgetState.FORCE_REQUESTED:
+                if budget.message and not self._reasoning_budget_post_force_reasoning_tail.endswith(
+                    budget.message
+                ):
+                    await self._reasoning_budget_failure(
+                        "reasoning_budget_enforcement_failed",
+                        "Reasoning budget message lost a race with a natural reasoning close.",
+                    )
+                    return
+                self._reasoning_budget_duplicate_close_pending = (
+                    not budget.message
+                    and not self._reasoning_budget_duplicate_close_consumed_in_delta
+                )
+                logger.info(
+                    "reasoning budget close completed request_id=%s observed_trigger_tokens=%d "
+                    "overshoot_lower_bound_tokens=%d",
+                    self._request_id,
+                    self._reasoning_budget_token_count,
+                    self._reasoning_budget_overshoot_lower_bound,
+                )
+            else:
+                logger.info(
+                    "reasoning budget completed naturally request_id=%s observed_tokens=%d",
+                    self._request_id,
+                    self._reasoning_budget_token_count,
+                )
+            self._reasoning_budget_state = _ReasoningBudgetState.DONE
+            self._reasoning_budget_post_force_reasoning_tail = ""
+            return
+        if self._reasoning_budget_state is _ReasoningBudgetState.FORCE_REQUESTED:
+            self._reasoning_budget_overshoot_lower_bound += len(event.token_ids)
+            return
+        if self._reasoning_budget_state is not _ReasoningBudgetState.COUNTING:
+            return
+        if event.text and not event.token_ids:
+            if budget.source is _ReasoningBudgetSource.SERVER_DEFAULT:
+                self._disable_reasoning_budget("token_ids_unavailable")
+                return
+            await self._reasoning_budget_failure(
+                "reasoning_budget_accounting_unavailable",
+                "Reasoning budget accounting became unavailable during generation.",
+            )
+            return
+        self._reasoning_budget_token_count += len(event.token_ids)
+        if self._reasoning_budget_token_count >= budget.max_tokens:
+            await self._force_reasoning_close()
 
     @property
     def compiled_prompt(self) -> CompiledPrompt:
@@ -601,10 +1092,10 @@ class ServingSession:
                 "model output ended with an incomplete tool call request_id=%s",
                 self._request_id,
             )
-            await self._model_failure(
-                "tool_call_incomplete",
-                "Model output ended with an incomplete tool call.",
-            )
+            message = "Model output ended with an incomplete tool call."
+            if event.reason is RuntimeStopReason.LENGTH:
+                message = "Model output reached the output token limit with an incomplete tool call."
+            await self._model_failure("tool_call_incomplete", message)
             return
 
         completed_calls = self._tool_batch.completed_calls
@@ -725,6 +1216,12 @@ class ServingSession:
             self._pending.append(GenerationStarted(self._request_id))
             return
         if isinstance(event, RuntimeTextDelta):
+            prepared_event = await self._prepare_reasoning_budget_delta(event)
+            if self._terminal:
+                return
+            if prepared_event is None:
+                return
+            event = prepared_event
             try:
                 if (
                     isinstance(self._parser, NativeTokenAwareIncrementalParser)
@@ -738,6 +1235,9 @@ class ServingSession:
                     semantic_events = self._parser.feed(event.text)
             except NativeTokenProvenanceError:
                 await self._fail_native_token_provenance()
+                return
+            await self._apply_reasoning_budget(event, semantic_events)
+            if self._terminal:
                 return
             for semantic in semantic_events:
                 await self._process_semantic(semantic)

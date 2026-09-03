@@ -263,6 +263,14 @@ class Gemma4PromptCompiler(HFTemplatePromptCompiler):
                 continue
 
             if isinstance(item, ReasoningItem):
+                if (
+                    item.starts_new_assistant_segment
+                    and assistant_text is not None
+                    and assistant_text.strip()
+                    and not assistant_calls
+                    and not assistant_responses
+                ):
+                    flush_assistant()
                 if assistant_responses:
                     flush_assistant()
                 if assistant_text is not None or assistant_calls:

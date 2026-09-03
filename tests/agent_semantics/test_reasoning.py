@@ -4,7 +4,13 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode, ReasoningPolicy
+from exqserve.agent.reasoning import (
+    ReasoningBudgetMode,
+    ReasoningBudgetOverride,
+    ReasoningEffort,
+    ReasoningMode,
+    ReasoningPolicy,
+)
 
 
 def test_reasoning_mode_values_are_protocol_neutral() -> None:
@@ -45,3 +51,24 @@ def test_reasoning_policy_is_immutable() -> None:
 
     with pytest.raises(FrozenInstanceError):
         policy.mode = ReasoningMode.DISABLED  # type: ignore[misc]
+
+
+def test_reasoning_budget_override_preserves_inherit_disable_explicit_states() -> None:
+    assert ReasoningBudgetOverride().mode is ReasoningBudgetMode.INHERIT
+    assert ReasoningBudgetOverride(ReasoningBudgetMode.DISABLE).mode is ReasoningBudgetMode.DISABLE
+    explicit = ReasoningBudgetOverride(ReasoningBudgetMode.EXPLICIT, 0, "done ")
+    assert explicit.max_tokens == 0
+    assert explicit.message == "done "
+
+    with pytest.raises(ValueError):
+        ReasoningBudgetOverride(ReasoningBudgetMode.INHERIT, 1)
+    with pytest.raises(ValueError):
+        ReasoningBudgetOverride(ReasoningBudgetMode.INHERIT, message="unused")
+    with pytest.raises(ValueError):
+        ReasoningBudgetOverride(ReasoningBudgetMode.DISABLE, message="unused")
+    with pytest.raises(ValueError):
+        ReasoningBudgetOverride(ReasoningBudgetMode.EXPLICIT, -1)
+    with pytest.raises(ValueError):
+        ReasoningBudgetOverride(ReasoningBudgetMode.INHERIT, message="unused")
+    with pytest.raises(TypeError):
+        ReasoningBudgetOverride(ReasoningBudgetMode.EXPLICIT, True)  # type: ignore[arg-type]

@@ -25,6 +25,7 @@ from exqserve.core.sampling import SamplingOverridePolicy
 from exqserve.protocol.openai.common import (
     OpenAIProtocol,
     invalid_request,
+    parse_reasoning_budget,
     parse_reasoning_effort,
     parse_sampling,
 )
@@ -251,6 +252,8 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
         "assistant": MessageRole.ASSISTANT,
     }
     call_index = 0
+    assistant_text_in_segment = False
+    assistant_tool_call_in_segment = False
     for index, raw_item in enumerate(value):
         item = _as_dict(raw_item, code="invalid_input", param=f"input[{index}]")
         item_type = item.get("type")
@@ -268,12 +271,30 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
                     items.append(MessageItem(MessageRole.USER, content))
                 else:
                     items.append(MultimodalMessageItem(MessageRole.USER, content))
+                assistant_text_in_segment = False
+                assistant_tool_call_in_segment = False
             else:
                 text = _message_text(item.get("content"), param=f"input[{index}].content")
                 items.append(MessageItem(role_map[role], text))
+                if role == "assistant":
+                    assistant_text_in_segment = assistant_text_in_segment or bool(text.strip())
+                else:
+                    assistant_text_in_segment = False
+                    assistant_tool_call_in_segment = False
             continue
         if item_type == "reasoning":
-            items.append(ReasoningItem(_reasoning_text(item.get("content"), param=f"input[{index}].content")))
+            starts_new_segment = (
+                assistant_text_in_segment and not assistant_tool_call_in_segment
+            )
+            items.append(
+                ReasoningItem(
+                    _reasoning_text(item.get("content"), param=f"input[{index}].content"),
+                    starts_new_assistant_segment=starts_new_segment,
+                )
+            )
+            if starts_new_segment:
+                assistant_text_in_segment = False
+                assistant_tool_call_in_segment = False
             continue
         if item_type == "function_call":
             call_id = item.get("call_id")
@@ -289,6 +310,7 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
                 raise invalid_request("invalid_function_call", "Function call item is malformed.", f"input[{index}]")
             items.append(ToolCallItem(call_id, name, arguments, call_index))
             call_index += 1
+            assistant_tool_call_in_segment = True
             continue
         if item_type == "function_call_output":
             call_id = item.get("call_id")
@@ -305,6 +327,8 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
             else:
                 items.append(MultimodalToolResultItem(call_id, content))
             call_index = 0
+            assistant_text_in_segment = False
+            assistant_tool_call_in_segment = False
             continue
         raise invalid_request(
             "unsupported_input_item",
@@ -389,8 +413,10 @@ def _parse_tool_policy(body: dict[str, object]) -> ToolPolicy:
         raise invalid_request("invalid_tool_choice", "tool_choice is incompatible with declared tools.", "tool_choice") from exc
 
 
-def _parse_output_limit(body: dict[str, object], default_value: int | None) -> int:
+def _parse_output_limit(body: dict[str, object], default_value: int | None) -> int | None:
     value = body.get("max_output_tokens", default_value)
+    if value is None:
+        return None
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise invalid_request("invalid_max_output_tokens", "A positive max_output_tokens value is required.", "max_output_tokens")
     return value
@@ -496,6 +522,7 @@ class ParsedResponsesRequest:
             self.serving.structured_output,
             self.serving.seed,
             self.serving.sampling,
+            reasoning_budget=self.serving.reasoning_budget,
         )
 
 
@@ -529,6 +556,7 @@ class ResponsesRequestAdapter:
         items = (*instruction_items, *state_input_items)
         policy = _parse_tool_policy(body)
         reasoning = _parse_reasoning(body.get("reasoning"))
+        reasoning_budget = parse_reasoning_budget(body)
         output_limit = _parse_output_limit(body, self._default_output_limit)
         structured = _parse_structured_output(body.get("text"))
         sampling = parse_sampling(body, self._sampling_overrides)
@@ -547,6 +575,7 @@ class ResponsesRequestAdapter:
             structured,
             seed,
             sampling,
+            reasoning_budget=reasoning_budget,
         )
         return ParsedResponsesRequest(
             serving,
@@ -571,6 +600,7 @@ class ResponsesRequestAdapter:
         items = (*instruction_items, *state_input_items)
         policy = _parse_tool_policy(body)
         reasoning = _parse_reasoning(body.get("reasoning"))
+        reasoning_budget = parse_reasoning_budget(body)
         structured = _parse_structured_output(body.get("text"))
 
         serving = ServingRequest(
@@ -579,6 +609,7 @@ class ResponsesRequestAdapter:
             policy,
             1,
             structured,
+            reasoning_budget=reasoning_budget,
         )
         return ParsedResponsesRequest(
             serving,

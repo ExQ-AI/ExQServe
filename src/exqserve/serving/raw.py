@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Protocol, Self
 
@@ -90,9 +90,16 @@ def _safe_error(
 
 
 class RawServingEngine:
-    def __init__(self, tokenizer: RawPromptTokenizer, controller: RawRequestController) -> None:
+    def __init__(
+        self,
+        tokenizer: RawPromptTokenizer,
+        controller: RawRequestController,
+        *,
+        output_limit_resolver: Callable[[int, int | None], int] | None = None,
+    ) -> None:
         self._tokenizer = tokenizer
         self._controller = controller
+        self._output_limit_resolver = output_limit_resolver
 
     async def submit(self, request: RawServingRequest) -> RawServingSession:
         if not isinstance(request, RawServingRequest):
@@ -132,10 +139,24 @@ class RawServingEngine:
             _prompt_hash(input_ids),
             request.stop_conditions,
         )
+        max_output_tokens = request.max_output_tokens
+        if max_output_tokens is None:
+            if self._output_limit_resolver is None:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INTERNAL,
+                        "serving_internal_error",
+                        "Automatic output token resolution is unavailable.",
+                    )
+                )
+            try:
+                max_output_tokens = self._output_limit_resolver(len(input_ids), max_output_tokens)
+            except RequestRejected as exc:
+                raise ServingRejected(exc.error) from exc
         runtime_request = RuntimeGenerationRequest(
             request.input.request_id,
             input_ids,
-            request.max_output_tokens,
+            max_output_tokens,
             request.seed,
             request.stop_conditions,
             request.sampling,

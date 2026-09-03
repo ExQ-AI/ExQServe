@@ -83,7 +83,7 @@ def test_completions_stream_options_and_echo_are_parsed_explicitly() -> None:
     assert parsed.stream is True
     assert parsed.echo is True
     assert parsed.include_usage is True
-    assert parsed.raw.max_output_tokens == 16
+    assert parsed.raw.max_output_tokens is None
 
 
 @pytest.mark.parametrize(

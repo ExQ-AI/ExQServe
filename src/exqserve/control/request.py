@@ -54,6 +54,37 @@ class RequestControlConfig:
             if self.timeout_seconds <= 0:
                 raise ValueError("timeout_seconds must be positive")
 
+    def resolve_output_limit(self, prompt_tokens: int, requested: int | None) -> int:
+        if not isinstance(prompt_tokens, int) or isinstance(prompt_tokens, bool):
+            raise TypeError("prompt_tokens must be an integer")
+        if prompt_tokens < 0:
+            raise ValueError("prompt_tokens must be non-negative")
+        if requested is not None:
+            if not isinstance(requested, int) or isinstance(requested, bool):
+                raise TypeError("requested must be an integer or None")
+            if requested <= 0:
+                raise ValueError("requested must be positive or None")
+            return requested
+
+        candidates: list[int] = []
+        if self.max_total_tokens is not None:
+            candidates.append(self.max_total_tokens - prompt_tokens - 1)
+        if self.max_output_tokens is not None:
+            candidates.append(self.max_output_tokens)
+        if not candidates:
+            raise ValueError(
+                "automatic output token resolution requires max_total_tokens or max_output_tokens"
+            )
+        resolved = min(candidates)
+        if resolved <= 0:
+            raise _rejection(
+                ErrorCategory.CONTEXT_LENGTH,
+                "total_context_limit_exceeded",
+                "Prompt leaves no room for model output within the served context.",
+                retryable=False,
+            )
+        return resolved
+
 
 class RequestTerminalReason(str, Enum):
     COMPLETED = "completed"
@@ -78,7 +109,11 @@ class RequestInjectionNotFound(LookupError):
 
 
 class RequestInjectionConflict(RuntimeError):
-    """Raised when a known generation is already terminating."""
+    """Raised when text injection cannot be applied to a known generation."""
+
+
+class RequestInjectionTerminating(RequestInjectionConflict):
+    """Raised when text injection loses a race with generation termination."""
 
 
 class RuntimeSubmitter(Protocol):
@@ -177,11 +212,11 @@ class ControlledSession:
                 "Text injection is unavailable while a generation constraint is active."
             )
         if self._iteration_terminal or self._cancel_called or self._released:
-            raise RequestInjectionConflict("The requested generation is already terminating.")
+            raise RequestInjectionTerminating("The requested generation is already terminating.")
         try:
             self._runtime_session.inject_text(text)
         except RuntimeInjectionUnavailable as exc:
-            raise RequestInjectionConflict("The requested generation is already terminating.") from exc
+            raise RequestInjectionTerminating("The requested generation is already terminating.") from exc
 
     async def cancel(
         self,

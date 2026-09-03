@@ -35,6 +35,7 @@ def test_serving_request_is_immutable_and_contains_no_wire_stream_field() -> Non
     assert {field.name for field in fields(request)} == {
         "input",
         "reasoning",
+        "reasoning_budget",
         "tools",
         "structured_output",
         "max_output_tokens",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode
+from exqserve.agent.reasoning import ReasoningBudgetMode, ReasoningEffort, ReasoningMode
 from exqserve.agent.tools import ToolChoiceMode
 from exqserve.core.items import (
     ImageContentPart,
@@ -121,6 +121,39 @@ def test_responses_string_input_and_default_output_limit() -> None:
     assert parsed.serving.input.items == (MessageItem(MessageRole.USER, "hello"),)
     assert parsed.serving.max_output_tokens == 23
     assert parsed.stream is False
+
+    automatic = ResponsesRequestAdapter().parse(
+        {"model": "m", "input": "hello"},
+        request_id="r-auto",
+    )
+    assert automatic.serving.max_output_tokens is None
+
+
+def test_responses_retry_reasoning_marks_a_new_assistant_segment() -> None:
+    parsed = ResponsesRequestAdapter().parse(
+        {
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "first attempt"}],
+                },
+                {"type": "message", "role": "assistant", "content": "partial answer"},
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "retry"}],
+                },
+                {"type": "message", "role": "assistant", "content": "final answer"},
+            ],
+        },
+        request_id="retry-boundary",
+    )
+
+    assert parsed.serving.input.items[3] == ReasoningItem(
+        "retry",
+        starts_new_assistant_segment=True,
+    )
 
 
 def test_responses_input_token_count_parse_does_not_require_generation_limit() -> None:
@@ -317,3 +350,32 @@ def test_responses_rejects_invalid_strict_function_schema() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.code == "invalid_json_schema"
+
+
+def test_responses_reasoning_budget_uses_top_level_extension_and_preserves_reasoning_object() -> None:
+    parsed = ResponsesRequestAdapter().parse(
+        {
+            "model": "m",
+            "input": "hello",
+            "max_output_tokens": 32,
+            "reasoning": {"effort": "high"},
+            "reasoning_budget_tokens": 12,
+        },
+        request_id="responses-budget",
+    )
+    assert parsed.serving.reasoning.effort is ReasoningEffort.HIGH
+    assert parsed.serving.reasoning_budget.mode is ReasoningBudgetMode.EXPLICIT
+    assert parsed.serving.reasoning_budget.max_tokens == 12
+
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        ResponsesRequestAdapter().parse(
+            {
+                "model": "m",
+                "input": "hello",
+                "max_output_tokens": 32,
+                "reasoning_budget_tokens": 8,
+                "thinking_token_budget": 9,
+            },
+            request_id="responses-budget-conflict",
+        )
+    assert exc_info.value.code == "conflicting_reasoning_budget"

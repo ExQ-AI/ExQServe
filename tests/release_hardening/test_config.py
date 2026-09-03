@@ -18,11 +18,11 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.max_batch_size == 8
     assert config.max_chunk_size == 2048
     assert config.max_in_flight == 8
-    assert config.default_api_output_tokens == 4096
+    assert config.default_api_output_tokens is None
     assert config.response_store_max_records == 1024
     assert config.response_store_ttl_seconds == 3600.0
     assert config.response_store_max_bytes == 64 * 1024 * 1024
-    assert config.max_request_body_bytes == 16 * 1024 * 1024
+    assert config.max_request_body_bytes == 32 * 1024 * 1024
     assert config.max_injection_body_bytes == 64 * 1024
     assert config.vision_cache_mb == 256
     assert config.sysmem_kv_cache_mb == 0
@@ -328,3 +328,32 @@ def test_server_config_accepts_only_tool_constraint_enum_values(tmp_path: Path) 
     )
     with pytest.raises(TypeError, match="tool_constraint_mode"):
         ServerConfig(tmp_path, tool_constraint_mode="schema")  # type: ignore[arg-type]
+
+
+def test_server_config_reasoning_budget_default_normalizes_disable_and_validates(tmp_path: Path) -> None:
+    configured = ServerConfig(
+        tmp_path, reasoning_budget_tokens=128, reasoning_budget_message="answer now "
+    )
+    budget = configured.reasoning_budget_default()
+    assert budget.max_tokens == 128
+    assert budget.message == "answer now "
+
+    disabled = ServerConfig(tmp_path, reasoning_budget_tokens=-1)
+    assert disabled.reasoning_budget_tokens is None
+    assert disabled.reasoning_budget_default().max_tokens is None
+
+    with pytest.raises(ValueError, match="reasoning_budget_tokens"):
+        ServerConfig(tmp_path, reasoning_budget_tokens=-2)
+    with pytest.raises(TypeError, match="reasoning_budget_tokens"):
+        ServerConfig(tmp_path, reasoning_budget_tokens=True)  # type: ignore[arg-type]
+
+
+def test_anthropic_compatibility_profile_validation(tmp_path: Path) -> None:
+    assert (
+        ServerConfig(
+            tmp_path, anthropic_compatibility_profile="claude-code-2.1.251"
+        ).anthropic_compatibility_profile
+        == "claude-code-2.1.251"
+    )
+    with pytest.raises(ValueError, match="anthropic_compatibility_profile"):
+        ServerConfig(tmp_path, anthropic_compatibility_profile="claude-code-latest")

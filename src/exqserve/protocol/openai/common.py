@@ -6,7 +6,13 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 
-from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode, ReasoningPolicy
+from exqserve.agent.reasoning import (
+    ReasoningBudgetMode,
+    ReasoningBudgetOverride,
+    ReasoningEffort,
+    ReasoningMode,
+    ReasoningPolicy,
+)
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.sampling import SamplingOverridePolicy
 from exqserve.core.usage import TokenUsage
@@ -126,6 +132,61 @@ def responses_usage(usage: TokenUsage) -> dict[str, object]:
 
 def invalid_request(code: str, message: str, param: str | None = None) -> OpenAIProtocolError:
     return OpenAIProtocolError(400, "invalid_request_error", code, message, param)
+
+
+def parse_reasoning_budget(body: dict[str, object]) -> ReasoningBudgetOverride:
+    aliases = ("reasoning_budget_tokens", "thinking_token_budget")
+    supplied = [(name, body[name]) for name in aliases if name in body]
+    message_present = "reasoning_budget_message" in body
+    raw_message = body.get("reasoning_budget_message")
+    if message_present and not isinstance(raw_message, str):
+        raise invalid_request(
+            "invalid_reasoning_budget_message",
+            "reasoning_budget_message must be a string.",
+            "reasoning_budget_message",
+        )
+    message = raw_message if isinstance(raw_message, str) else None
+    if not supplied:
+        if message_present:
+            raise invalid_request(
+                "reasoning_budget_message_requires_budget",
+                "reasoning_budget_message requires an explicit reasoning budget.",
+                "reasoning_budget_message",
+            )
+        return ReasoningBudgetOverride()
+
+    parsed: list[tuple[str, int]] = []
+    for name, value in supplied:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise invalid_request(
+                "invalid_reasoning_budget",
+                f"{name} must be an integer.",
+                name,
+            )
+        if value < -1:
+            raise invalid_request(
+                "invalid_reasoning_budget",
+                f"{name} must be -1 or a non-negative integer.",
+                name,
+            )
+        parsed.append((name, value))
+    values = {value for _, value in parsed}
+    if len(values) != 1:
+        raise invalid_request(
+            "conflicting_reasoning_budget",
+            "Reasoning budget aliases must not contain conflicting values.",
+            parsed[-1][0],
+        )
+    value = parsed[0][1]
+    if value == -1:
+        if message_present:
+            raise invalid_request(
+                "reasoning_budget_message_with_disabled_budget",
+                "reasoning_budget_message cannot be used when the reasoning budget is disabled.",
+                "reasoning_budget_message",
+            )
+        return ReasoningBudgetOverride(ReasoningBudgetMode.DISABLE)
+    return ReasoningBudgetOverride(ReasoningBudgetMode.EXPLICIT, value, message)
 
 
 def parse_reasoning_effort(value: object, *, param: str) -> ReasoningPolicy:

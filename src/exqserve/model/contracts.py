@@ -365,6 +365,26 @@ class ToolGenerationConstraint:
         _validate_bool("eos_after_completed", self.eos_after_completed)
 
 
+@dataclass(frozen=True, slots=True)
+class ReasoningControlSpec:
+    close_sequence: str
+    initially_in_reasoning: bool
+
+    def __post_init__(self) -> None:
+        _validate_non_empty("close_sequence", self.close_sequence)
+        _validate_bool("initially_in_reasoning", self.initially_in_reasoning)
+
+
+@runtime_checkable
+class ReasoningControlProvider(Protocol):
+    def create_reasoning_control(
+        self,
+        reasoning_policy: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> ReasoningControlSpec | None:
+        ...
+
+
 @runtime_checkable
 class ToolConstraintProvider(Protocol):
     def create_tool_constraint(

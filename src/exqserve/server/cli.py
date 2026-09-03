@@ -72,11 +72,14 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "max_output_tokens": None,
     "max_total_tokens": None,
     "timeout_seconds": None,
-    "default_output_tokens": 4096,
+    "default_output_tokens": None,
+    "reasoning_budget_tokens": None,
+    "reasoning_budget_message": "",
+    "anthropic_compatibility_profile": None,
     "response_store_max_records": 1024,
     "response_store_ttl_seconds": 3600.0,
     "response_store_max_bytes": 64 * 1024 * 1024,
-    "max_request_body_bytes": 16 * 1024 * 1024,
+    "max_request_body_bytes": 32 * 1024 * 1024,
     "max_injection_body_bytes": 64 * 1024,
     "api_key": None,
     "api_key_file": None,
@@ -346,7 +349,23 @@ def _build_parser(
     parser.add_argument("--max-output-tokens", type=int)
     parser.add_argument("--max-total-tokens", type=int)
     parser.add_argument("--timeout-seconds", type=float)
-    parser.add_argument("--default-output-tokens", type=int)
+    parser.add_argument("--default-output-tokens", type=_default_output_tokens)
+    parser.add_argument(
+        "--reasoning-budget-tokens",
+        "--reasoning-budget",
+        dest="reasoning_budget_tokens",
+        type=int,
+        help="Default soft reasoning-token budget; -1 disables the server default.",
+    )
+    parser.add_argument(
+        "--reasoning-budget-message",
+        help="Optional text injected inside reasoning immediately before the forced close.",
+    )
+    parser.add_argument(
+        "--anthropic-compatibility-profile",
+        choices=("claude-code-2.1.251",),
+        help="Enable a version-pinned best-effort Anthropic client compatibility profile.",
+    )
     parser.add_argument("--response-store-max-records", type=int)
     parser.add_argument("--response-store-ttl-seconds", type=float)
     parser.add_argument("--response-store-max-bytes", type=int)
@@ -512,6 +531,29 @@ def _device_ids(value: str | None) -> tuple[int, ...] | None:
     return device_ids
 
 
+def _default_output_tokens(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    if isinstance(value, bool):
+        raise TypeError("default output tokens must be a positive integer or 'auto'")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                "default output tokens must be a positive integer or 'auto'"
+            ) from exc
+    else:
+        raise TypeError("default output tokens must be a positive integer or 'auto'")
+    if parsed <= 0:
+        raise ValueError("default output tokens must be a positive integer or 'auto'")
+    return parsed
+
+
 def _read_api_key_file(path: Path) -> list[str]:
     values = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not values:
@@ -556,6 +598,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
     if resolved["model_directory"] is None:
         parser.error("model_directory is required (or set model-directory in --config)")
     args = argparse.Namespace(**resolved)
+    args.default_output_tokens = _default_output_tokens(args.default_output_tokens)
 
     key_bits, value_bits = _cache_bits(args.kv_cache_bits)
     mtp_bits, _ = _cache_bits(args.mtp_cache_bits)
@@ -628,6 +671,9 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.moe_cpu_threads,
         args.tool_call_fanout_limit,
         args.constrained_parallel_tool_call_limit,
+        args.reasoning_budget_tokens,
+        args.reasoning_budget_message,
+        args.anthropic_compatibility_profile,
     )
 
 

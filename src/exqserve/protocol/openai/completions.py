@@ -47,9 +47,9 @@ def _parse_prompt(value: object) -> RawPromptItem:
     )
 
 
-def _positive_max_tokens(value: object) -> int:
+def _positive_max_tokens(value: object) -> int | None:
     if value is None:
-        return 16
+        return None
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise invalid_request("invalid_max_tokens", "max_tokens must be a positive integer.", "max_tokens")
     return value

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from typing import get_type_hints
 
-from exqserve.agent.reasoning import ReasoningPolicy
+from exqserve.agent.reasoning import ReasoningMode, ReasoningPolicy
 from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
-from exqserve.model.contracts import IncrementalParserLike, PromptCompilerLike
+from exqserve.model.contracts import (
+    IncrementalParserLike,
+    PromptCompilerLike,
+    ReasoningControlProvider,
+)
 from exqserve.model.deepseek_v4 import DeepSeekV4IncrementalParser, DeepSeekV4PromptCompiler
 from exqserve.model.gemma4 import Gemma4IncrementalParser, Gemma4PromptCompiler
 from exqserve.model.generic_hf import GenericHFIncrementalParser, GenericHFPromptCompiler
@@ -140,3 +144,26 @@ def test_default_registry_uses_generic_fallback_for_unknown_or_missing_architect
         assert dialect.dialect_id == "generic-hf"
         assert isinstance(dialect.create_compiler(_Adapter()), GenericHFPromptCompiler)
         assert isinstance(dialect.create_parser("req-1", ReasoningPolicy(), _TOOL_POLICY), GenericHFIncrementalParser)
+
+
+def test_builtin_reasoning_control_capabilities_keep_v1_fallback_conservative() -> None:
+    enabled = ReasoningPolicy(ReasoningMode.ENABLED)
+    default = ReasoningPolicy()
+
+    qwen = QwenDialect()
+    assert isinstance(qwen, ReasoningControlProvider)
+    qwen_control = qwen.create_reasoning_control(default, _TOOL_POLICY)
+    assert qwen_control is not None
+    assert qwen_control.close_sequence == "</think>"
+    assert qwen_control.initially_in_reasoning is True
+
+    gemma = Gemma4Dialect()
+    assert isinstance(gemma, ReasoningControlProvider)
+    gemma_default = gemma.create_reasoning_control(default, _TOOL_POLICY)
+    gemma_enabled = gemma.create_reasoning_control(enabled, _TOOL_POLICY)
+    assert gemma_default is not None and gemma_default.initially_in_reasoning is False
+    assert gemma_enabled is not None and gemma_enabled.initially_in_reasoning is True
+    assert gemma_enabled.close_sequence == "<channel|>"
+
+    assert not isinstance(MuseGlimmerDialect(), ReasoningControlProvider)
+    assert not isinstance(GenericHFDialect(), ReasoningControlProvider)

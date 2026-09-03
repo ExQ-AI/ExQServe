@@ -21,6 +21,8 @@ from exqserve.plugin_api import (
     MessageRole,
     ModelCapabilities,
     ModelDialectPluginRegistration,
+    ReasoningControlProvider,
+    ReasoningControlSpec,
     ReasoningPolicy,
     RenderedPrompt,
     StrictToolConstraintProvider,
@@ -128,6 +130,17 @@ class _Dialect:
 
 
 @dataclass(frozen=True)
+class _ReasoningDialect(_Dialect):
+    def create_reasoning_control(
+        self,
+        reasoning_policy: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> ReasoningControlSpec | None:
+        del reasoning_policy, tool_policy
+        return ReasoningControlSpec("</think>", True)
+
+
+@dataclass(frozen=True)
 class _ConstrainedDialect(_Dialect):
     def create_tool_constraint(
         self,
@@ -192,6 +205,16 @@ def test_tool_constraint_provider_is_additive_to_plugin_api_v1() -> None:
     assert not isinstance(dialect, StrictToolConstraintProvider)
     constraint = dialect.create_tool_constraint(_POLICY, ToolConstraintMode.FORMAT)
     assert constraint == ToolGenerationConstraint("<tool>", 'start: "ok"', False)
+
+
+def test_reasoning_control_provider_is_additive_to_plugin_api_v1() -> None:
+    assert MODEL_DIALECT_PLUGIN_API_VERSION == 1
+    assert not isinstance(_Dialect(), ReasoningControlProvider)
+    dialect = _ReasoningDialect()
+    assert isinstance(dialect, ReasoningControlProvider)
+    assert dialect.create_reasoning_control(ReasoningPolicy(), _POLICY) == ReasoningControlSpec(
+        "</think>", True
+    )
 
 
 def test_plugin_entry_point_discovery_and_explicit_selection() -> None:

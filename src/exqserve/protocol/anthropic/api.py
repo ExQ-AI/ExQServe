@@ -174,14 +174,17 @@ def create_anthropic_router(
     engine: TokenCountingServingEngineLike,
     *,
     served_model: ServedModelSource | None = None,
-    max_request_body_bytes: int = 16 * 1024 * 1024,
+    max_request_body_bytes: int = 32 * 1024 * 1024,
     adapter: AnthropicMessagesRequestAdapter | None = None,
+    compatibility_profile: str | None = None,
 ) -> APIRouter:
     if not isinstance(max_request_body_bytes, int) or isinstance(max_request_body_bytes, bool):
         raise TypeError("max_request_body_bytes must be an integer")
     if max_request_body_bytes <= 0:
         raise ValueError("max_request_body_bytes must be positive")
-    codec = adapter or AnthropicMessagesRequestAdapter()
+    if adapter is not None and compatibility_profile is not None:
+        raise ValueError("adapter and compatibility_profile cannot be combined")
+    codec = adapter or AnthropicMessagesRequestAdapter(compatibility_profile)
     router = APIRouter()
 
     @router.post("/v1/messages/count_tokens")
@@ -231,7 +234,8 @@ def create_anthropic_app(
     engine: TokenCountingServingEngineLike,
     *,
     served_model: ServedModelSource | None = None,
-    max_request_body_bytes: int = 16 * 1024 * 1024,
+    max_request_body_bytes: int = 32 * 1024 * 1024,
+    compatibility_profile: str | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.include_router(
@@ -239,6 +243,7 @@ def create_anthropic_app(
             engine,
             served_model=served_model,
             max_request_body_bytes=max_request_body_bytes,
+            compatibility_profile=compatibility_profile,
         )
     )
     return app

@@ -18,6 +18,8 @@ from exqserve.agent.tools import ToolPolicy
 from exqserve.control.request import RequestController
 from exqserve.core.model import ServedModelInfo
 from exqserve.model.contracts import (
+    ReasoningControlProvider,
+    ReasoningControlSpec,
     StrictToolConstraintProvider,
     ToolConstraintMode,
     ToolConstraintProvider,
@@ -182,10 +184,8 @@ def _build_model_bundle(
         int(time.time()),
         config.effective_context_length(runtime_object.model_metadata.max_context_tokens),
     )
-    controller = RequestController(
-        runtime_object,
-        config.request_control_config(runtime_object.model_metadata.max_context_tokens),
-    )
+    request_control = config.request_control_config(runtime_object.model_metadata.max_context_tokens)
+    controller = RequestController(runtime_object, request_control)
     template_adapter = RuntimeTemplateAdapter(runtime_object)
     dialect = default_model_dialect_registry().resolve(
         runtime_object.model_metadata.architecture,
@@ -224,6 +224,20 @@ def _build_model_bundle(
     ) -> IncrementalParserLike:
         return _dialect_parser(dialect, request_id, reasoning, tool_policy)
 
+    reasoning_control_factory: Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None] | None = None
+    if isinstance(dialect, ReasoningControlProvider):
+        reasoning_provider = dialect
+
+        def create_reasoning_control(
+            reasoning: ReasoningPolicy, tool_policy: ToolPolicy
+        ) -> ReasoningControlSpec | None:
+            return reasoning_provider.create_reasoning_control(reasoning, tool_policy)
+
+        reasoning_control_factory = create_reasoning_control
+
+    def tokenize_reasoning_control(text: str) -> tuple[int, ...]:
+        return runtime_object.tokenize_encoded_prompt(text).input_ids
+
     engine = ServingEngine(
         compiler,
         parser_factory,
@@ -231,8 +245,16 @@ def _build_model_bundle(
         tool_constraint_factory,
         tool_options.fanout_limit,
         tool_options.constrained_parallel_limit,
+        request_control.resolve_output_limit,
+        reasoning_control_factory,
+        tokenize_reasoning_control,
+        config.reasoning_budget_default(),
     )
-    raw_engine = RawServingEngine(runtime_object, cast(RawRequestController, controller))
+    raw_engine = RawServingEngine(
+        runtime_object,
+        cast(RawRequestController, controller),
+        output_limit_resolver=request_control.resolve_output_limit,
+    )
     observed = ObservedServingEngine(engine, metrics, capture=capture)
     observed_raw = ObservedRawServingEngine(raw_engine, metrics, capture=capture)
     return ActiveModelBundle(
@@ -325,6 +347,7 @@ def compose_server(
             model_manager,
             served_model=model_manager.current_model,
             max_request_body_bytes=config.max_request_body_bytes,
+            compatibility_profile=config.anthropic_compatibility_profile,
         )
     )
     app.include_router(

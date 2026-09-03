@@ -77,10 +77,13 @@ class MultimodalMessageItem:
 @dataclass(frozen=True, slots=True)
 class ReasoningItem:
     text: str
+    starts_new_assistant_segment: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str):
             raise TypeError("text must be a string")
+        if not isinstance(self.starts_new_assistant_segment, bool):
+            raise TypeError("starts_new_assistant_segment must be a bool")
 
 
 @dataclass(frozen=True, slots=True)
