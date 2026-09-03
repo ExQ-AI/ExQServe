@@ -8,7 +8,11 @@ ExQServe is the serving/API layer; ExLlamaV3 provides the inference backend.
 
 ## Why ExQServe?
 
-ExQServe focuses on Agent-facing serving semantics rather than treating every model family as the same chat template. It preserves model-native reasoning and Tool Calling protocols behind OpenAI- and Anthropic-compatible APIs. LLGuidance-backed constrained decoding can enforce tool-call formats and schemas during generation.
+ExQServe handles Agent-facing serving semantics across model families while preserving model-native reasoning and Tool Calling protocols behind OpenAI- and Anthropic-compatible APIs.
+
+For Tool Calling, schema and boundary handling can be enforced during generation. LLGuidance-backed constrained decoding is combined with Tool Call validation and atomic commit of parallel calls, so malformed or incomplete calls are rejected before they reach the next Agent turn.
+
+Runtime and protocol failures are surfaced with explicit recovery, retryability, and restart states. When recovery is safe, a failed ExLlamaV3 generator is quarantined and rebuilt.
 
 ## Features
 
@@ -16,10 +20,10 @@ ExQServe focuses on Agent-facing serving semantics rather than treating every mo
 - Agent workflows with reasoning, tool calling, parallel tool calls, OpenAI `strict:true` function tools, LLGuidance-backed constrained decoding, Structured Outputs, streaming, cancellation, and continuation
 - Model-native Agent adaptations for the Qwen3.5 architecture family, Gemma 4, Muse Glimmer, DeepSeek V4, and GLM-5, plus a conservative Generic HF fallback
 - Pluggable model-dialect API for extending model-native reasoning and Tool Calling protocols
-- Runtime recovery and request-lifecycle hardening, including safe ExLlamaV3 generator rebuilds after recoverable backend failures
-- Automatic output-budget resolution, soft Reasoning Budget controls, and an optional Claude Code Anthropic compatibility profile
-- Long-context and runtime controls including quantized KV cache, system-memory KV/recurrent caches, MTP, n-gram drafting, external draft models, MoE CPU offload, ExLlamaV3 offload controls, CUDA device selection, and tensor parallelism
-- Serving observability and renderer concurrency controls for long-running Agent workloads
+- Generation guarantees with fail-closed Tool Call validation, atomic constrained-parallel batches, protocol-aware output boundaries, and explicit terminal semantics
+- Agent-oriented failure and recovery semantics, including context-capacity normalization, protocol-visible recovery facts, and safe ExLlamaV3 generator recovery
+- Soft Reasoning Budget handling, automatic output-limit resolution, and an optional Claude Code compatibility profile with model-aware mid-conversation system handling and cache-local prompts
+- Long-context and ExLlamaV3 runtime controls including quantized KV cache, system-memory KV/recurrent caches, MTP, n-gram drafting, external draft models, MoE CPU offload/expert splitting, vision offload, CUDA device selection, and tensor parallelism
 - Model switching, PEFT LoRA, YAML configuration, Prometheus metrics, and optional API-key authentication
 
 ## Model support
@@ -35,13 +39,19 @@ ExQServe focuses on Agent-facing serving semantics rather than treating every mo
 
 Adapted families preserve their model-native reasoning and tool protocols. Vision has been validated on Qwen3.8, Gemma 4, and Muse Glimmer; Generic HF can preserve multimodal input when the backend exposes a compatible vision component. Image input is opt-in with `--vision`, and unsupported model/backend combinations fail explicitly instead of silently falling back to text mode.
 
-## Roadmap
+## Agent workload validation
 
-ExQServe is under active development. Current priorities include:
+ExQServe is tested with real Agent clients and long-running Tool Calling workloads in addition to protocol and unit tests.
 
-- [x] Pluggable model dialects for easier model-native Agent protocol extensions
-- [x] LLGuidance-backed constrained decoding for Tool Calling and Structured Outputs
-- [ ] Broader model-family adaptations
+Release validation covers:
+
+- multi-turn, parallel, named, required, and `strict:true` Tool Calling with tool-result continuation
+- constrained generation, Structured Outputs, malformed/incomplete model-output boundaries, and fail-closed Tool Call handling
+- long-context continuation, cache-local prompt handling, automatic output budgeting, and soft reasoning budgets
+- request cancellation, context-capacity rejection, terminal-state serialization, and protocol-visible failure/recovery facts
+- backend generator failure, safe recovery, and restart-required behavior when runtime state cannot be reused safely
+
+Release-specific workload results are published with the corresponding release instead of being kept here as permanent benchmarks.
 
 ## Installation
 
@@ -174,8 +184,10 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--tool-constraint-mode` | Generation-time tool constraints: `off`, `format`, or `schema` |
 | `--max-tool-calls-per-generation` | Limit protocol-visible tool calls in one assistant generation |
 | `--max-constrained-parallel-tool-calls` | Limit one atomic constrained-parallel tool batch |
+| `--anthropic-compatibility-profile` | Optional best-effort Anthropic client profile; use `claude-code` for Claude Code-style workloads |
 | `--chat-template` | Override the model's HF chat template with a UTF-8 Jinja file |
 | `--vision` | Load the model's vision component and accept image input; fails clearly if the selected model/backend cannot provide it |
+| `--vision-offload` | Keep the ExLlamaV3 vision component in pinned host memory to reduce VRAM use |
 | `--allow-remote-images` | Allow HTTP(S) image URLs; data-image URLs only require `--vision` |
 | `--vision-cache-mb` | CPU budget for cached vision embeddings (default 256 MiB; `0` disables retention) |
 | `--max-injection-body-bytes` | Maximum JSON body size for output injection (default 64 KiB) |
@@ -183,6 +195,13 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--kv-cache-bits` | KV-cache precision |
 | `--sysmem-kv-cache-mb` | Pinned system-memory budget for ExLlamaV3's second-tier K/V page cache |
 | `--sysmem-recurrent-cache-mb` | System-memory budget for ExLlamaV3 recurrent-state checkpoints |
+| `--max-in-flight` | Maximum concurrently admitted requests |
+| `--max-prompt-tokens` | Optional server-side prompt-token limit |
+| `--max-output-tokens` | Optional server-side output-token limit |
+| `--max-total-tokens` | Optional server-side prompt + output token limit |
+| `--default-output-tokens` | Default API output limit; `auto`/unset lets the serving layer resolve the available output budget |
+| `--reasoning-budget-tokens` | Default soft reasoning-token budget; `-1` disables the server default |
+| `--reasoning-budget-message` | Optional text inserted inside reasoning immediately before a budget-forced close |
 | `--max-batch-size` | Maximum batch size |
 | `--max-chunk-size` | Prefill chunk size |
 | `--mtp` | Enable MTP speculative decoding |
@@ -194,9 +213,12 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--ngram-draft-tokens` | Maximum speculative tokens proposed by n-gram drafting |
 | `--draft-model` | External draft model |
 | `--moe-cpu-offload-layers` | Run the first N eligible block-sparse MoE layers on CPU |
+| `--moe-cpu-split-experts` | Keep N routed experts per eligible MoE layer on CPU through ExLlamaV3 split mode |
+| `--draft-moe-cpu-offload-layers` | Run the first N eligible draft/MTP MoE layers on CPU |
 | `--moe-cpu-threads` | Worker-thread count for ExLlamaV3 MoE CPU offload |
 | `--device-ids` | Process-visible CUDA device allowlist, e.g. `0,1` |
 | `--tensor-parallel` | Enable ExLlamaV3 tensor parallelism |
+| `--tp-backend` | Select the ExLlamaV3 tensor-parallel communication backend: `native` or `nccl` |
 | `--lora` | Load a PEFT LoRA adapter |
 | `--sampler-preset` | Load a sampler preset YAML |
 

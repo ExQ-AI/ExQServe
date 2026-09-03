@@ -31,7 +31,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN python -m pip install --no-cache-dir . \
-    && python -c "import torch; import exllamav3_ext, fastapi, huggingface_hub, jsonschema, uvicorn; import exllamav3, exqserve; from importlib.metadata import version; assert version('exllamav3').startswith('1.4.4+cu128.torch2.11.0'); assert version('exqserve') == '0.4.0'; assert torch.__version__.startswith('2.11.0')"
+    && python -c "import torch; import exllamav3_ext, fastapi, huggingface_hub, jsonschema, uvicorn; import exllamav3, exqserve; from importlib.metadata import version; assert version('exllamav3').startswith('1.4.4+cu128.torch2.11.0'); assert version('exqserve') == '0.5.0'; assert torch.__version__.startswith('2.11.0')"
 
 EXPOSE 8000
 

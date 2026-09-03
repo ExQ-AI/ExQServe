@@ -8,7 +8,11 @@ ExQServe 是服务/API 层，ExLlamaV3 提供底层推理后端。
 
 ## 为什么选择 ExQServe？
 
-ExQServe 重点处理 Agent 场景的服务语义，而不是把不同模型都当成同一种 chat template。它在兼容 OpenAI 和 Anthropic 的 API 后保留各模型原生的思考与工具调用协议，并通过基于 LLGuidance 的 Constrained Decoding 在生成阶段约束工具调用格式和参数 Schema。
+ExQServe 面向 Agent 场景处理不同模型族的服务语义，同时通过 OpenAI / Anthropic 兼容 API 保留模型原生的思考和工具调用协议。
+
+在 Tool Calling 上，ExQServe 可以在生成阶段约束 Schema 和调用边界。LLGuidance Constrained Decoding 与 Tool Call 校验、并行调用原子提交结合，格式错误或不完整的调用会在进入下一轮 Agent 对话前被拒绝。
+
+运行时和协议故障会带有明确的恢复、重试和重启状态。条件允许时，失败的 ExLlamaV3 Generator 会被隔离并重建。
 
 ## 主要功能
 
@@ -16,10 +20,10 @@ ExQServe 重点处理 Agent 场景的服务语义，而不是把不同模型都�
 - 面向 Agent 场景支持思考内容与最终回答分离、工具调用、并行工具调用、OpenAI `strict:true` Function Tools、基于 LLGuidance 的 Constrained Decoding、Structured Outputs、流式响应、请求取消和连续调用
 - 已针对 Qwen3.5 架构系列、Gemma 4、Muse Glimmer、DeepSeek V4 和 GLM-5 实现模型原生 Agent 适配；其他兼容 Hugging Face 模型可走保守的通用兼容路径
 - 提供可插拔的 Model Dialect API，用于扩展模型原生的思考与工具调用协议
-- 提供运行时恢复与请求生命周期加固；对于可安全恢复的后端故障，可重建 ExLlamaV3 Generator
-- 支持自动 Output Budget、Soft Reasoning Budget，以及可选的 Claude Code Anthropic 兼容 Profile
-- 支持长上下文和运行时控制，包括量化 KV Cache、系统内存 KV/Recurrent Cache、MTP、n-gram drafting、外部 draft model、MoE CPU offload、ExLlamaV3 offload controls、CUDA 设备选择和 Tensor Parallel
-- 提供服务可观测性和 Renderer 并发控制，面向长时间 Agent 工作负载
+- 提供 Generation Guarantees，包括 fail-closed Tool Call 校验、受约束并行 Tool Call 的原子批次提交、协议感知输出边界和明确终止语义
+- 提供面向 Agent 的失败与恢复语义，包括上下文容量错误归一化、协议可见的恢复信息，以及安全条件下的 ExLlamaV3 Generator Recovery
+- 支持 Soft Reasoning Budget、自动 Output Budget，以及可选的 Claude Code 兼容 Profile；对话中途的 system 内容会按模型能力处理，并尽量保持 Prefix Cache 局部性
+- 支持长上下文和 ExLlamaV3 运行时控制，包括量化 KV Cache、系统内存 KV/Recurrent Cache、MTP、n-gram drafting、外部 draft model、MoE CPU offload/专家拆分、Vision Offload、CUDA 设备选择和 Tensor Parallel
 - 支持模型切换、PEFT LoRA、YAML 配置、Prometheus Metrics 和可选 API Key
 
 ## 模型支持
@@ -35,13 +39,19 @@ ExQServe 重点处理 Agent 场景的服务语义，而不是把不同模型都�
 
 已适配系列会保留各自的思考与工具调用格式。Qwen3.8、Gemma 4 和 Muse Glimmer 已验证图片输入；其他 Hugging Face 模型在后端提供兼容视觉组件时也可以保留多模态输入。图片能力需要显式开启 `--vision`，不支持的模型或后端会直接报错，不会静默退回纯文本模式。
 
-## 开发计划
+## Agent 工作负载验证
 
-ExQServe 仍在持续开发中，目前主要关注：
+除协议测试和单元测试外，ExQServe 也会使用真实 Agent 客户端和长时间 Tool Calling 工作负载进行验证。
 
-- [x] Dialect 插件系统，降低模型原生 Agent 协议的扩展与维护成本
-- [x] 基于 LLGuidance 的 Constrained Decoding，用于 Tool Calling 与 Structured Outputs
-- [ ] 更多模型系列适配
+Release 验证覆盖：
+
+- 多轮、并行、named、required 和 `strict:true` Tool Calling，以及工具结果回传后的继续生成
+- Constrained Generation、Structured Outputs、模型输出不完整/格式异常边界，以及 fail-closed Tool Call 处理
+- 长上下文继续生成、Cache-local Prompt 处理、自动 Output Budget 和 Soft Reasoning Budget
+- 请求取消、上下文容量拒绝、终止状态序列化，以及协议可见的失败/恢复信息
+- 后端 Generator 故障、安全恢复，以及运行时状态无法安全复用时的 restart-required 行为
+
+每个版本的工作负载结果会随对应 Release 一起发布，不在 README 中长期固定为 Benchmark。
 
 ## 安装
 
@@ -174,8 +184,10 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--tool-constraint-mode` | 生成阶段工具约束：`off`、`format` 或 `schema` |
 | `--max-tool-calls-per-generation` | 限制一次 assistant 生成中对外可见的工具调用数量 |
 | `--max-constrained-parallel-tool-calls` | 限制一次原子化受约束并行工具调用批次的大小 |
+| `--anthropic-compatibility-profile` | 可选的 Anthropic 客户端兼容 Profile；Claude Code 风格工作负载可使用 `claude-code` |
 | `--chat-template` | 使用 UTF-8 Jinja 文件覆盖模型自带的 HF chat template |
 | `--vision` | 加载模型的视觉组件并接受图片输入；模型或后端不支持时会直接报错 |
+| `--vision-offload` | 将 ExLlamaV3 Vision 组件保留在 pinned host memory，以降低显存占用 |
 | `--allow-remote-images` | 允许 HTTP(S) 图片地址；data URL 只需要开启 `--vision` |
 | `--vision-cache-mb` | 图片 embedding 的 CPU 缓存上限，默认 256 MiB；设为 `0` 可关闭缓存 |
 | `--max-injection-body-bytes` | 生成中注入接口的 JSON body 上限，默认 64 KiB |
@@ -183,6 +195,13 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--kv-cache-bits` | KV Cache 精度 |
 | `--sysmem-kv-cache-mb` | ExLlamaV3 二级 K/V page cache 使用的 pinned 系统内存预算 |
 | `--sysmem-recurrent-cache-mb` | ExLlamaV3 recurrent-state checkpoint 的系统内存预算 |
+| `--max-in-flight` | 同时允许进入服务层的最大请求数 |
+| `--max-prompt-tokens` | 可选的服务端 Prompt Token 上限 |
+| `--max-output-tokens` | 可选的服务端 Output Token 上限 |
+| `--max-total-tokens` | 可选的服务端 Prompt + Output 总 Token 上限 |
+| `--default-output-tokens` | API 默认输出上限；`auto`/未设置时由服务层根据可用容量自动解析 Output Budget |
+| `--reasoning-budget-tokens` | 默认 Soft Reasoning Token Budget；`-1` 关闭服务端默认值 |
+| `--reasoning-budget-message` | Reasoning Budget 强制收束前，可选插入到 reasoning 内的提示文本 |
 | `--max-batch-size` | 最大 batch size |
 | `--max-chunk-size` | Prefill chunk size |
 | `--mtp` | 开启 MTP 投机解码 |
@@ -194,9 +213,12 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--ngram-draft-tokens` | n-gram drafting 每次最多提出的 speculative token 数 |
 | `--draft-model` | 外部 draft model |
 | `--moe-cpu-offload-layers` | 将前 N 个符合条件的 block-sparse MoE 层交给 CPU 执行 |
+| `--moe-cpu-split-experts` | 通过 ExLlamaV3 split mode 将每个符合条件的 MoE 层中的 N 个 routed experts 保留在 CPU |
+| `--draft-moe-cpu-offload-layers` | 将前 N 个符合条件的 draft/MTP MoE 层交给 CPU 执行 |
 | `--moe-cpu-threads` | ExLlamaV3 MoE CPU offload 的工作线程数 |
 | `--device-ids` | 当前进程可见的 CUDA 设备，例如 `0,1` |
 | `--tensor-parallel` | 开启 ExLlamaV3 Tensor Parallel |
+| `--tp-backend` | 选择 ExLlamaV3 Tensor Parallel 通信后端：`native` 或 `nccl` |
 | `--lora` | 加载 PEFT LoRA |
 | `--sampler-preset` | 加载 sampler preset YAML |
 
