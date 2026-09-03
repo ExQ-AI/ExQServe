@@ -164,15 +164,16 @@ def test_muse_glimmer_multimodal_user_content_uses_shared_hf_contract() -> None:
     )
 
 
-def test_muse_glimmer_compile_sets_native_stop_conditions() -> None:
+def test_muse_glimmer_compile_uses_configured_native_eot_stop() -> None:
     compiler = MuseGlimmerPromptCompiler(_FakeTemplateAdapter((1, 2, 3)))
+    compiler.configure_native_eot_stop(200008)
     compiled = compiler.compile(
         _request(MessageItem(MessageRole.USER, "hello")),
         ReasoningPolicy(),
         _policy(),
     )
 
-    assert compiled.stop_conditions == ("<|eot|>", "<|end_of_text|>")
+    assert compiled.stop_conditions == (200008, "<|end_of_text|>")
     assert compiled.raw_output_is_text_only is False
     assert compiled.structured_output_trigger is None
     assert len(compiled.prompt_hash) == 64

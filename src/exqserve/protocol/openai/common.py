@@ -13,7 +13,7 @@ from exqserve.agent.reasoning import (
     ReasoningMode,
     ReasoningPolicy,
 )
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, public_error_code
 from exqserve.core.sampling import SamplingOverridePolicy
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import RuntimeSamplingConfig
@@ -54,6 +54,7 @@ class OpenAIProtocolError(Exception):
         code: str,
         message: str,
         param: str | None = None,
+        exqserve_cause: str | None = None,
     ) -> None:
         if not isinstance(status_code, int) or isinstance(status_code, bool):
             raise TypeError("status_code must be an integer")
@@ -64,36 +65,64 @@ class OpenAIProtocolError(Exception):
                 raise ValueError(f"{name} must be a non-empty string")
         if param is not None and not isinstance(param, str):
             raise TypeError("param must be a string or None")
+        if exqserve_cause is not None and (
+            not isinstance(exqserve_cause, str) or not exqserve_cause.strip()
+        ):
+            raise ValueError("exqserve_cause must be a non-empty string or None")
         self.status_code = status_code
         self.type = type
         self.code = code
         self.message = message
         self.param = param
+        self.exqserve_cause = exqserve_cause
         super().__init__(message)
 
-    def to_body(self) -> dict[str, object]:
-        return {
-            "error": {
-                "message": self.message,
-                "type": self.type,
-                "param": self.param,
-                "code": self.code,
-            }
+    def to_error_object(self, *, include_param: bool = True) -> dict[str, object]:
+        error: dict[str, object] = {
+            "message": self.message,
+            "type": self.type,
+            "code": self.code,
         }
+        if include_param:
+            error["param"] = self.param
+        if self.exqserve_cause is not None:
+            error["exqserve_cause"] = self.exqserve_cause
+        return error
+
+    def to_body(self) -> dict[str, object]:
+        return {"error": self.to_error_object()}
 
 
 def map_canonical_error(error: CanonicalError) -> OpenAIProtocolError:
     if not isinstance(error, CanonicalError):
         raise TypeError("error must be a CanonicalError")
+    cause = None if error.cause is None else error.cause.value
+    fact_code = public_error_code(error)
+    wire_code = fact_code or error.code
     if error.category is ErrorCategory.OVERLOADED:
-        return OpenAIProtocolError(429, "rate_limit_error", error.code, error.message)
+        status = 503 if error.code == "runtime_recovering" else 429
+        return OpenAIProtocolError(status, "rate_limit_error", wire_code, error.message, None, cause)
+    if error.category is ErrorCategory.CONTEXT_LENGTH:
+        return OpenAIProtocolError(
+            400,
+            "invalid_request_error",
+            wire_code,
+            "Request exceeds the model context window.",
+            None,
+            cause,
+        )
     if error.category in {
         ErrorCategory.INVALID_REQUEST,
         ErrorCategory.UNSUPPORTED_CAPABILITY,
-        ErrorCategory.CONTEXT_LENGTH,
     }:
-        return OpenAIProtocolError(400, "invalid_request_error", error.code, error.message)
-    return OpenAIProtocolError(500, "server_error", error.code, error.message)
+        return OpenAIProtocolError(400, "invalid_request_error", wire_code, error.message, None, cause)
+    return OpenAIProtocolError(500, "server_error", wire_code, error.message, None, cause)
+
+
+def map_stream_canonical_error(error: CanonicalError) -> OpenAIProtocolError:
+    """Map an HTTP-200 stream failure without client-specific message encoding."""
+
+    return map_canonical_error(error)
 
 
 def _usage_counts(usage: TokenUsage) -> tuple[int, int, int]:

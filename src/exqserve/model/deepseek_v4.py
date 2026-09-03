@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from exqserve.agent._json import (
     InvalidJsonError,
@@ -40,10 +40,12 @@ from exqserve.model.contracts import (
     ChatTemplateAdapter,
     CompiledPrompt,
     ModelCapabilities,
+    ParserTerminalIssue,
     TemplateMessage,
     TemplateRequest,
     TemplateTool,
     TemplateToolCall,
+    incomplete_tool_terminal_issue,
 )
 
 DEEPSEEK_V4_CAPABILITIES = ModelCapabilities(
@@ -480,6 +482,10 @@ class DeepSeekV4ParserFinish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool
 
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
+
 
 def _deterministic_call_id(request_id: str, index: int) -> str:
     digest = hashlib.sha256(f"{request_id}\0deepseek-v4\0{index}".encode()).hexdigest()
@@ -520,6 +526,210 @@ def _unwrap_wrapper_arguments(
         if isinstance(inner, dict) and set(inner).issubset(properties):
             return inner
     return arguments
+
+
+def _find_json_parameter_close(source: str, start: int) -> int:
+    """Find a DSML parameter close outside JSON string literals."""
+
+    cursor = start
+    in_string = False
+    escaped = False
+    while cursor < len(source):
+        if not in_string and source.startswith(_PARAMETER_CLOSE, cursor):
+            return cursor
+
+        char = source[cursor]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        cursor += 1
+    return -1
+
+
+@dataclass(slots=True)
+class _DirectJsonScanState:
+    payload_start: int | None = None
+    cursor: int = 0
+    stack: list[str] = field(default_factory=list)
+    in_string: bool = False
+    escaped: bool = False
+    payload_end: int | None = None
+
+    def reset(self) -> None:
+        self.payload_start = None
+        self.cursor = 0
+        self.stack.clear()
+        self.in_string = False
+        self.escaped = False
+        self.payload_end = None
+
+
+def _find_json_object_end(
+    source: str,
+    start: int,
+    state: _DirectJsonScanState | None = None,
+) -> int:
+    """Return one JSON object's end, incrementally when a scan state is supplied."""
+
+    if start >= len(source) or source[start] != "{":
+        return -1
+    if state is None:
+        state = _DirectJsonScanState()
+    if state.payload_start != start:
+        state.reset()
+        state.payload_start = start
+        state.cursor = start
+    if state.payload_end is not None:
+        return state.payload_end
+
+    cursor = state.cursor
+    while cursor < len(source):
+        char = source[cursor]
+        if state.in_string:
+            if state.escaped:
+                state.escaped = False
+            elif char == "\\":
+                state.escaped = True
+            elif char == '"':
+                state.in_string = False
+            cursor += 1
+            state.cursor = cursor
+            continue
+        if char == '"':
+            state.in_string = True
+        elif char in "{[":
+            state.stack.append(char)
+        elif char in "}]":
+            if not state.stack:
+                state.payload_end = cursor + 1
+                state.cursor = state.payload_end
+                return state.payload_end
+            expected = "{" if char == "}" else "["
+            if state.stack[-1] != expected:
+                state.payload_end = cursor + 1
+                state.cursor = state.payload_end
+                return state.payload_end
+            state.stack.pop()
+            if not state.stack:
+                state.payload_end = cursor + 1
+                state.cursor = state.payload_end
+                return state.payload_end
+        cursor += 1
+        state.cursor = cursor
+    return -1
+
+
+def _direct_json_payload_span(
+    source: str,
+    invoke_at: int,
+    state: _DirectJsonScanState | None = None,
+) -> tuple[int, int] | None:
+    """Return the direct-JSON payload span for an invoke, if this is that variant."""
+
+    name_start = invoke_at + len(_INVOKE_OPEN_PREFIX)
+    name_end = source.find('\">', name_start)
+    if name_end < 0:
+        return None
+    payload_start = name_end + 2
+    while payload_start < len(source) and source[payload_start].isspace():
+        payload_start += 1
+    if payload_start >= len(source) or source[payload_start] != "{":
+        return None
+    return payload_start, _find_json_object_end(source, payload_start, state)
+
+
+def _find_dsml_close_outside_json_parameters(
+    source: str,
+    marker: str,
+    start: int = 0,
+    *,
+    direct_json_state: _DirectJsonScanState | None = None,
+) -> int:
+    """Find an outer DSML close while protecting JSON string literals.
+
+    Protection covers both ``string=false`` parameter payloads and the already-supported
+    direct-JSON invoke variant. DeepSeek's native ``string=true`` representation remains
+    raw and has no escaping convention for DSML delimiters, so markers inside raw values
+    intentionally retain the protocol's existing first-delimiter behavior.
+    """
+
+    cursor = start
+    while cursor < len(source):
+        marker_at = source.find(marker, cursor)
+        if marker_at < 0:
+            return -1
+
+        invoke_at = source.find(_INVOKE_OPEN_PREFIX, cursor, marker_at)
+        parameter_at = source.find(_PARAMETER_OPEN_PREFIX, cursor, marker_at)
+        if invoke_at >= 0 and invoke_at < marker_at and (
+            parameter_at < 0 or invoke_at < parameter_at
+        ):
+            direct_span = _direct_json_payload_span(source, invoke_at, direct_json_state)
+            if direct_span is not None:
+                _, payload_end = direct_span
+                if payload_end < 0:
+                    return -1
+                cursor = payload_end
+                continue
+
+        if parameter_at < 0 or marker_at < parameter_at:
+            return marker_at
+
+        key_start = parameter_at + len(_PARAMETER_OPEN_PREFIX)
+        key_end = source.find('" string="', key_start)
+        if key_end < 0 or key_end > marker_at:
+            return marker_at
+        flag_start = key_end + len('" string="')
+        flag_end = source.find('">', flag_start)
+        if flag_end < 0 or flag_end > marker_at:
+            return marker_at
+        string_flag = source[flag_start:flag_end]
+        if string_flag not in {"true", "false"}:
+            return marker_at
+
+        value_start = flag_end + 2
+        if string_flag == "true":
+            parameter_close = source.find(_PARAMETER_CLOSE, value_start)
+            if parameter_close < 0 or marker_at <= parameter_close:
+                return marker_at
+        else:
+            parameter_close = _find_json_parameter_close(source, value_start)
+            if parameter_close < 0:
+                return -1
+            if marker == _PARAMETER_CLOSE:
+                return parameter_close
+
+            protected_cursor = value_start
+            in_string = False
+            escaped = False
+            while protected_cursor < parameter_close:
+                char = source[protected_cursor]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                else:
+                    if source.startswith(marker, protected_cursor):
+                        return protected_cursor
+                    if char == '"':
+                        in_string = True
+                protected_cursor += 1
+
+            if marker_at < parameter_close:
+                cursor = parameter_close + len(_PARAMETER_CLOSE)
+                continue
+
+        cursor = parameter_close + len(_PARAMETER_CLOSE)
+    return -1
 
 
 def _parse_invoke_body(
@@ -579,7 +789,11 @@ def _parse_invoke_body(
         if string_flag not in {"true", "false"}:
             raise ValueError("invalid DeepSeek-V4 parameter string flag")
         value_start = flag_end + 2
-        value_end = payload.find(_PARAMETER_CLOSE, value_start)
+        value_end = (
+            payload.find(_PARAMETER_CLOSE, value_start)
+            if string_flag == "true"
+            else _find_json_parameter_close(payload, value_start)
+        )
         if value_end < 0:
             raise ValueError("DeepSeek-V4 parameter value is incomplete")
         raw_value = payload[value_start:value_end]
@@ -614,7 +828,7 @@ def _parse_tool_block(
             break
         if not body.startswith(_INVOKE_OPEN_PREFIX, cursor):
             raise ValueError("unexpected text inside DeepSeek-V4 tool block")
-        close = body.find(_INVOKE_CLOSE, cursor)
+        close = _find_dsml_close_outside_json_parameters(body, _INVOKE_CLOSE, cursor)
         if close < 0:
             raise ValueError("DeepSeek-V4 invoke is incomplete")
         end = close + len(_INVOKE_CLOSE)
@@ -657,6 +871,7 @@ class DeepSeekV4IncrementalParser:
         self._call_index = 0
         self._in_tool = False
         self._bare_tool = False
+        self._direct_json_scan_state = _DirectJsonScanState()
         self._had_incomplete_tool = False
         self._finished = False
 
@@ -725,7 +940,11 @@ class DeepSeekV4IncrementalParser:
 
         while self._buffer:
             if self._in_tool:
-                close_at = self._buffer.find(_TOOL_BLOCK_CLOSE)
+                close_at = _find_dsml_close_outside_json_parameters(
+                    self._buffer,
+                    _TOOL_BLOCK_CLOSE,
+                    direct_json_state=self._direct_json_scan_state,
+                )
                 if close_at < 0:
                     return tuple(events)
                 end = close_at + len(_TOOL_BLOCK_CLOSE)
@@ -737,6 +956,7 @@ class DeepSeekV4IncrementalParser:
                 self._buffer = self._buffer[end:]
                 self._in_tool = False
                 self._bare_tool = False
+                self._direct_json_scan_state.reset()
                 self._emit_tool_block(block, events)
                 continue
 
@@ -783,6 +1003,7 @@ class DeepSeekV4IncrementalParser:
                 self._buffer = self._buffer[len(_MALFORMED_TOOL_BLOCK_OPEN) :]
             self._close_channel(events)
             self._mode = "text"
+            self._direct_json_scan_state.reset()
             self._in_tool = True
             self._bare_tool = malformed_wrapper or marker in _BARE_INVOKE_MARKERS
 

@@ -11,9 +11,9 @@ from exqserve.server.config import ServerConfig
 def test_renderer_workers_default_and_validation(tmp_path: Path) -> None:
     assert ServerConfig(tmp_path).renderer_workers == 1
     with pytest.raises(ValueError, match="renderer_workers must be positive"):
-        ServerConfig(tmp_path, renderer_workers=0)
+        ServerConfig(model_directory=tmp_path, renderer_workers=0)
     with pytest.raises(TypeError, match="renderer_workers must be an integer"):
-        ServerConfig(tmp_path, renderer_workers=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path, renderer_workers=True)  # type: ignore[arg-type]
 
 
 def test_renderer_workers_cli_and_yaml(tmp_path: Path) -> None:

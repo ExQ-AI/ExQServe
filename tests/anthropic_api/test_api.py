@@ -5,10 +5,12 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
     GenerationEvent,
+    GenerationFailed,
     GenerationStarted,
     TextCompleted,
     TextDelta,
@@ -17,7 +19,7 @@ from exqserve.core.events import (
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.usage import TokenUsage
 from exqserve.protocol.anthropic.api import create_anthropic_app
-from exqserve.serving.contracts import ServingRequest
+from exqserve.serving.contracts import MidSystemPolicy, ServingRejected, ServingRequest
 
 
 class _Session:
@@ -135,10 +137,84 @@ def test_messages_requires_supported_anthropic_version_and_shapes_errors() -> No
     asyncio.run(scenario())
 
 
-def test_claude_code_profile_is_wired_through_http_and_consumes_only_token_marker() -> None:
+def test_runtime_recovering_is_529_preheader_but_http_200_midstream_error() -> None:
+    error = CanonicalError(
+        ErrorCategory.OVERLOADED,
+        "runtime_recovering",
+        "Runtime is rebuilding.",
+        True,
+        FailureCause.RUNTIME_RECOVERING,
+    )
+
+    class RejectingEngine:
+        async def submit(self, request: ServingRequest) -> _Session:
+            raise ServingRejected(error)
+
+        async def count_input_tokens(self, request: ServingRequest) -> int:
+            return 0
+
+    class FailureSession:
+        def __init__(self, request_id: str) -> None:
+            self._events: list[GenerationEvent] = [
+                GenerationStarted(request_id),
+                GenerationFailed(request_id, error),
+            ]
+            self.input_token_count = 4
+
+        def __aiter__(self) -> AsyncIterator[GenerationEvent]:
+            return self
+
+        async def __anext__(self) -> GenerationEvent:
+            if not self._events:
+                raise StopAsyncIteration
+            return self._events.pop(0)
+
+        async def cancel(self) -> None:
+            return None
+
+    class StreamingFailureEngine:
+        async def submit(self, request: ServingRequest) -> FailureSession:
+            return FailureSession(request.input.request_id)
+
+        async def count_input_tokens(self, request: ServingRequest) -> int:
+            return 0
+
+    async def scenario() -> None:
+        body = {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
+
+        rejected = await _request(
+            create_anthropic_app(RejectingEngine()),
+            "POST",
+            "/v1/messages",
+            headers=_headers(),
+            json=body,
+        )
+        assert rejected.status_code == 529
+        assert rejected.json()["error"] == {
+            "type": "overloaded_error",
+            "message": "Runtime is rebuilding.",
+            "exqserve_code": "runtime_recovering",
+        }
+
+        streamed = await _request(
+            create_anthropic_app(StreamingFailureEngine()),
+            "POST",
+            "/v1/messages",
+            headers=_headers(),
+            json={**body, "stream": True},
+        )
+        assert streamed.status_code == 200
+        assert "event: error" in streamed.text
+        assert '"type":"overloaded_error"' in streamed.text
+        assert '"exqserve_code":"runtime_recovering"' in streamed.text
+
+    asyncio.run(scenario())
+
+
+def test_claude_code_profile_is_wired_through_http_as_content_agnostic_best_effort() -> None:
     async def scenario() -> None:
         engine = _Engine()
-        app = create_anthropic_app(engine, compatibility_profile="claude-code-2.1.251")
+        app = create_anthropic_app(engine, compatibility_profile="claude-code")
         body = {
             "model": "m",
             "max_tokens": 16,
@@ -150,7 +226,7 @@ def test_claude_code_profile_is_wired_through_http_and_consumes_only_token_marke
                     "content": [
                         {
                             "type": "text",
-                            "text": "<total_tokens>14997958 tokens left</total_tokens>",
+                            "text": "Available agent types: future wording",
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
@@ -163,7 +239,9 @@ def test_claude_code_profile_is_wired_through_http_and_consumes_only_token_marke
         assert engine.requests[0].input.items == (
             MessageItem(MessageRole.SYSTEM, "durable"),
             MessageItem(MessageRole.USER, "hello"),
+            MessageItem(MessageRole.SYSTEM, "Available agent types: future wording"),
         )
+        assert engine.requests[0].mid_system_policy is MidSystemPolicy.BEST_EFFORT
 
         counted = await _request(
             app,
@@ -174,6 +252,7 @@ def test_claude_code_profile_is_wired_through_http_and_consumes_only_token_marke
         )
         assert counted.status_code == 200
         assert engine.count_requests[0].input.items == engine.requests[0].input.items
+        assert engine.count_requests[0].mid_system_policy is MidSystemPolicy.BEST_EFFORT
 
         arbitrary = await _request(
             app,
@@ -189,7 +268,19 @@ def test_claude_code_profile_is_wired_through_http_and_consumes_only_token_marke
                 ],
             },
         )
-        assert arbitrary.status_code == 400
+        assert arbitrary.status_code == 200
+        assert engine.requests[-1].input.items[-1] == MessageItem(
+            MessageRole.SYSTEM, "You must answer in JSON."
+        )
+
+        legacy_engine = _Engine()
+        legacy_app = create_anthropic_app(
+            legacy_engine, compatibility_profile="claude-code-2.1.251"
+        )
+        legacy = await _request(legacy_app, "POST", "/v1/messages", headers=_headers(), json=body)
+        assert legacy.status_code == 200
+        assert legacy_engine.requests[0].mid_system_policy is MidSystemPolicy.BEST_EFFORT
+        assert legacy_engine.requests[0].input.items == engine.requests[0].input.items
 
     asyncio.run(scenario())
 

@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Protocol
 
 from exqserve.core.errors import CanonicalError
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 
@@ -55,6 +56,8 @@ class RuntimeCapabilities:
     cache_usage: bool
     quantized_kv_cache: bool
     vision: bool = False
+    generation_constraints: bool = False
+    structural_token_provenance: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -65,6 +68,8 @@ class RuntimeCapabilities:
             "cache_usage",
             "quantized_kv_cache",
             "vision",
+            "generation_constraints",
+            "structural_token_provenance",
         ):
             _validate_bool(name, getattr(self, name))
 
@@ -73,13 +78,22 @@ class RuntimeCapabilities:
 class RuntimeModelMetadata:
     max_context_tokens: int | None = None
     architecture: str | None = None
+    backend_context_tokens: int | None = None
+    generation_headroom_tokens: int | None = None
 
     def __post_init__(self) -> None:
-        if self.max_context_tokens is not None:
-            if not isinstance(self.max_context_tokens, int) or isinstance(self.max_context_tokens, bool):
-                raise TypeError("max_context_tokens must be an integer or None")
-            if self.max_context_tokens <= 0:
-                raise ValueError("max_context_tokens must be positive")
+        for name in (
+            "max_context_tokens",
+            "backend_context_tokens",
+            "generation_headroom_tokens",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer or None")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
         if self.architecture is not None:
             if not isinstance(self.architecture, str):
                 raise TypeError("architecture must be a string or None")
@@ -449,6 +463,8 @@ class RuntimeGenerationRequest:
     output_json_schema: str | None = None
     output_json_trigger: str | None = None
     generation_constraint: RuntimeGenerationConstraint | None = None
+    generation_guarantee: GenerationGuarantee = GenerationGuarantee.NONE
+    constraint_fallback_policy: ConstraintFallbackPolicy = ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
     use_native_eos: bool = False
 
     def __post_init__(self) -> None:
@@ -491,6 +507,10 @@ class RuntimeGenerationRequest:
             self.generation_constraint, RuntimeGenerationConstraint
         ):
             raise TypeError("generation_constraint must be a RuntimeGenerationConstraint or None")
+        if not isinstance(self.generation_guarantee, GenerationGuarantee):
+            raise TypeError("generation_guarantee must be a GenerationGuarantee")
+        if not isinstance(self.constraint_fallback_policy, ConstraintFallbackPolicy):
+            raise TypeError("constraint_fallback_policy must be a ConstraintFallbackPolicy")
         _validate_bool("use_native_eos", self.use_native_eos)
         if self.generation_constraint is not None and self.output_json_schema is not None:
             raise ValueError("generation_constraint cannot be combined with output_json_schema")
@@ -594,6 +614,9 @@ class RuntimeFinished:
     backend_reason: str | None = None
     eos_token_id: int | None = None
     eos_token_text: str | None = None
+    hard_constraint_installed: bool = False
+    hard_constraint_activated: bool = False
+    effective_generation_guarantee: GenerationGuarantee = GenerationGuarantee.NONE
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -625,6 +648,19 @@ class RuntimeFinished:
                 raise TypeError("eos_token_text must be a string or None")
             if not self.eos_token_text:
                 raise ValueError("eos_token_text must not be empty")
+        _validate_bool("hard_constraint_installed", self.hard_constraint_installed)
+        _validate_bool("hard_constraint_activated", self.hard_constraint_activated)
+        if self.hard_constraint_activated and not self.hard_constraint_installed:
+            raise ValueError("hard_constraint_activated requires hard_constraint_installed=True")
+        if not isinstance(self.effective_generation_guarantee, GenerationGuarantee):
+            raise TypeError("effective_generation_guarantee must be a GenerationGuarantee")
+        if (
+            not self.hard_constraint_activated
+            and self.effective_generation_guarantee is not GenerationGuarantee.NONE
+        ):
+            raise ValueError(
+                "effective_generation_guarantee requires an activated hard constraint"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,6 +687,16 @@ RuntimeEvent = RuntimeStarted | RuntimeTextDelta | RuntimeFinished | RuntimeCanc
 
 class RuntimeConstraintUnsupported(ValueError):
     """Raised when the active runtime cannot soundly enforce a generation constraint."""
+
+
+class RuntimeUnavailable(RuntimeError):
+    """Raised when runtime health has a typed request-rejection projection."""
+
+    def __init__(self, error: CanonicalError) -> None:
+        if not isinstance(error, CanonicalError):
+            raise TypeError("error must be a CanonicalError")
+        self.error = error
+        super().__init__(error.message)
 
 
 class RuntimeInjectionUnavailable(RuntimeError):

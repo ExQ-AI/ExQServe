@@ -37,7 +37,13 @@ from exqserve.core.items import MessageItem, MessageRole, ToolCallItem
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
-from exqserve.model.contracts import CompiledPrompt, ReasoningControlSpec, TemplateRequest
+from exqserve.model.contracts import (
+    CompiledPrompt,
+    ParserTerminalIssue,
+    ReasoningControlSpec,
+    TemplateRequest,
+    incomplete_tool_terminal_issue,
+)
 from exqserve.runtime.contracts import (
     RuntimeEvent,
     RuntimeFinished,
@@ -55,6 +61,10 @@ from exqserve.serving.engine import ServingEngine
 class _Finish:
     events: tuple[GenerationEvent, ...] = ()
     incomplete_tool_call: bool = False
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class _ReasoningParser:
@@ -162,6 +172,13 @@ class _Controller:
     def __init__(self, controlled: _Controlled) -> None:
         self.controlled = controlled
         self.requests: list[RuntimeGenerationRequest] = []
+
+    async def acquire(self, request_id: str):  # type: ignore[no-untyped-def]
+        del request_id
+        return self
+
+    async def release(self) -> None:
+        return None
 
     async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
         self.requests.append(request)

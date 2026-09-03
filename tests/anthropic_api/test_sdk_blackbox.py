@@ -12,6 +12,7 @@ import uvicorn
 
 anthropic = pytest.importorskip("anthropic")
 
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
@@ -27,7 +28,7 @@ from exqserve.core.events import (
 from exqserve.core.items import ToolCallItem, ToolResultItem
 from exqserve.core.usage import TokenUsage
 from exqserve.protocol.anthropic.api import create_anthropic_app
-from exqserve.serving.contracts import ServingRequest
+from exqserve.serving.contracts import ServingRejected, ServingRequest
 
 
 class _Session:
@@ -210,3 +211,49 @@ def test_current_anthropic_sdk_create_stream_count_and_tool_roundtrip() -> None:
 
     assert len(engine.count_requests) == 1
     assert len(engine.requests) == 4
+
+
+def test_current_anthropic_sdk_preserves_optional_standard_diagnostic_extension() -> None:
+    error = CanonicalError(
+        ErrorCategory.OVERLOADED,
+        "runtime_recovering",
+        "Runtime is rebuilding.",
+        True,
+        FailureCause.RUNTIME_RECOVERING,
+    )
+
+    class _RejectingEngine:
+        async def count_input_tokens(self, request: ServingRequest) -> int:
+            return 0
+
+        async def submit(self, request: ServingRequest) -> _Session:
+            raise ServingRejected(error)
+
+    app = create_anthropic_app(_RejectingEngine())
+
+    async def scenario(base_url: str) -> None:
+        async with anthropic.AsyncAnthropic(
+            api_key="test",
+            base_url=base_url,
+            max_retries=0,
+        ) as client:
+            with pytest.raises(anthropic.APIStatusError) as exc_info:
+                await client.messages.create(
+                    model="local-qwen",
+                    max_tokens=16,
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+        exc = exc_info.value
+        assert exc.status_code == 529
+        assert exc.body == {
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": "Runtime is rebuilding.",
+                "exqserve_code": "runtime_recovering",
+            },
+            "request_id": exc.response.headers["request-id"],
+        }
+
+    with _serve(app) as base_url:
+        asyncio.run(scenario(base_url))

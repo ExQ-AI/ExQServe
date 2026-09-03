@@ -9,8 +9,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from exqserve.control.request import RequestTerminalReason
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.model import ServedModelInfo
+from exqserve.server.capabilities import EffectiveModelSnapshot
 from exqserve.server.config import ServerConfig
 from exqserve.serving.contracts import (
     RawServingEngineLike,
@@ -49,7 +51,10 @@ class ManagedControllerLike(Protocol):
     async def inject_text(self, request_id: str, text: str) -> None:
         ...
 
-    async def close(self) -> None:
+    async def close(
+        self,
+        reason: RequestTerminalReason = RequestTerminalReason.SERVER_SHUTDOWN,
+    ) -> None:
         ...
 
 
@@ -76,6 +81,7 @@ class ActiveModelBundle:
     engine: TokenCountingServingEngineLike
     raw_engine: RawServingEngineLike
     preprocessing: ManagedPreprocessingLike | None = None
+    capabilities: EffectiveModelSnapshot | None = None
 
 
 class ModelManagerState(str, Enum):
@@ -173,6 +179,10 @@ class ModelManager:
         bundle = self._bundle
         return None if bundle is None else bundle.served_model
 
+    def current_capabilities(self) -> EffectiveModelSnapshot | None:
+        bundle = self._bundle
+        return None if bundle is None else bundle.capabilities
+
     def snapshot(self) -> ModelManagerSnapshot:
         bundle = self._bundle
         return ModelManagerSnapshot(
@@ -228,10 +238,14 @@ class ModelManager:
         finally:
             await self._release_submission_bundle()
 
-    async def _close_bundle(self, bundle: ActiveModelBundle) -> None:
+    async def _close_bundle(
+        self,
+        bundle: ActiveModelBundle,
+        reason: RequestTerminalReason = RequestTerminalReason.SERVER_SHUTDOWN,
+    ) -> None:
         controller_error: BaseException | None = None
         try:
-            await bundle.controller.close()
+            await bundle.controller.close(reason)
         except asyncio.CancelledError as exc:
             controller_error = exc
         except Exception as exc:  # noqa: BLE001 - runtime teardown must still be attempted.
@@ -287,7 +301,7 @@ class ModelManager:
                 old_bundle = self._bundle
                 self._state = ModelManagerState.SWITCHING
             try:
-                await self._close_bundle(old_bundle)
+                await self._close_bundle(old_bundle, RequestTerminalReason.MODEL_SWITCH)
                 async with self._lock:
                     self._bundle = None
                 new_bundle = await self._builder(model_id, path)

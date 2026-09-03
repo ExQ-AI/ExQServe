@@ -4,9 +4,10 @@ import json
 
 import pytest
 
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
+    GenerationCancelled,
     GenerationCompleted,
     GenerationFailed,
     GenerationStarted,
@@ -23,7 +24,7 @@ from exqserve.core.events import (
 )
 from exqserve.core.items import ToolCallItem
 from exqserve.core.usage import TokenUsage
-from exqserve.protocol.anthropic.common import AnthropicProtocolError
+from exqserve.protocol.anthropic.common import AnthropicProtocolError, map_canonical_error
 from exqserve.protocol.anthropic.serialization import (
     AnthropicMessageAccumulator,
     AnthropicMessageStreamSerializer,
@@ -190,6 +191,301 @@ def test_stream_serializer_emits_anthropic_event_flow_and_tool_json_delta() -> N
         },
     }
     assert payloads[-1][1] == {"type": "message_stop"}
+
+
+def test_anthropic_stream_defers_post_tool_text_until_tool_commit() -> None:
+    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_order_single")
+    call = ToolCallItem("toolu_1", "lookup", '{"id":1}', 0)
+
+    before_commit_events = (
+        GenerationStarted("req_1"),
+        ToolCallStarted("req_1", "toolu_1", "lookup", 0),
+        ToolCallArgumentsDelta("req_1", "toolu_1", '{"id":1}', 0),
+        TextStarted("req_1"),
+        TextDelta("req_1", "after tool"),
+        TextCompleted("req_1", "after tool"),
+    )
+    before_commit = [
+        payload
+        for event in before_commit_events
+        for payload in serializer.feed(event)
+    ]
+
+    assert [name for name, _ in before_commit] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+    ]
+
+    committed = serializer.feed(ToolCallCompleted("req_1", call))
+    assert [name for name, _ in committed] == [
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert committed[0][1]["index"] == 0
+    assert committed[1][1]["index"] == 1
+    assert committed[1][1]["content_block"] == {"type": "text", "text": ""}  # type: ignore[index]
+    assert committed[2][1]["delta"] == {"type": "text_delta", "text": "after tool"}  # type: ignore[index]
+
+
+def test_anthropic_stream_serializes_multiple_tools_before_post_tool_content() -> None:
+    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_order_multi")
+    first = ToolCallItem("toolu_1", "lookup", '{"id":1}', 0)
+    second = ToolCallItem("toolu_2", "lookup", '{"id":2}', 1)
+
+    before_commit_events = (
+        GenerationStarted("req_1"),
+        ToolCallStarted("req_1", "toolu_1", "lookup", 0),
+        ToolCallArgumentsDelta("req_1", "toolu_1", '{"id":1}', 0),
+        ToolCallStarted("req_1", "toolu_2", "lookup", 1),
+        ToolCallArgumentsDelta("req_1", "toolu_2", '{"id":2}', 1),
+        TextStarted("req_1"),
+        TextDelta("req_1", "after tools"),
+        TextCompleted("req_1", "after tools"),
+        ReasoningStarted("req_1"),
+        ReasoningDelta("req_1", "tail thought"),
+        ReasoningCompleted("req_1", "tail thought"),
+    )
+    before_commit = [
+        payload
+        for event in before_commit_events
+        for payload in serializer.feed(event)
+    ]
+    assert [name for name, _ in before_commit] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+    ]
+
+    first_commit = serializer.feed(ToolCallCompleted("req_1", first))
+    assert [name for name, _ in first_commit] == [
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+    ]
+    assert [payload["index"] for _, payload in first_commit] == [0, 1, 1]
+
+    second_commit = serializer.feed(ToolCallCompleted("req_1", second))
+    names = [name for name, _ in second_commit]
+    assert names == [
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    starts = [payload for name, payload in second_commit if name == "content_block_start"]
+    assert [payload["content_block"]["type"] for payload in starts] == ["text", "thinking"]  # type: ignore[index]
+    stops = [payload["index"] for name, payload in (*first_commit, *second_commit) if name == "content_block_stop"]
+    assert stops == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (
+        GenerationFailed(
+            "req_1",
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_policy_violation",
+                "Model output violated the requested tool policy.",
+                False,
+            ),
+        ),
+        GenerationCancelled("req_1"),
+    ),
+)
+def test_anthropic_stream_abort_discards_queued_post_tool_content(
+    terminal: GenerationFailed | GenerationCancelled,
+) -> None:
+    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_order_abort")
+
+    payloads = []
+    for event in (
+        GenerationStarted("req_1"),
+        ToolCallStarted("req_1", "toolu_1", "lookup", 0),
+        ToolCallArgumentsDelta("req_1", "toolu_1", '{"id":1}', 0),
+        TextStarted("req_1"),
+        TextDelta("req_1", "must not publish"),
+        TextCompleted("req_1", "must not publish"),
+        terminal,
+    ):
+        payloads.extend(serializer.feed(event))
+
+    names = [name for name, _ in payloads]
+    assert names[:3] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+    ]
+    assert "content_block_stop" not in names
+    assert sum(name == "content_block_start" for name in names) == 1
+    assert names[-1] == "error"
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "error_type", "fact_code"),
+    [
+        (
+            CanonicalError(
+                ErrorCategory.CONTEXT_LENGTH,
+                "prompt_limit_exceeded",
+                "Context is too long.",
+                False,
+            ),
+            400,
+            "invalid_request_error",
+            "context_length_exceeded",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_invalid",
+                "Model produced an invalid tool call.",
+                False,
+                FailureCause.MODEL_TOOL_OUTPUT_INVALID,
+            ),
+            500,
+            "api_error",
+            "tool_call_invalid",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.OVERLOADED,
+                "runtime_recovering",
+                "Runtime is rebuilding.",
+                True,
+                FailureCause.RUNTIME_RECOVERING,
+            ),
+            529,
+            "overloaded_error",
+            "runtime_recovering",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_incomplete",
+                "Model output ended with an incomplete tool call.",
+                False,
+                FailureCause.OUTPUT_EOS,
+            ),
+            500,
+            "api_error",
+            "tool_call_incomplete",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "tool_call_incomplete",
+                "Model output ended with an incomplete tool call.",
+                False,
+                FailureCause.OUTPUT_LENGTH,
+            ),
+            500,
+            "api_error",
+            "tool_call_incomplete",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "protocol_ambiguity",
+                "Model output ended at an ambiguous protocol boundary.",
+                False,
+                FailureCause.OUTPUT_EOS,
+            ),
+            500,
+            "api_error",
+            "protocol_ambiguity",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "protocol_ambiguity",
+                "Model output ended at an ambiguous protocol boundary.",
+                False,
+                FailureCause.OUTPUT_LENGTH,
+            ),
+            500,
+            "api_error",
+            "protocol_ambiguity",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "protocol_ambiguity",
+                "Model output ended at an ambiguous protocol boundary.",
+                False,
+                FailureCause.PARSER_AMBIGUITY_LIMIT,
+            ),
+            500,
+            "api_error",
+            "protocol_ambiguity",
+        ),
+        (
+            CanonicalError(
+                ErrorCategory.RUNTIME_FAILURE,
+                "restart_required",
+                "Runtime restart is required.",
+                False,
+                FailureCause.RESTART_REQUIRED,
+            ),
+            500,
+            "api_error",
+            "restart_required",
+        ),
+    ],
+)
+def test_anthropic_projection_keeps_standard_identity_and_optional_diagnostic_code(
+    error: CanonicalError,
+    status: int,
+    error_type: str,
+    fact_code: str,
+) -> None:
+    mapped = map_canonical_error(error)
+    assert mapped.status_code == status
+    assert mapped.type == error_type
+    assert mapped.exqserve_code == fact_code
+    body = mapped.to_body("req_map")
+    assert body["error"]["type"] == error_type  # type: ignore[index]
+    assert body["error"]["message"] == error.message  # type: ignore[index]
+    assert body["error"]["exqserve_code"] == fact_code  # type: ignore[index]
+
+    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_fact")
+    stream_error = serializer.feed(GenerationFailed("req_stream", error))
+    assert stream_error == (("error", mapped.to_body("req_stream")),)
+
+
+def test_anthropic_model_failure_causes_do_not_become_hidden_retry_statuses() -> None:
+    cases = (
+        ("tool_call_incomplete", FailureCause.OUTPUT_EOS),
+        ("tool_call_incomplete", FailureCause.OUTPUT_LENGTH),
+        ("protocol_ambiguity", FailureCause.OUTPUT_EOS),
+        ("protocol_ambiguity", FailureCause.OUTPUT_LENGTH),
+        ("protocol_ambiguity", FailureCause.PARSER_AMBIGUITY_LIMIT),
+        ("tool_call_invalid", FailureCause.MODEL_TOOL_OUTPUT_INVALID),
+    )
+    for code, cause in cases:
+        source = CanonicalError(ErrorCategory.MODEL_FAILURE, code, "Model output failed.", False, cause)
+        mapped = map_canonical_error(source)
+        assert mapped.status_code == 500
+        assert mapped.type == "api_error"
+        assert mapped.message == source.message
+        assert mapped.exqserve_code == code
+
+
+def test_anthropic_protocol_error_omits_extension_without_machine_fact() -> None:
+    error = AnthropicProtocolError(500, "api_error", "Ordinary failure.")
+    assert error.exqserve_code is None
+    assert error.to_body("req_plain") == {
+        "type": "error",
+        "error": {"type": "api_error", "message": "Ordinary failure."},
+        "request_id": "req_plain",
+    }
 
 
 def test_anthropic_invalid_tool_candidate_leaves_tentative_block_open_then_errors() -> None:

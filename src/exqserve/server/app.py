@@ -22,12 +22,10 @@ from exqserve.core.model import ServedModelInfo
 from exqserve.model.contracts import (
     ReasoningControlProvider,
     ReasoningControlSpec,
-    StrictToolConstraintProvider,
+    StructuralTokenRequirements,
     ToolConstraintMode,
     ToolConstraintProvider,
-    ToolConstraintUnsupported,
     ToolGenerationConstraint,
-    has_exposed_strict_tool,
 )
 from exqserve.model.registry import (
     DeepSeekV4Dialect,
@@ -55,6 +53,12 @@ from exqserve.runtime.contracts import (
 )
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime
 from exqserve.server.admin import create_admin_router
+from exqserve.server.capabilities import (
+    CapabilityGuardedPromptCompiler,
+    SnapshotToolConstraintFactory,
+    resolve_effective_model_snapshot,
+    validate_heterogeneous_switch_overrides,
+)
 from exqserve.server.config import ServerConfig
 from exqserve.server.injection import create_injection_router
 from exqserve.server.model_manager import (
@@ -65,7 +69,11 @@ from exqserve.server.model_manager import (
     discover_model_directories,
 )
 from exqserve.server.security import BearerAuthMiddleware
-from exqserve.serving.contracts import IncrementalParserLike
+from exqserve.serving.contracts import (
+    BestEffortMidSystemLowering,
+    IncrementalParserLike,
+    MidSystemCapability,
+)
 from exqserve.serving.engine import RequestControllerLike, RuntimeTemplateAdapter, ServingEngine
 from exqserve.serving.preprocessing import RendererLane, RendererLanePool, await_task_termination
 from exqserve.serving.raw import RawRequestController, RawServingEngine
@@ -98,6 +106,7 @@ class ServerRuntimeLike(Protocol):
         *,
         add_generation_prompt: bool = True,
         protect_literal_tokens: bool = False,
+        structural_marker_texts: tuple[str, ...] = (),
     ) -> RuntimeRenderedPrompt:
         ...
 
@@ -190,6 +199,82 @@ def _is_builtin_dialect(dialect: ModelDialect) -> bool:
     }
 
 
+def _structural_marker_texts(requirements: StructuralTokenRequirements) -> tuple[str, ...]:
+    return requirements.prompt_markers
+
+
+def _output_structural_marker_texts(requirements: StructuralTokenRequirements) -> tuple[str, ...]:
+    return requirements.output_markers
+
+
+def _configure_output_provenance(
+    runtime: ServerRuntimeLike,
+    requirements: StructuralTokenRequirements,
+) -> dict[str, int]:
+    markers = _output_structural_marker_texts(requirements)
+    if not markers:
+        return {}
+    configurator = getattr(runtime, "configure_output_structural_markers", None)
+    if not callable(configurator):
+        raise TypeError("dialect requires runtime output structural-token provenance support")
+    configured = configurator(markers)
+    if not isinstance(configured, dict) or set(configured) != set(markers):
+        raise TypeError("runtime output structural-token configuration returned invalid marker IDs")
+    if not all(
+        isinstance(marker_id, int) and not isinstance(marker_id, bool) and marker_id >= 0
+        for marker_id in configured.values()
+    ):
+        raise TypeError("runtime output structural-token configuration returned invalid token IDs")
+    return configured
+
+
+def _configure_effective_compiler_output_stops(
+    compiler: object,
+    requirements: StructuralTokenRequirements,
+    output_marker_ids: dict[str, int],
+) -> None:
+    native_stop = requirements.native_output_stop_marker
+    if native_stop is None:
+        return
+    if native_stop not in output_marker_ids:
+        raise RuntimeError("dialect native output stop marker ID is unavailable")
+    configurator = getattr(compiler, "configure_native_output_stop", None)
+    if not callable(configurator):
+        raise TypeError("dialect native output stop requires compiler configuration support")
+    configurator(native_stop, output_marker_ids[native_stop])
+
+
+_BUILTIN_MID_SYSTEM_CAPABILITIES: dict[type[object], MidSystemCapability] = {
+    QwenDialect: MidSystemCapability.LEADING_ONLY,
+    Gemma4Dialect: MidSystemCapability.LEADING_ONLY,
+    Glm5Dialect: MidSystemCapability.LEADING_ONLY,
+    DeepSeekV4Dialect: MidSystemCapability.LEADING_ONLY,
+    MuseGlimmerDialect: MidSystemCapability.LEADING_ONLY,
+    GenericHFDialect: MidSystemCapability.LEADING_ONLY,
+}
+
+
+def _builtin_mid_system_capability(dialect: ModelDialect) -> MidSystemCapability:
+    return _BUILTIN_MID_SYSTEM_CAPABILITIES.get(
+        type(dialect),
+        MidSystemCapability.LEADING_ONLY,
+    )
+
+
+_BUILTIN_BEST_EFFORT_MID_SYSTEM_LOWERINGS: dict[type[object], BestEffortMidSystemLowering] = {
+    QwenDialect: BestEffortMidSystemLowering.IN_PLACE_USER_META,
+}
+
+
+def _builtin_best_effort_mid_system_lowering(
+    dialect: ModelDialect,
+) -> BestEffortMidSystemLowering:
+    return _BUILTIN_BEST_EFFORT_MID_SYSTEM_LOWERINGS.get(
+        type(dialect),
+        BestEffortMidSystemLowering.MERGED_LEADING,
+    )
+
+
 async def _rollback_failed_bundle(
     runtime: ServerRuntimeLike,
     controller: RequestController | None,
@@ -266,26 +351,34 @@ def _build_model_bundle(
     preprocessing_pool: RendererLanePool | None = None
     try:
         tool_options = config.tool_serving_options()
-        served_model = ServedModelInfo(
-            public_model_id,
-            int(time.time()),
-            config.effective_context_length(runtime_object.model_metadata.max_context_tokens),
-        )
-        request_control = config.request_control_config(runtime_object.model_metadata.max_context_tokens)
-        controller = RequestController(runtime_object, request_control)
         dialect = default_model_dialect_registry().resolve(
             runtime_object.model_metadata.architecture,
             config.model_dialect,
         )
+        effective = resolve_effective_model_snapshot(config, dialect, runtime_object)
+        validate_heterogeneous_switch_overrides(config, model_directory, dialect, effective)
+        served_model = ServedModelInfo(
+            public_model_id,
+            int(time.time()),
+            effective.context_window,
+        )
+        request_control = config.request_control_config_for_context(effective.context_window)
+        controller = RequestController(runtime_object, request_control)
         if config.renderer_workers > 1 and not _is_builtin_dialect(dialect):
             raise ValueError(
                 "renderer_workers > 1 is not supported for external Model Dialect Plugin API v1 dialects"
             )
 
+        structural_requirements = effective.structural_requirements
+        output_marker_ids = _configure_output_provenance(runtime_object, structural_requirements)
+        structural_marker_texts = _structural_marker_texts(structural_requirements)
         lanes: list[RendererLane] = []
         if config.renderer_workers == 1:
-            adapter = RuntimeTemplateAdapter(runtime_object)
-            lanes.append(RendererLane(runtime_object, dialect.create_compiler(adapter)))
+            adapter = RuntimeTemplateAdapter(runtime_object, structural_marker_texts)
+            compiler = dialect.create_compiler(adapter)
+            _configure_effective_compiler_output_stops(compiler, structural_requirements, output_marker_ids)
+            guarded = CapabilityGuardedPromptCompiler(compiler, effective)
+            lanes.append(RendererLane(runtime_object, guarded))
         else:
             renderer_factory = getattr(runtime_object, "create_prompt_renderer", None)
             if not callable(renderer_factory):
@@ -294,33 +387,32 @@ def _build_model_bundle(
                 )
             for _ in range(config.renderer_workers):
                 renderer = renderer_factory()
-                adapter = RuntimeTemplateAdapter(renderer)
-                lanes.append(RendererLane(renderer, dialect.create_compiler(adapter)))
+                adapter = RuntimeTemplateAdapter(renderer, structural_marker_texts)
+                compiler = dialect.create_compiler(adapter)
+                _configure_effective_compiler_output_stops(compiler, structural_requirements, output_marker_ids)
+                guarded = CapabilityGuardedPromptCompiler(compiler, effective)
+                lanes.append(RendererLane(renderer, guarded))
         preprocessing_pool = RendererLanePool(tuple(lanes), metrics)
 
-        tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
+        raw_tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
         if isinstance(dialect, ToolConstraintProvider):
             constraint_provider = dialect
-            strict_capable = (
-                isinstance(dialect, StrictToolConstraintProvider)
-                and dialect.supports_strict_tools
-            )
 
             def create_tool_constraint(tool_policy: ToolPolicy) -> ToolGenerationConstraint | None:
-                if has_exposed_strict_tool(tool_policy) and not strict_capable:
-                    raise ToolConstraintUnsupported(
-                        f"model dialect {dialect.dialect_id!r} does not support strict function tools"
-                    )
                 return constraint_provider.create_tool_constraint(
                     tool_policy,
                     tool_options.constraint_mode,
                 )
 
-            tool_constraint_factory = create_tool_constraint
-        elif tool_options.constraint_mode is not ToolConstraintMode.OFF:
+            raw_tool_constraint_factory = create_tool_constraint
+        if (
+            tool_options.constraint_mode is not ToolConstraintMode.OFF
+            and not effective.tool_generation_available
+        ):
             raise ValueError(
                 f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
             )
+        tool_constraint_factory = SnapshotToolConstraintFactory(raw_tool_constraint_factory, effective)
 
         def parser_factory(
             request_id: str,
@@ -330,7 +422,8 @@ def _build_model_bundle(
             return _dialect_parser(dialect, request_id, reasoning, tool_policy)
 
         reasoning_control_factory: Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None] | None = None
-        if isinstance(dialect, ReasoningControlProvider):
+        if effective.reasoning_control_available:
+            assert isinstance(dialect, ReasoningControlProvider)
             reasoning_provider = dialect
 
             def create_reasoning_control(
@@ -355,6 +448,8 @@ def _build_model_bundle(
             tokenize_reasoning_control,
             config.reasoning_budget_default(),
             preprocessing_pool=preprocessing_pool,
+            mid_system_capability=_builtin_mid_system_capability(dialect),
+            best_effort_mid_system_lowering=_builtin_best_effort_mid_system_lowering(dialect),
         )
         raw_engine = RawServingEngine(
             None,
@@ -372,6 +467,7 @@ def _build_model_bundle(
             observed,
             observed_raw,
             preprocessing_pool,
+            effective,
         )
     except BaseException as build_error:
         _rollback_failed_bundle_sync(runtime_object, controller, preprocessing_pool, build_error)

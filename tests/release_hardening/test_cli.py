@@ -758,15 +758,19 @@ def test_cli_and_yaml_reasoning_budget_defaults_and_precedence(tmp_path: Path) -
 def test_cli_and_yaml_anthropic_compatibility_profile(tmp_path: Path) -> None:
     default_config = cli.parse_config([str(tmp_path)])
     explicit_config = cli.parse_config(
+        [str(tmp_path), "--anthropic-compatibility-profile", "claude-code"]
+    )
+    legacy_config = cli.parse_config(
         [str(tmp_path), "--anthropic-compatibility-profile", "claude-code-2.1.251"]
     )
     assert default_config.anthropic_compatibility_profile is None
-    assert explicit_config.anthropic_compatibility_profile == "claude-code-2.1.251"
+    assert explicit_config.anthropic_compatibility_profile == "claude-code"
+    assert legacy_config.anthropic_compatibility_profile == "claude-code-2.1.251"
 
     config_path = tmp_path / "anthropic-compat.yaml"
     config_path.write_text(
-        f"model-directory: {tmp_path}\nanthropic-compatibility-profile: claude-code-2.1.251\n",
+        f"model-directory: {tmp_path}\nanthropic-compatibility-profile: claude-code\n",
         encoding="utf-8",
     )
     yaml_config = cli.parse_config(["--config", str(config_path)])
-    assert yaml_config.anthropic_compatibility_profile == "claude-code-2.1.251"
+    assert yaml_config.anthropic_compatibility_profile == "claude-code"

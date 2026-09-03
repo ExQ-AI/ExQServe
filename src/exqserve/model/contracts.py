@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolChoiceMode, ToolPolicy
 from exqserve.core.events import GenerationEvent
+from exqserve.core.generation_guarantees import GenerationGuarantee
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.tokens import NativeTokenSpan
 
@@ -81,6 +82,33 @@ class ModelCapabilities:
             "vision",
         ):
             _validate_bool(name, getattr(self, name))
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralTokenRequirements:
+    """Optional dialect-owned structural-token requirements for prompt/output correctness."""
+
+    prompt_markers: tuple[str, ...] = ()
+    output_markers: tuple[str, ...] = ()
+    native_output_stop_marker: str | None = None
+    requires_output_provenance: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("prompt_markers", "output_markers"):
+            value = getattr(self, name)
+            if not isinstance(value, tuple):
+                raise TypeError(f"{name} must be a tuple")
+            if not all(isinstance(marker, str) and marker for marker in value):
+                raise ValueError(f"{name} must contain only non-empty strings")
+            if len(set(value)) != len(value):
+                raise ValueError(f"{name} must not contain duplicate markers")
+        if self.native_output_stop_marker is not None:
+            _validate_non_empty("native_output_stop_marker", self.native_output_stop_marker)
+            if self.native_output_stop_marker not in self.output_markers:
+                raise ValueError("native_output_stop_marker must be one of output_markers")
+        _validate_bool("requires_output_provenance", self.requires_output_provenance)
+        if self.requires_output_provenance and not self.output_markers:
+            raise ValueError("output provenance requires at least one output marker")
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,13 +332,49 @@ class PromptCompilerLike(Protocol):
         ...
 
 
+class ParserTerminalIssueKind(str, Enum):
+    INCOMPLETE_TOOL = "incomplete_tool"
+    PROTOCOL_AMBIGUITY = "protocol_ambiguity"
+
+
+class ParserAmbiguityDetail(str, Enum):
+    UNRESOLVED_BOUNDARY = "unresolved_boundary"
+    HOLD_LIMIT = "hold_limit"
+
+
+@dataclass(frozen=True, slots=True)
+class ParserTerminalIssue:
+    kind: ParserTerminalIssueKind
+    ambiguity_detail: ParserAmbiguityDetail | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ParserTerminalIssueKind):
+            raise TypeError("kind must be a ParserTerminalIssueKind")
+        if self.kind is ParserTerminalIssueKind.INCOMPLETE_TOOL:
+            if self.ambiguity_detail is not None:
+                raise ValueError("incomplete_tool must not have ambiguity_detail")
+            return
+        if self.ambiguity_detail is None:
+            raise ValueError("protocol_ambiguity requires ambiguity_detail")
+        if not isinstance(self.ambiguity_detail, ParserAmbiguityDetail):
+            raise TypeError("ambiguity_detail must be a ParserAmbiguityDetail or None")
+
+
+def incomplete_tool_terminal_issue(incomplete: bool) -> ParserTerminalIssue | None:
+    if not isinstance(incomplete, bool):
+        raise TypeError("incomplete must be a bool")
+    if not incomplete:
+        return None
+    return ParserTerminalIssue(ParserTerminalIssueKind.INCOMPLETE_TOOL)
+
+
 class ParserFinishLike(Protocol):
     @property
     def events(self) -> tuple[GenerationEvent, ...]:
         ...
 
     @property
-    def incomplete_tool_call(self) -> bool:
+    def terminal_issue(self) -> ParserTerminalIssue | None:
         ...
 
 
@@ -329,6 +393,10 @@ class NativeTokenProvenanceError(RuntimeError):
 class NativeTokenAwareIncrementalParser:
     """Nominal internal opt-in for parsers that consume verified token provenance."""
 
+    @property
+    def early_terminal_issue(self) -> ParserTerminalIssue | None:
+        return None
+
     def feed_with_native_tokens(
         self,
         chunk: str,
@@ -343,6 +411,9 @@ class ToolConstraintMode(str, Enum):
     SCHEMA = "schema"
 
 
+ToolConstraintGuarantee = GenerationGuarantee
+
+
 class ToolConstraintUnsupported(ValueError):
     """Raised when an explicit constrained-tool policy cannot be represented safely."""
 
@@ -354,6 +425,7 @@ class ToolGenerationConstraint:
     trigger: str
     lark_grammar: str
     eos_after_completed: bool
+    branch_guarantees: tuple[tuple[str, ToolConstraintGuarantee], ...] | None = None
 
     def __post_init__(self) -> None:
         for name in ("trigger", "lark_grammar"):
@@ -363,6 +435,32 @@ class ToolGenerationConstraint:
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
         _validate_bool("eos_after_completed", self.eos_after_completed)
+        if self.branch_guarantees is None:
+            return
+        if not isinstance(self.branch_guarantees, tuple):
+            raise TypeError("branch_guarantees must be a tuple or None")
+        seen_names: set[str] = set()
+        for entry in self.branch_guarantees:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError("branch_guarantees entries must be (tool_name, guarantee) tuples")
+            tool_name, guarantee = entry
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError("branch guarantee tool names must be non-empty strings")
+            if tool_name in seen_names:
+                raise ValueError("branch guarantee tool names must be unique")
+            if not isinstance(guarantee, ToolConstraintGuarantee):
+                raise TypeError("branch guarantee values must be ToolConstraintGuarantee")
+            seen_names.add(tool_name)
+
+    def guarantee_for_tool(self, tool_name: str) -> ToolConstraintGuarantee:
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("tool_name must be a non-empty string")
+        if self.branch_guarantees is None:
+            return ToolConstraintGuarantee.UNKNOWN
+        for candidate_name, guarantee in self.branch_guarantees:
+            if candidate_name == tool_name:
+                return guarantee
+        return ToolConstraintGuarantee.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +497,13 @@ class ToolConstraintProvider(Protocol):
 class StrictToolConstraintProvider(Protocol):
     @property
     def supports_strict_tools(self) -> bool:
+        ...
+
+
+@runtime_checkable
+class StructuralTokenProvider(Protocol):
+    @property
+    def structural_token_requirements(self) -> StructuralTokenRequirements:
         ...
 
 

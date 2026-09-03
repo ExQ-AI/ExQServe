@@ -41,6 +41,42 @@ def discover_marker_texts(text_codec: object) -> tuple[str, ...]:
     return tuple(sorted(markers, key=lambda value: (-len(value), value)))
 
 
+def effective_marker_texts(
+    text_codec: _TextCodecLike,
+    explicit_markers: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return validated explicit markers union retained tokenizer discovery."""
+
+    if not isinstance(explicit_markers, tuple):
+        raise TypeError("explicit_markers must be a tuple")
+
+    combined = set(discover_marker_texts(text_codec))
+    combined.update(explicit_markers)
+    result = tuple(sorted(combined, key=lambda value: (-len(value), value)))
+
+    for marker in result:
+        if not isinstance(marker, str):
+            raise TypeError("structural marker declarations must be strings")
+        if len(marker) < 2 or not marker.startswith("<"):
+            raise ValueError("structural marker declarations must begin with '<'")
+        structural_ids = _encoded_ids(
+            text_codec,
+            marker,
+            special=True,
+            embeddings=None,
+        )
+        literal_ids = _literal_ids(text_codec, marker)
+        if not structural_ids:
+            raise ValueError(f"structural marker {marker!r} has no special-token encoding")
+        if not literal_ids:
+            raise ValueError(f"structural marker {marker!r} has no literal-token encoding")
+        if structural_ids == literal_ids:
+            raise ValueError(
+                f"structural marker {marker!r} cannot be distinguished from literal encoding"
+            )
+    return result
+
+
 def marker_sentinels(
     messages: list[dict[str, object]],
     tools: list[dict[str, object]] | None,
@@ -50,7 +86,7 @@ def marker_sentinels(
     result: dict[str, str] = {}
     for index, marker in enumerate(marker_texts):
         digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()[:16]
-        sentinel = f"__EXQSERVE_QWEN_LITERAL_{index}_{digest}__"
+        sentinel = f"__EXQSERVE_STRUCTURAL_LITERAL_{index}_{digest}__"
         while sentinel in source_repr or sentinel in result.values():
             sentinel += "_"
         result[marker] = sentinel

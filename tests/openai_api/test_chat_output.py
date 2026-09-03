@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -122,6 +122,55 @@ def test_chat_stream_failure_and_cancel_are_error_payloads_not_success_finishes(
     cancel_payload = other.feed(GenerationCancelled("r"))
     assert cancel_payload[0]["error"]["code"] == "generation_cancelled"  # type: ignore[index]
     assert "choices" not in cancel_payload[0]
+
+
+def test_chat_stream_failure_keeps_standard_code_and_optional_cause() -> None:
+    error = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "tool_call_incomplete",
+        "Model output ended with an incomplete tool call.",
+        False,
+        FailureCause.OUTPUT_EOS,
+    )
+    payload = ChatStreamSerializer("m", response_id="chatcmpl-fact", created=1).feed(
+        GenerationFailed("r", error)
+    )[0]["error"]
+    assert payload["code"] == "tool_call_incomplete"  # type: ignore[index]
+    assert payload["exqserve_cause"] == "output_eos"  # type: ignore[index]
+    assert payload["message"] == (  # type: ignore[index]
+        "Model output ended with an incomplete tool call."
+    )
+
+    accumulator = ChatAccumulator("m", response_id="chatcmpl-fact-sync", created=1)
+    accumulator.consume(GenerationFailed("r", error))
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == "tool_call_incomplete"
+    assert exc_info.value.message == "Model output ended with an incomplete tool call."
+
+
+def test_chat_model_tool_output_invalid_keeps_standard_code_and_optional_cause() -> None:
+    error = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "tool_call_invalid",
+        "Model produced an invalid tool call.",
+        False,
+        FailureCause.MODEL_TOOL_OUTPUT_INVALID,
+    )
+    payload = ChatStreamSerializer("m", response_id="chatcmpl-tool-invalid", created=1).feed(
+        GenerationFailed("r", error)
+    )[0]["error"]
+    assert payload["code"] == "tool_call_invalid"  # type: ignore[index]
+    assert payload["exqserve_cause"] == "model_tool_output_invalid"  # type: ignore[index]
+    assert payload["message"] == (  # type: ignore[index]
+        "Model produced an invalid tool call."
+    )
+
+    accumulator = ChatAccumulator("m", response_id="chatcmpl-tool-invalid-sync", created=1)
+    accumulator.consume(GenerationFailed("r", error))
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == "tool_call_invalid"
 
 
 def test_chat_invalid_tool_candidate_streams_tentative_deltas_then_errors() -> None:

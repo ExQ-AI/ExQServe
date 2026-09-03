@@ -5,7 +5,12 @@ from typing import ClassVar
 
 import pytest
 
-from exqserve.runtime.contracts import ExLlamaV3LoadConfig, RuntimeGenerationRequest
+from exqserve.core.errors import FailureCause
+from exqserve.runtime.contracts import (
+    ExLlamaV3LoadConfig,
+    RuntimeGenerationRequest,
+    RuntimeUnavailable,
+)
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime, RuntimeSession
 from tests.runtime.test_adapter import _backend, _FakeTorch, _reset_factories
 
@@ -194,7 +199,7 @@ def test_duplicate_failure_notifications_start_only_one_recovery(
         assert runtime._recovery_task is first_task
         await first_task
 
-        callback()
+        assert callback() is FailureCause.RUNTIME_RECOVERING
         assert len(_RecoveryAsyncGenerator.instances) == 2
         assert runtime.is_healthy is True
         await runtime.close()
@@ -202,21 +207,24 @@ def test_duplicate_failure_notifications_start_only_one_recovery(
     asyncio.run(scenario())
 
 
-def test_non_poison_failure_notification_does_not_recover(
+def test_explicit_backend_failure_notification_recovers_without_stored_generator_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
         runtime = _make_runtime(monkeypatch)
         session = _submit(runtime, "req-a")
-        generator = _RecoveryAsyncGenerator.instances[-1]
+        failed = _RecoveryAsyncGenerator.instances[-1]
         callback = session._on_backend_failure
         assert callable(callback)
 
-        callback()
+        assert callback() is FailureCause.RUNTIME_RECOVERING
 
-        assert runtime._generator is generator
-        assert runtime._recovery_task is None
-        assert len(_RecoveryAsyncGenerator.instances) == 1
+        assert runtime._generator is None
+        assert runtime._quarantined_generator is failed
+        task = runtime._recovery_task
+        assert task is not None
+        await task
+        assert len(_RecoveryAsyncGenerator.instances) == 2
         assert runtime.is_healthy is True
         await runtime.close()
 
@@ -234,8 +242,11 @@ def test_submit_time_known_poison_guard_starts_recovery_and_rejects_racing_submi
         failed = _RecoveryAsyncGenerator.instances[-1]
         failed.error = RuntimeError("shared generator failed")
 
-        with pytest.raises(RuntimeError, match="recovering"):
+        with pytest.raises(RuntimeUnavailable) as exc_info:
             _submit(runtime, "req-b")
+        assert exc_info.value.error.code == "runtime_recovering"
+        assert exc_info.value.error.retryable is True
+        assert exc_info.value.error.cause is FailureCause.RUNTIME_RECOVERING
 
         assert runtime._generator_state is module._GeneratorLifecycleState.RECOVERING
         assert runtime._quarantined_generator is failed
@@ -271,6 +282,55 @@ def test_iteration_task_observer_proactively_starts_recovery(
         assert runtime._generator_state is module._GeneratorLifecycleState.READY
         assert runtime.is_healthy is True
         assert len(_RecoveryAsyncGenerator.instances) == 2
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_observer_recovery_success_preserves_failed_session_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        runtime = _make_runtime(monkeypatch)
+        _RecoveryAsyncGenerator.expose_iteration_task = True
+        session = _submit(runtime, "req-a")
+        failed = _RecoveryAsyncGenerator.instances[-1]
+        callback = session._on_backend_failure
+        assert callable(callback)
+        failed.error = RuntimeError("shared generator failed")
+
+        failed.iteration_task.finish()
+        task = runtime._recovery_task
+        assert task is not None
+        await task
+
+        assert runtime.is_healthy is True
+        assert callback() is FailureCause.RUNTIME_RECOVERING
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_observer_recovery_failure_upgrades_failed_session_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        runtime = _make_runtime(monkeypatch)
+        _RecoveryAsyncGenerator.expose_iteration_task = True
+        _RecoveryAsyncGenerator.fail_construction_at = 2
+        session = _submit(runtime, "req-a")
+        failed = _RecoveryAsyncGenerator.instances[-1]
+        callback = session._on_backend_failure
+        assert callable(callback)
+        failed.error = RuntimeError("shared generator failed")
+
+        failed.iteration_task.finish()
+        task = runtime._recovery_task
+        assert task is not None
+        await task
+
+        assert runtime.is_healthy is False
+        assert callback() is FailureCause.RESTART_REQUIRED
         await runtime.close()
 
     asyncio.run(scenario())
@@ -380,19 +440,26 @@ def test_sysmem_kv_poison_fails_closed_without_constructing_second_generator(
                 sysmem_kv_cache_mb=512,
             ),
         )
-        _submit(runtime, "req-a")
+        session = _submit(runtime, "req-a")
         failed = _RecoveryAsyncGenerator.instances[-1]
-        await _poison_and_wait(runtime, failed)
+        failed.error = RuntimeError("shared generator failed")
+        callback = session._on_backend_failure
+        assert callable(callback)
+        assert callback() is FailureCause.RESTART_REQUIRED
 
         assert runtime._generator_state is module._GeneratorLifecycleState.FAILED
         assert runtime.is_healthy is False
         assert runtime._generator is None
         assert runtime._quarantined_generator is failed
+        assert runtime._recovery_task is None
         assert len(_RecoveryAsyncGenerator.instances) == 1
-        assert failed.close_calls == 1
-        assert failed.generator.clear_queue_calls == 1
-        with pytest.raises(RuntimeError, match="unhealthy"):
+        assert failed.close_calls == 0
+        assert failed.generator.clear_queue_calls == 0
+        with pytest.raises(RuntimeUnavailable) as exc_info:
             _submit(runtime, "req-b")
+        assert exc_info.value.error.code == "restart_required"
+        assert exc_info.value.error.retryable is False
+        assert exc_info.value.error.cause is FailureCause.RESTART_REQUIRED
         with pytest.raises(RuntimeError, match="restart the server process"):
             await runtime.close()
         assert runtime._resources is not None

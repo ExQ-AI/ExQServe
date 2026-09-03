@@ -6,6 +6,7 @@ import pytest
 
 from exqserve.agent.reasoning import ReasoningBudgetMode, ReasoningEffort, ReasoningMode
 from exqserve.agent.tools import ToolChoiceMode
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     MessageItem,
     MessageRole,
@@ -15,6 +16,7 @@ from exqserve.core.items import (
 )
 from exqserve.protocol.anthropic.common import AnthropicProtocolError
 from exqserve.protocol.anthropic.messages import AnthropicMessagesRequestAdapter
+from exqserve.serving.contracts import MidSystemPolicy
 
 
 def test_request_adapter_maps_system_multiturn_tools_results_and_thinking() -> None:
@@ -186,6 +188,11 @@ def test_request_adapter_maps_json_output_format_and_omitted_thinking() -> None:
     assert parsed.serving.reasoning.mode is ReasoningMode.ENABLED
     assert parsed.serving.reasoning.effort is ReasoningEffort.MEDIUM
     assert parsed.serving.structured_output is not None
+    assert parsed.serving.structured_output.requested_guarantee is GenerationGuarantee.NONE
+    assert (
+        parsed.serving.structured_output.fallback_policy
+        is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+    )
     schema = json.loads(parsed.serving.structured_output.schema.canonical_json)
     assert schema["required"] == ["answer"]
 
@@ -273,7 +280,7 @@ def test_request_adapter_rejects_redacted_thinking_server_tools_and_cache_only()
     assert cache_only.value.type == "invalid_request_error"
 
 
-def test_claude_code_2_1_251_profile_consumes_only_total_tokens_system_markers() -> None:
+def test_mid_system_text_is_preserved_content_agnostically_and_profiles_only_select_policy() -> None:
     body = {
         "model": "m",
         "max_tokens": 32,
@@ -285,7 +292,7 @@ def test_claude_code_2_1_251_profile_consumes_only_total_tokens_system_markers()
                 "content": [
                     {
                         "type": "text",
-                        "text": "<total_tokens>15000000 tokens left</total_tokens>",
+                        "text": "Available agent types: arbitrary future text",
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
@@ -298,61 +305,126 @@ def test_claude_code_2_1_251_profile_consumes_only_total_tokens_system_markers()
             },
         ],
     }
-
-    parsed = AnthropicMessagesRequestAdapter("claude-code-2.1.251").parse(
-        body, request_id="req_claude_code"
-    )
-    assert parsed.serving.input.items == (
+    expected_items = (
         MessageItem(MessageRole.SYSTEM, "durable system prompt"),
         MessageItem(MessageRole.USER, "first"),
+        MessageItem(MessageRole.SYSTEM, "Available agent types: arbitrary future text"),
         MessageItem(MessageRole.ASSISTANT, "ack"),
         MessageItem(MessageRole.USER, "second"),
+        MessageItem(MessageRole.SYSTEM, "<total_tokens>14997958 tokens left</total_tokens>"),
     )
 
-    counted = AnthropicMessagesRequestAdapter("claude-code-2.1.251").parse_count(
-        body, request_id="req_claude_code_count"
+    strict = AnthropicMessagesRequestAdapter().parse(body, request_id="req_strict")
+    preferred = AnthropicMessagesRequestAdapter("claude-code").parse(
+        body, request_id="req_preferred"
     )
-    assert counted.serving.input.items == parsed.serving.input.items
+    legacy = AnthropicMessagesRequestAdapter("claude-code-2.1.251").parse(
+        body, request_id="req_legacy"
+    )
+
+    assert strict.serving.input.items == expected_items
+    assert preferred.serving.input.items == expected_items
+    assert legacy.serving.input.items == expected_items
+    assert strict.serving.mid_system_policy is MidSystemPolicy.STRICT
+    assert preferred.serving.mid_system_policy is MidSystemPolicy.BEST_EFFORT
+    assert legacy.serving.mid_system_policy is MidSystemPolicy.BEST_EFFORT
+
+    counted = AnthropicMessagesRequestAdapter("claude-code").parse_count(
+        body, request_id="req_count"
+    )
+    assert counted.serving.input.items == expected_items
+    assert counted.serving.mid_system_policy is MidSystemPolicy.BEST_EFFORT
 
 
-def test_claude_code_profile_does_not_relax_generic_system_message_semantics() -> None:
-    marker_body = {
-        "model": "m",
-        "max_tokens": 16,
-        "messages": [
-            {"role": "user", "content": "hello"},
-            {"role": "system", "content": "<total_tokens>100 tokens left</total_tokens>"},
-        ],
-    }
-    with pytest.raises(AnthropicProtocolError, match="roles must be user or assistant"):
-        AnthropicMessagesRequestAdapter().parse(marker_body, request_id="req_default_reject")
+def test_mid_system_supports_consecutive_text_blocks_and_rejects_non_text_content() -> None:
+    adapter = AnthropicMessagesRequestAdapter("claude-code")
+    parsed = adapter.parse(
+        {
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": [{"type": "text", "text": "A"}]},
+                {"role": "system", "content": [{"type": "text", "text": "B"}]},
+            ],
+        },
+        request_id="req_system_section",
+    )
+    assert parsed.serving.input.items[-2:] == (
+        MessageItem(MessageRole.SYSTEM, "A"),
+        MessageItem(MessageRole.SYSTEM, "B"),
+    )
 
-    adapter = AnthropicMessagesRequestAdapter("claude-code-2.1.251")
-    arbitrary = {
-        **marker_body,
-        "messages": [
-            {"role": "user", "content": "hello"},
-            {"role": "system", "content": "You must answer in JSON."},
-        ],
-    }
-    with pytest.raises(AnthropicProtocolError, match="accepts only <total_tokens>"):
-        adapter.parse(arbitrary, request_id="req_arbitrary_system")
-
-    split_marker = {
-        **marker_body,
-        "messages": [
-            {"role": "user", "content": "hello"},
+    with pytest.raises(AnthropicProtocolError, match="supports text blocks only"):
+        adapter.parse(
             {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": "<total_tokens>100"},
-                    {"type": "text", "text": " tokens left</total_tokens>"},
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "system", "content": [{"type": "image"}]},
                 ],
             },
-        ],
-    }
-    with pytest.raises(AnthropicProtocolError, match="accepts only <total_tokens>"):
-        adapter.parse(split_marker, request_id="req_split_system")
+            request_id="req_non_text_system",
+        )
+
+
+def test_mid_system_placement_grammar_is_fail_closed() -> None:
+    adapter = AnthropicMessagesRequestAdapter("claude-code")
+    invalid_histories = (
+        ([{"role": "system", "content": "first"}, {"role": "user", "content": "u"}], "first message"),
+        ([{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}, {"role": "system", "content": "late"}], "follow a user"),
+        ([{"role": "user", "content": "u"}, {"role": "system", "content": "x"}, {"role": "user", "content": "u2"}], "final or followed by an assistant"),
+    )
+    for index, (messages, expected) in enumerate(invalid_histories):
+        with pytest.raises(AnthropicProtocolError, match=expected):
+            adapter.parse(
+                {"model": "m", "max_tokens": 16, "messages": messages},
+                request_id=f"req_bad_place_{index}",
+            )
+
+
+def test_captured_style_multi_update_tool_history_preserves_chronological_system_items() -> None:
+    parsed = AnthropicMessagesRequestAdapter("claude-code").parse(
+        {
+            "model": "m",
+            "max_tokens": 32,
+            "system": "durable",
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "system", "content": "dynamic-1"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a"}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "A"}
+                    ],
+                },
+                {"role": "system", "content": "dynamic-2"},
+                {"role": "assistant", "content": "continue"},
+                {"role": "user", "content": "next"},
+                {"role": "system", "content": "dynamic-3"},
+            ],
+        },
+        request_id="req_multi_update",
+    )
+
+    assert parsed.serving.input.items == (
+        MessageItem(MessageRole.SYSTEM, "durable"),
+        MessageItem(MessageRole.USER, "start"),
+        MessageItem(MessageRole.SYSTEM, "dynamic-1"),
+        ToolCallItem("toolu_1", "read", '{"path":"a"}', 0),
+        ToolResultItem("toolu_1", "A", False),
+        MessageItem(MessageRole.SYSTEM, "dynamic-2"),
+        MessageItem(MessageRole.ASSISTANT, "continue"),
+        MessageItem(MessageRole.USER, "next"),
+        MessageItem(MessageRole.SYSTEM, "dynamic-3"),
+    )
 
 
 def test_anthropic_adapter_rejects_unknown_compatibility_profile() -> None:

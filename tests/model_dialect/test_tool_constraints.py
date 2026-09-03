@@ -4,7 +4,12 @@ import pytest
 
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
-from exqserve.model.contracts import ToolConstraintMode, ToolConstraintUnsupported
+from exqserve.model.contracts import (
+    ToolConstraintGuarantee,
+    ToolConstraintMode,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
+)
 from exqserve.model.gemma4 import gemma4_tool_constraint
 from exqserve.model.qwen import qwen_tool_constraint
 from exqserve.model.tool_constraints import qwen_parameter_schema
@@ -46,6 +51,12 @@ def _qwen_schema() -> str:
 
 def test_constraint_modes_are_stable() -> None:
     assert [mode.value for mode in ToolConstraintMode] == ["off", "format", "schema"]
+    assert [guarantee.value for guarantee in ToolConstraintGuarantee] == [
+        "none",
+        "format",
+        "schema",
+        "unknown",
+    ]
 
 
 def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
@@ -69,6 +80,7 @@ def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
     assert "start: WS? function WS? </tool_call>" in constraint.lark_grammar
     assert '"</tool_call>"' not in constraint.lark_grammar
     assert "<tool_call> WS? function" not in constraint.lark_grammar
+    assert constraint.guarantee_for_tool("save") is ToolConstraintGuarantee.SCHEMA
 
 
 def test_qwen_constraint_bounds_structural_whitespace() -> None:
@@ -107,6 +119,7 @@ def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> N
     assert '"<tool_call>"' not in constraint.lark_grammar
     assert '"</tool_call>"' not in constraint.lark_grammar
     assert "%json" not in constraint.lark_grammar
+    assert constraint.guarantee_for_tool("lookup") is ToolConstraintGuarantee.FORMAT
 
 
 @pytest.mark.parametrize("mode", (ToolConstraintMode.FORMAT, ToolConstraintMode.SCHEMA))
@@ -176,6 +189,15 @@ def test_qwen_mixed_strict_and_non_strict_tools_keep_distinct_branches() -> None
     assert '"<function=loose_tool>"' in constraint.lark_grammar
     assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' in constraint.lark_grammar
     assert '"<parameter=loose_value>"' not in constraint.lark_grammar
+    assert constraint.guarantee_for_tool("strict_tool") is ToolConstraintGuarantee.SCHEMA
+    assert constraint.guarantee_for_tool("loose_tool") is ToolConstraintGuarantee.FORMAT
+
+
+def test_legacy_tool_generation_constraint_defaults_to_unknown_branch_metadata() -> None:
+    constraint = ToolGenerationConstraint("<tool>", 'start: "ok"', True)
+
+    assert constraint.branch_guarantees is None
+    assert constraint.guarantee_for_tool("lookup") is ToolConstraintGuarantee.UNKNOWN
 
 
 def test_qwen_named_non_strict_tool_ignores_hidden_strict_tools_when_baseline_off() -> None:
@@ -202,6 +224,7 @@ def test_gemma_strict_tool_escalates_off_baseline_but_rejects_parallel() -> None
     assert constraint is not None
     assert '"count"' in constraint.lark_grammar
     assert constraint.eos_after_completed is True
+    assert constraint.guarantee_for_tool("save") is ToolConstraintGuarantee.SCHEMA
 
     with pytest.raises(ToolConstraintUnsupported, match="parallel"):
         gemma4_tool_constraint(_policy(tool, parallel=True), ToolConstraintMode.OFF)

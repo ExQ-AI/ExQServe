@@ -16,6 +16,7 @@ from exqserve.model.contracts import (
     ModelDialect,
     ModelDialectPluginRegistration,
     ReasoningControlSpec,
+    StructuralTokenRequirements,
     ToolConstraintMode,
     ToolGenerationConstraint,
 )
@@ -44,6 +45,8 @@ from exqserve.model.glm5 import (
 )
 from exqserve.model.muse_glimmer import (
     MUSE_GLIMMER_CAPABILITIES,
+    MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS,
+    MUSE_GLIMMER_PROMPT_STRUCTURAL_MARKERS,
     MuseGlimmerIncrementalParser,
     MuseGlimmerPromptCompiler,
 )
@@ -252,6 +255,15 @@ class DeepSeekV4Dialect:
 class MuseGlimmerDialect:
     dialect_id: str = "muse-glimmer"
     capabilities: ModelCapabilities = MUSE_GLIMMER_CAPABILITIES
+
+    @property
+    def structural_token_requirements(self) -> StructuralTokenRequirements:
+        return StructuralTokenRequirements(
+            prompt_markers=MUSE_GLIMMER_PROMPT_STRUCTURAL_MARKERS,
+            output_markers=MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS,
+            native_output_stop_marker=MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS[-1],
+            requires_output_provenance=True,
+        )
 
     def matches(self, architecture: str | None) -> bool:
         if architecture is None:

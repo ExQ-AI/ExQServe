@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -13,11 +14,20 @@ import exqserve.server.app as app_module
 from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
 from exqserve.core.sampling import SamplingOverride, SamplingOverridePolicy
 from exqserve.core.usage import TokenUsage
-from exqserve.model.contracts import ToolConstraintMode
-from exqserve.model.registry import GenericHFDialect
+from exqserve.model.contracts import (
+    StructuralTokenRequirements,
+    ToolConstraintMode,
+)
+from exqserve.model.muse_glimmer import (
+    MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS,
+    MUSE_GLIMMER_PROMPT_STRUCTURAL_MARKERS,
+    MuseGlimmerPromptCompiler,
+)
+from exqserve.model.registry import GenericHFDialect, MuseGlimmerDialect, QwenDialect
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
+    RuntimeCapabilities,
     RuntimeFinished,
     RuntimeGenerationRequest,
     RuntimeModelMetadata,
@@ -29,6 +39,7 @@ from exqserve.runtime.contracts import (
 )
 from exqserve.server.app import compose_server
 from exqserve.server.config import ServerConfig
+from exqserve.serving.contracts import BestEffortMidSystemLowering, MidSystemCapability
 
 
 class _FakeRuntimeSession:
@@ -54,6 +65,16 @@ class _FakeRuntimeSession:
 
 
 class _FakeRuntime:
+    capabilities = RuntimeCapabilities(
+        cancellation=True,
+        template_rendering=True,
+        tokenization=True,
+        seed=True,
+        cache_usage=True,
+        quantized_kv_cache=True,
+        generation_constraints=True,
+    )
+
     def __init__(self) -> None:
         self.is_ready = False
         self.load_calls: list[ExLlamaV3LoadConfig] = []
@@ -162,7 +183,7 @@ def test_composition_loads_runtime_and_serves_health_metrics_and_chat(tmp_path: 
         runtime = _FakeRuntime()
         composed = compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 served_model_id="local",
                 max_request_body_bytes=1024,
                 max_injection_body_bytes=32,
@@ -171,6 +192,9 @@ def test_composition_loads_runtime_and_serves_health_metrics_and_chat(tmp_path: 
         )
         assert len(runtime.load_calls) == 1
         assert runtime.submit_calls == []
+        capabilities = composed.model_manager.current_capabilities()
+        assert capabilities is not None
+        assert capabilities.context_window == composed.served_model.context_length
 
         async with composed.app.router.lifespan_context(composed.app):
             health = await _request(composed.app, "GET", "/health")
@@ -260,7 +284,7 @@ def test_metrics_do_not_read_old_runtime_while_model_switch_is_closing_it(tmp_pa
         old_runtime = _BlockingCloseStatsRuntime(active_jobs=7)
         new_runtime = _StatsRuntime(active_jobs=1)
         composed = compose_server(
-            ServerConfig(first_dir, model_root=tmp_path, served_model_id="first"),
+            ServerConfig(model_directory=first_dir, model_root=tmp_path, served_model_id="first"),
             runtime=old_runtime,
             runtime_factory=lambda: new_runtime,
         )
@@ -292,6 +316,84 @@ def test_metrics_do_not_read_old_runtime_while_model_switch_is_closing_it(tmp_pa
     asyncio.run(scenario())
 
 
+def test_structural_marker_inventory_is_declared_by_dialect_descriptor() -> None:
+    requirements = MuseGlimmerDialect().structural_token_requirements
+
+    assert app_module._structural_marker_texts(requirements) == MUSE_GLIMMER_PROMPT_STRUCTURAL_MARKERS
+    assert app_module._output_structural_marker_texts(requirements) == MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS
+
+    empty = StructuralTokenRequirements()
+    assert app_module._structural_marker_texts(empty) == ()
+    assert app_module._output_structural_marker_texts(empty) == ()
+
+
+def test_muse_compiler_uses_descriptor_native_output_stop() -> None:
+    compiler = MuseGlimmerPromptCompiler(object())
+    requirements = MuseGlimmerDialect().structural_token_requirements
+    native_stop = requirements.native_output_stop_marker
+    assert native_stop is not None
+
+    app_module._configure_effective_compiler_output_stops(
+        compiler,
+        requirements,
+        {native_stop: 200008},
+    )
+
+    assert compiler.stop_conditions == (200008, "<|end_of_text|>")
+
+    external_compiler = MuseGlimmerPromptCompiler(object())
+    app_module._configure_effective_compiler_output_stops(
+        external_compiler,
+        StructuralTokenRequirements(),
+        {},
+    )
+    assert external_compiler.stop_conditions == (MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS[-1], "<|end_of_text|>")
+
+
+def test_mid_system_capability_is_bound_to_exact_builtin_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExternalMuse(MuseGlimmerDialect):
+        dialect_id = "external-muse"
+
+    monkeypatch.setattr(
+        app_module,
+        "_BUILTIN_MID_SYSTEM_CAPABILITIES",
+        {MuseGlimmerDialect: MidSystemCapability.INLINE},
+    )
+
+    assert (
+        app_module._builtin_mid_system_capability(MuseGlimmerDialect())
+        is MidSystemCapability.INLINE
+    )
+    assert (
+        app_module._builtin_mid_system_capability(ExternalMuse())
+        is MidSystemCapability.LEADING_ONLY
+    )
+
+
+def test_best_effort_mid_system_lowering_is_bound_to_exact_qwen_origin() -> None:
+    class ExternalQwen(QwenDialect):
+        dialect_id = "external-qwen"
+
+    assert (
+        app_module._builtin_best_effort_mid_system_lowering(QwenDialect())
+        is BestEffortMidSystemLowering.IN_PLACE_USER_META
+    )
+    assert (
+        app_module._builtin_best_effort_mid_system_lowering(ExternalQwen())
+        is BestEffortMidSystemLowering.MERGED_LEADING
+    )
+    assert (
+        app_module._builtin_best_effort_mid_system_lowering(MuseGlimmerDialect())
+        is BestEffortMidSystemLowering.MERGED_LEADING
+    )
+    assert (
+        app_module._builtin_best_effort_mid_system_lowering(GenericHFDialect())
+        is BestEffortMidSystemLowering.MERGED_LEADING
+    )
+
+
 def test_renderer_workers_gt_one_rejects_external_plugin_v1_subclass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -308,7 +410,7 @@ def test_renderer_workers_gt_one_rejects_external_plugin_v1_subclass(
 
     with pytest.raises(ValueError, match="Plugin API v1"):
         compose_server(
-            ServerConfig(tmp_path, renderer_workers=2),
+            ServerConfig(model_directory=tmp_path, renderer_workers=2),
             runtime=runtime,
         )
 
@@ -320,7 +422,7 @@ def test_failed_renderer_setup_rolls_back_loaded_runtime(tmp_path: Path) -> None
     runtime = _FakeRuntime()
 
     with pytest.raises(ValueError, match="independent prompt renderers"):
-        compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+        compose_server(ServerConfig(model_directory=tmp_path, renderer_workers=2), runtime=runtime)
 
     assert len(runtime.load_calls) == 1
     assert runtime.close_calls == 1
@@ -331,7 +433,7 @@ def test_partial_renderer_replica_failure_rolls_back_loaded_runtime(tmp_path: Pa
     runtime = _RendererRuntime(fail_renderer_at=2)
 
     with pytest.raises(RuntimeError, match="renderer construction failed"):
-        compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+        compose_server(ServerConfig(model_directory=tmp_path, renderer_workers=2), runtime=runtime)
 
     assert runtime.renderer_calls == 2
     assert runtime.close_calls == 1
@@ -360,7 +462,7 @@ def test_failed_bundle_cleanup_surfaces_unresolved_ownership(tmp_path: Path) -> 
     runtime = _FailingCloseRendererRuntime(fail_renderer_at=2)
 
     with pytest.raises(BaseExceptionGroup, match="runtime ownership could not be resolved") as captured:
-        compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+        compose_server(ServerConfig(model_directory=tmp_path, renderer_workers=2), runtime=runtime)
 
     assert runtime.close_calls == 1
     messages = [str(exc) for exc in captured.value.exceptions]
@@ -390,7 +492,7 @@ def test_post_pool_setup_failure_closes_pool_before_runtime(
     with pytest.raises(ValueError, match="does not support constrained tool generation"):
         compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 renderer_workers=2,
                 tool_constraint_mode=ToolConstraintMode.FORMAT,
             ),
@@ -409,7 +511,7 @@ def test_failed_bundle_rollback_works_inside_running_event_loop(tmp_path: Path) 
     async def scenario() -> None:
         runtime = _FakeRuntime()
         with pytest.raises(ValueError, match="independent prompt renderers"):
-            compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+            compose_server(ServerConfig(model_directory=tmp_path, renderer_workers=2), runtime=runtime)
         assert runtime.close_calls == 1
         assert runtime.is_ready is False
 
@@ -428,7 +530,7 @@ def test_switch_replacement_build_failure_rolls_back_new_runtime(tmp_path: Path)
         initial = _RendererRuntime()
         replacement = _RendererRuntime(fail_renderer_at=2)
         composed = compose_server(
-            ServerConfig(first_dir, model_root=tmp_path, renderer_workers=2),
+            ServerConfig(model_directory=first_dir, model_root=tmp_path, renderer_workers=2),
             runtime=initial,
             runtime_factory=lambda: replacement,
         )
@@ -457,7 +559,7 @@ def test_cancelled_switch_waits_for_background_build_and_rolls_back_orphan(tmp_p
         initial = _RendererRuntime()
         replacement = _BlockingRendererRuntime()
         composed = compose_server(
-            ServerConfig(first_dir, model_root=tmp_path, renderer_workers=2),
+            ServerConfig(model_directory=first_dir, model_root=tmp_path, renderer_workers=2),
             runtime=initial,
             runtime_factory=lambda: replacement,
         )
@@ -493,7 +595,7 @@ def test_composition_enforces_physical_context_limit_by_default(tmp_path: Path) 
         runtime = _FakeRuntime()
         composed = compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 served_model_id="local",
                 cache_tokens=256,
                 default_api_output_tokens=1,
@@ -515,8 +617,57 @@ def test_composition_enforces_physical_context_limit_by_default(tmp_path: Path) 
             },
         )
         assert response.status_code == 400
-        assert response.json()["error"]["code"] == "total_context_limit_exceeded"
+        assert response.json()["error"]["code"] == "context_length_exceeded"
+        assert response.json()["error"]["message"] == "Request exceeds the model context window."
         assert runtime.submit_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_models_and_request_control_share_runtime_served_context(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        runtime.model_metadata = RuntimeModelMetadata(
+            251,
+            backend_context_tokens=256,
+            generation_headroom_tokens=5,
+        )
+        composed = compose_server(
+            ServerConfig(model_directory=tmp_path, served_model_id="local", cache_tokens=256),
+            runtime=runtime,
+        )
+
+        models = await _request(composed.app, "GET", "/v1/models")
+        assert models.json()["data"][0]["context_length"] == 251
+
+        exact = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "local",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "disabled",
+                "max_tokens": 249,
+            },
+        )
+        assert exact.status_code == 200
+        assert runtime.submit_calls[-1].max_new_tokens == 249
+
+        over = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "local",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "disabled",
+                "max_tokens": 250,
+            },
+        )
+        assert over.status_code == 400
+        assert over.json()["error"]["code"] == "context_length_exceeded"
+        assert len(runtime.submit_calls) == 1
 
     asyncio.run(scenario())
 
@@ -526,7 +677,7 @@ def test_composition_explicit_max_total_tokens_only_tightens_physical_limit(tmp_
         runtime = _FakeRuntime()
         composed = compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 served_model_id="local",
                 cache_tokens=256,
                 max_total_tokens=3,
@@ -549,7 +700,8 @@ def test_composition_explicit_max_total_tokens_only_tightens_physical_limit(tmp_
             },
         )
         assert response.status_code == 400
-        assert response.json()["error"]["code"] == "total_context_limit_exceeded"
+        assert response.json()["error"]["code"] == "context_length_exceeded"
+        assert response.json()["error"]["message"] == "Request exceeds the model context window."
         assert runtime.submit_calls == []
 
     asyncio.run(scenario())
@@ -560,7 +712,7 @@ def test_composition_applies_static_sampler_override_policy_to_openai_requests(t
         runtime = _FakeRuntime()
         policy = SamplingOverridePolicy((SamplingOverride("temperature", 0.25, True),))
         composed = compose_server(
-            ServerConfig(tmp_path, served_model_id="local", sampling_overrides=policy),
+            ServerConfig(model_directory=tmp_path, served_model_id="local", sampling_overrides=policy),
             runtime=runtime,
         )
         response = await _request(
@@ -593,7 +745,7 @@ def test_composition_selects_qwen_dialect_and_generic_fallback_from_runtime_arch
 
         generic_runtime = _FakeRuntime()
         generic_runtime.model_metadata = RuntimeModelMetadata(131072, "LlamaForCausalLM")
-        generic = compose_server(ServerConfig(tmp_path, served_model_id="generic"), runtime=generic_runtime)
+        generic = compose_server(ServerConfig(model_directory=tmp_path, served_model_id="generic"), runtime=generic_runtime)
         generic_response = await _request(
             generic.app,
             "POST",
@@ -609,7 +761,7 @@ def test_composition_selects_qwen_dialect_and_generic_fallback_from_runtime_arch
 
         qwen_runtime = _FakeRuntime()
         qwen_runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
-        qwen = compose_server(ServerConfig(tmp_path, served_model_id="qwen"), runtime=qwen_runtime)
+        qwen = compose_server(ServerConfig(model_directory=tmp_path, served_model_id="qwen"), runtime=qwen_runtime)
         qwen_response = await _request(
             qwen.app,
             "POST",
@@ -635,7 +787,7 @@ def test_composition_requires_constraint_provider_only_when_mode_is_enabled(tmp_
 
     try:
         compose_server(
-            ServerConfig(tmp_path, tool_constraint_mode=ToolConstraintMode.FORMAT),
+            ServerConfig(model_directory=tmp_path, tool_constraint_mode=ToolConstraintMode.FORMAT),
             runtime=generic_runtime,
         )
     except ValueError as exc:
@@ -648,7 +800,7 @@ def test_qwen_strict_tool_escalates_constraint_when_global_mode_is_off(tmp_path:
     async def scenario() -> None:
         runtime = _FakeRuntime()
         runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
-        composed = compose_server(ServerConfig(tmp_path, served_model_id="qwen"), runtime=runtime)
+        composed = compose_server(ServerConfig(model_directory=tmp_path, served_model_id="qwen"), runtime=runtime)
         response = await _request(
             composed.app,
             "POST",
@@ -685,13 +837,77 @@ def test_qwen_strict_tool_escalates_constraint_when_global_mode_is_off(tmp_path:
     asyncio.run(scenario())
 
 
+def test_dialect_tool_false_rejects_strict_tool_before_runtime_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        base = QwenDialect()
+        dialect = replace(
+            base,
+            capabilities=replace(
+                base.capabilities,
+                tool_calling=False,
+                parallel_tool_calls=False,
+            ),
+        )
+
+        class FixedRegistry:
+            def resolve(self, architecture: str | None, forced_dialect: str) -> QwenDialect:
+                del architecture, forced_dialect
+                return dialect
+
+        monkeypatch.setattr(app_module, "default_model_dialect_registry", lambda: FixedRegistry())
+        runtime = _FakeRuntime()
+        runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
+        composed = compose_server(ServerConfig(model_directory=tmp_path, served_model_id="qwen"), runtime=runtime)
+        capabilities = composed.model_manager.current_capabilities()
+        assert capabilities is not None
+        assert capabilities.dialect_capabilities.tool_calling is False
+        assert capabilities.tool_generation_available is False
+        assert capabilities.strict_tool_generation_available is False
+
+        response = await _request(
+            composed.app,
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"id": {"type": "integer"}},
+                                "required": ["id"],
+                                "additionalProperties": False,
+                            },
+                            "strict": True,
+                        },
+                    }
+                ],
+                "parallel_tool_calls": False,
+                "reasoning_effort": "disabled",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "tool_constraint_unsupported"
+        assert runtime.submit_calls == []
+
+    asyncio.run(scenario())
+
+
 def test_generic_strict_tool_rejects_before_runtime_submission_when_global_mode_is_off(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         runtime = _FakeRuntime()
         runtime.model_metadata = RuntimeModelMetadata(131072, "LlamaForCausalLM")
-        composed = compose_server(ServerConfig(tmp_path, served_model_id="generic"), runtime=runtime)
+        composed = compose_server(ServerConfig(model_directory=tmp_path, served_model_id="generic"), runtime=runtime)
         response = await _request(
             composed.app,
             "POST",
@@ -730,7 +946,7 @@ def test_qwen_composition_forwards_enabled_tool_constraint(tmp_path: Path) -> No
         runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
         composed = compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 served_model_id="qwen",
                 tool_constraint_mode=ToolConstraintMode.FORMAT,
             ),
@@ -773,7 +989,7 @@ def test_qwen_constrained_parallel_restores_runtime_constraint(tmp_path: Path) -
         runtime.model_metadata = RuntimeModelMetadata(131072, "Qwen3_5ForConditionalGeneration")
         composed = compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 served_model_id="qwen",
                 tool_constraint_mode=ToolConstraintMode.SCHEMA,
             ),
@@ -843,7 +1059,7 @@ def test_metadata_capture_is_explicit_and_does_not_store_payload_text(tmp_path: 
         capture_path = tmp_path / "capture.jsonl"
         runtime = _FakeRuntime()
         config = ServerConfig(
-            tmp_path,
+            model_directory=tmp_path,
             capture_mode=CaptureMode.METADATA,
             capture_path=capture_path,
             served_model_id="local",
@@ -917,7 +1133,7 @@ def test_bearer_auth_protects_v1_and_metrics_but_not_health(tmp_path: Path) -> N
     async def scenario() -> None:
         runtime = _FakeRuntime()
         config = ServerConfig(
-            tmp_path,
+            model_directory=tmp_path,
             served_model_id="local",
             api_keys=("alpha", "beta"),
         )
@@ -973,7 +1189,7 @@ def test_docs_remain_available_without_api_keys(tmp_path: Path) -> None:
 def test_metrics_can_be_explicitly_public_with_api_auth_enabled(tmp_path: Path) -> None:
     async def scenario() -> None:
         composed = compose_server(
-            ServerConfig(tmp_path, api_keys=("alpha",), protect_metrics=False),
+            ServerConfig(model_directory=tmp_path, api_keys=("alpha",), protect_metrics=False),
             runtime=_FakeRuntime(),
         )
         assert (await _request(composed.app, "GET", "/metrics")).status_code == 200
@@ -987,7 +1203,7 @@ def test_oversized_openai_body_is_rejected_before_runtime_submission(tmp_path: P
         runtime = _FakeRuntime()
         composed = compose_server(
             ServerConfig(
-                tmp_path,
+                model_directory=tmp_path,
                 served_model_id="local",
                 max_request_body_bytes=128,
             ),
@@ -1016,7 +1232,7 @@ def test_chunked_oversized_openai_body_is_bounded_without_content_length(tmp_pat
     async def scenario() -> None:
         runtime = _FakeRuntime()
         composed = compose_server(
-            ServerConfig(tmp_path, served_model_id="local", max_request_body_bytes=32),
+            ServerConfig(model_directory=tmp_path, served_model_id="local", max_request_body_bytes=32),
             runtime=runtime,
         )
 
@@ -1057,7 +1273,7 @@ def test_model_management_switch_unload_load_keeps_http_app_alive(tmp_path: Path
             return created
 
         composed = compose_server(
-            ServerConfig(first_dir, model_root=tmp_path),
+            ServerConfig(model_directory=first_dir, model_root=tmp_path),
             runtime=initial,
             runtime_factory=runtime_factory,
         )
@@ -1130,7 +1346,7 @@ def test_model_management_admin_routes_use_bearer_auth(tmp_path: Path) -> None:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
         composed = compose_server(
-            ServerConfig(model_dir, api_keys=("secret",)),
+            ServerConfig(model_directory=model_dir, api_keys=("secret",)),
             runtime=_FakeRuntime(),
         )
         assert (await _request(composed.app, "GET", "/admin/models")).status_code == 401

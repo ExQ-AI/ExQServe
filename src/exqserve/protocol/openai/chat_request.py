@@ -7,6 +7,7 @@ import json
 from exqserve.agent.schema import JsonSchema, validate_strict_function_schema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     CanonicalItem,
     ImageContentPart,
@@ -340,13 +341,30 @@ def _parse_structured_output(value: object) -> StructuredOutputSpec | None:
     if format_type == "text":
         return None
     if format_type == "json_object":
-        return StructuredOutputSpec(_schema_from_object({"type": "object"}, param="response_format"))
+        return StructuredOutputSpec(
+            _schema_from_object({"type": "object"}, param="response_format"),
+            GenerationGuarantee.FORMAT,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
     if format_type == "json_schema":
         definition = format_value.get("json_schema")
         if not isinstance(definition, dict):
             raise invalid_request("invalid_response_format", "json_schema definition is required.", "response_format.json_schema")
+        strict = definition.get("strict", False)
+        if not isinstance(strict, bool):
+            raise invalid_request(
+                "invalid_response_format",
+                "response_format.json_schema.strict must be boolean.",
+                "response_format.json_schema.strict",
+            )
         return StructuredOutputSpec(
-            _schema_from_object(definition.get("schema"), param="response_format.json_schema.schema")
+            _schema_from_object(definition.get("schema"), param="response_format.json_schema.schema"),
+            GenerationGuarantee.SCHEMA if strict else GenerationGuarantee.NONE,
+            (
+                ConstraintFallbackPolicy.FAIL_CLOSED
+                if strict
+                else ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+            ),
         )
     raise invalid_request("invalid_response_format", "Unsupported response_format.", "response_format.type")
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import pytest
+
 from exqserve.core.events import (
     GenerationEvent,
     ReasoningCompleted,
@@ -14,17 +16,51 @@ from exqserve.core.events import (
     ToolCallCompleted,
     ToolCallStarted,
 )
-from exqserve.model.muse_glimmer import MuseGlimmerIncrementalParser
+from exqserve.core.tokens import NativeTokenSpan
+from exqserve.model.contracts import NativeTokenProvenanceError
+from exqserve.model.muse_glimmer import (
+    MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS,
+    MuseGlimmerIncrementalParser,
+)
+
+_NATIVE_IDS = {
+    "<|start|>": 200022,
+    "<|message|>": 200023,
+    "<|eom|>": 200007,
+    "<|eot|>": 200008,
+}
+
+
+def _native_spans(chunk: str) -> tuple[NativeTokenSpan, ...]:
+    spans: list[NativeTokenSpan] = []
+    for marker in MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS:
+        start = 0
+        while (position := chunk.find(marker, start)) >= 0:
+            spans.append(
+                NativeTokenSpan(position, position + len(marker), _NATIVE_IDS[marker], marker)
+            )
+            start = position + len(marker)
+    return tuple(sorted(spans, key=lambda span: span.start))
 
 
 def _parse(chunks: Iterable[str]) -> tuple[list[GenerationEvent], bool]:
     parser = MuseGlimmerIncrementalParser("req-muse")
     events: list[GenerationEvent] = []
     for chunk in chunks:
-        events.extend(parser.feed(chunk))
+        events.extend(parser.feed_with_native_tokens(chunk, _native_spans(chunk)))
     finished = parser.finish()
     events.extend(finished.events)
     return events, finished.incomplete_tool_call
+
+
+def _valid_native_splits(source: str) -> list[int]:
+    blocked: set[int] = set()
+    for marker in MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS:
+        start = 0
+        while (position := source.find(marker, start)) >= 0:
+            blocked.update(range(position + 1, position + len(marker)))
+            start = position + len(marker)
+    return [split for split in range(len(source) + 1) if split not in blocked]
 
 
 def _reasoning(events: Iterable[GenerationEvent]) -> str:
@@ -66,7 +102,7 @@ def test_muse_recipient_channels_are_chunk_boundary_safe() -> None:
     )
     baseline, _ = _parse([source])
 
-    for split in range(len(source) + 1):
+    for split in _valid_native_splits(source):
         events, incomplete = _parse([source[:split], source[split:]])
         assert incomplete is False
         assert _reasoning(events) == _reasoning(baseline) == "分析"
@@ -105,7 +141,7 @@ def test_muse_atem_parallel_invokes_are_repeated_and_indexed() -> None:
         '<atem:invoke name="time">\n<atem:parameter name="city">Tokyo</atem:parameter>\n</atem:invoke>\n'
         "</atem:function_calls><|eot|>"
     )
-    events, incomplete = _parse(list(source))
+    events, incomplete = _parse([source])
     calls = [event.call for event in _calls(events)]
 
     assert incomplete is False
@@ -176,9 +212,60 @@ def test_muse_raw_text_fallback_stays_text_for_protocol_robustness() -> None:
     assert _text(events) == "plain answer"
 
 
+def test_muse_ordinary_output_control_spellings_stay_in_reasoning_at_every_split() -> None:
+    literal = (
+        "source <|start|>assistant then <|message|> and <|eom|> and <|eot|> remain literal"
+    )
+    for split in range(len(literal) + 1):
+        parser = MuseGlimmerIncrementalParser("req-muse")
+        events: list[GenerationEvent] = []
+        header = " to=self<|message|>"
+        events.extend(parser.feed_with_native_tokens(header, _native_spans(header)))
+        events.extend(parser.feed_with_native_tokens(literal[:split], ()))
+        events.extend(parser.feed_with_native_tokens(literal[split:], ()))
+        close = "<|eom|>"
+        events.extend(parser.feed_with_native_tokens(close, _native_spans(close)))
+        finished = parser.finish()
+        events.extend(finished.events)
+
+        assert finished.incomplete_tool_call is False
+        assert _reasoning(events) == literal
+        assert _text(events) == ""
+
+
+def test_muse_missing_or_unaligned_output_provenance_fails_closed() -> None:
+    parser = MuseGlimmerIncrementalParser("req-muse")
+    header = " to=self<|message|>"
+    parser.feed_with_native_tokens(header, _native_spans(header))
+    with pytest.raises(NativeTokenProvenanceError):
+        parser.feed("<|eom|>")
+
+    parser = MuseGlimmerIncrementalParser("req-muse")
+    parser.feed_with_native_tokens(header, _native_spans(header))
+    parser.feed("ordinary text <|eo")
+    with pytest.raises(NativeTokenProvenanceError):
+        parser.finish()
+
+
+def test_muse_native_start_requires_valid_assistant_suffix() -> None:
+    parser = MuseGlimmerIncrementalParser("req-muse")
+    header = " to=self<|message|>reason<|eom|>"
+    parser.feed_with_native_tokens(header, _native_spans(header))
+    invalid = "<|start|>assistX"
+    with pytest.raises(NativeTokenProvenanceError):
+        parser.feed_with_native_tokens(invalid, _native_spans(invalid))
+
+    parser = MuseGlimmerIncrementalParser("req-muse")
+    parser.feed_with_native_tokens(header, _native_spans(header))
+    partial = "<|start|>assist"
+    parser.feed_with_native_tokens(partial, _native_spans(partial))
+    with pytest.raises(NativeTokenProvenanceError):
+        parser.finish()
+
 def test_finish_is_idempotent() -> None:
     parser = MuseGlimmerIncrementalParser("req-muse")
-    parser.feed(" to=user<|message|>hello")
+    chunk = " to=user<|message|>hello"
+    parser.feed_with_native_tokens(chunk, _native_spans(chunk))
     first = parser.finish()
     second = parser.finish()
 

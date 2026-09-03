@@ -122,9 +122,13 @@ class ServerConfig:
             raise TypeError("host must be a string")
         if not self.host.strip():
             raise ValueError("host must not be empty")
-        if self.anthropic_compatibility_profile not in {None, "claude-code-2.1.251"}:
+        if self.anthropic_compatibility_profile not in {
+            None,
+            "claude-code",
+            "claude-code-2.1.251",
+        }:
             raise ValueError(
-                "anthropic_compatibility_profile must be claude-code-2.1.251 or None"
+                "anthropic_compatibility_profile must be claude-code, claude-code-2.1.251, or None"
             )
         if not isinstance(self.model_dialect, str):
             raise TypeError("model_dialect must be a string")
@@ -330,10 +334,17 @@ class ServerConfig:
         )
 
     def request_control_config(self, model_limit: int | None = None) -> RequestControlConfig:
+        return self.request_control_config_for_context(self.effective_context_length(model_limit))
+
+    def request_control_config_for_context(self, context_window: int) -> RequestControlConfig:
+        if not isinstance(context_window, int) or isinstance(context_window, bool):
+            raise TypeError("context_window must be an integer")
+        if context_window <= 0:
+            raise ValueError("context_window must be positive")
         return RequestControlConfig(
             self.max_in_flight,
             self.max_prompt_tokens,
             self.max_output_tokens,
-            self.effective_context_length(model_limit),
+            context_window,
             self.timeout_seconds,
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -59,6 +60,56 @@ def test_detailed_tool_validation_returns_canonical_arguments_from_same_parse() 
 
     assert detailed.result.is_valid
     assert detailed.canonical_arguments == ('{"a":1,"b":2}',)
+
+
+def test_tool_validation_reports_numeric_overflow_as_invalid_json() -> None:
+    tool = _tool(
+        "lookup",
+        '{"type":"object","properties":{"x":{"type":"number"}},"required":["x"]}',
+    )
+    detailed = validate_tool_calls_with_canonical_arguments(
+        (_call(0, "lookup", args='{"x":1e999}'),),
+        _policy(tool),
+    )
+
+    assert detailed.result.is_valid is False
+    assert [issue.code for issue in detailed.result.issues] == [ValidationCode.INVALID_JSON]
+    assert "non-finite JSON number" in detailed.result.issues[0].message
+    assert detailed.canonical_arguments == (None,)
+
+
+def test_tool_validation_reports_host_integer_limit_as_invalid_json() -> None:
+    limit = sys.get_int_max_str_digits()
+    if limit == 0:
+        pytest.skip("Python integer digit safety limit is disabled")
+
+    huge_integer = "9" * (limit + 1)
+    tool = _tool(
+        "lookup",
+        '{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}',
+    )
+    detailed = validate_tool_calls_with_canonical_arguments(
+        (_call(0, "lookup", args=f'{{"x":{huge_integer}}}'),),
+        _policy(tool),
+    )
+
+    assert detailed.result.is_valid is False
+    assert [issue.code for issue in detailed.result.issues] == [ValidationCode.INVALID_JSON]
+    assert "supported digit limit" in detailed.result.issues[0].message
+    assert detailed.canonical_arguments == (None,)
+
+
+def test_tool_validation_reports_decoder_depth_as_invalid_json() -> None:
+    nested = "[" * 10_000 + "0" + "]" * 10_000
+    detailed = validate_tool_calls_with_canonical_arguments(
+        (_call(0, "lookup", args=f'{{"x":{nested}}}'),),
+        _policy(_tool("lookup")),
+    )
+
+    assert detailed.result.is_valid is False
+    assert [issue.code for issue in detailed.result.issues] == [ValidationCode.INVALID_JSON]
+    assert "decoder depth" in detailed.result.issues[0].message
+    assert detailed.canonical_arguments == (None,)
 
 
 def test_validation_codes_cover_v1_agent_semantics() -> None:

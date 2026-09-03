@@ -144,6 +144,40 @@ def test_qwen38_real_template_accepts_compiled_agent_history_deterministically(
     assert first.text.endswith("<think>\n")
 
 
+def test_qwen38_real_template_accepts_tool_result_followed_by_user_meta_reminder() -> None:
+    adapter = _TransformersTemplateAdapter(_model_directory())
+    compiler = QwenPromptCompiler(adapter)
+    tool = _tool()
+    policy = ToolPolicy(
+        tools=(tool,),
+        choice=ToolChoice(ToolChoiceMode.AUTO),
+        allow_parallel=True,
+    )
+    reminder = "<system-reminder>\nlate rule\n</system-reminder>"
+    request = CanonicalRequest(
+        request_id="compat-qwen38-reminder",
+        model="qwen",
+        items=(
+            MessageItem(MessageRole.SYSTEM, "Stable system"),
+            MessageItem(MessageRole.USER, "List /tmp"),
+            ToolCallItem("call-1", "list_files", '{"path":"/tmp"}', 0),
+            ToolResultItem("call-1", "a.txt"),
+            MessageItem(MessageRole.USER, reminder),
+        ),
+    )
+
+    compiled = compiler.compile(request, ReasoningPolicy(ReasoningMode.DISABLED), policy)
+
+    tool_call = compiled.text.index("<tool_call>")
+    tool_response = compiled.text.index("<tool_response>", tool_call)
+    reminder_start = compiled.text.index("<system-reminder>", tool_response)
+    assert tool_call < tool_response < reminder_start
+    assert "a.txt" in compiled.text[tool_response:reminder_start]
+    assert "late rule" in compiled.text[reminder_start:]
+    assert compiled.text.endswith("<think>\n\n</think>\n\n")
+    assert compiled.input_ids
+
+
 def test_qwen38_real_template_disabled_reasoning_uses_empty_think_block() -> None:
     adapter = _TransformersTemplateAdapter(_model_directory())
     compiler = QwenPromptCompiler(adapter)

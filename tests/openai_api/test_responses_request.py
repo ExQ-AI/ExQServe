@@ -4,6 +4,7 @@ import pytest
 
 from exqserve.agent.reasoning import ReasoningBudgetMode, ReasoningEffort, ReasoningMode
 from exqserve.agent.tools import ToolChoiceMode
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     ImageContentPart,
     MessageItem,
@@ -111,6 +112,8 @@ def test_responses_full_agent_request_maps_item_natively_to_serving_semantics() 
     assert parsed.serving.sampling.temperature == 0.7
     assert parsed.serving.structured_output is not None
     assert '"ok"' in parsed.serving.structured_output.schema.canonical_json
+    assert parsed.serving.structured_output.requested_guarantee is GenerationGuarantee.SCHEMA
+    assert parsed.serving.structured_output.fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
 
 
 def test_responses_string_input_and_default_output_limit() -> None:
@@ -284,6 +287,26 @@ def test_responses_tool_call_indices_reset_for_each_assistant_turn() -> None:
     ]
 
 
+def test_responses_tool_call_indices_reset_after_new_user_turn() -> None:
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"},
+            {"type": "message", "role": "user", "content": "second"},
+            {"type": "function_call", "call_id": "call-2", "name": "lookup", "arguments": "{}"},
+        ],
+        "max_output_tokens": 8,
+    }
+
+    parsed = ResponsesRequestAdapter().parse(body, request_id="r")
+    calls = [item for item in parsed.serving.input.items if isinstance(item, ToolCallItem)]
+    assert [(call.call_id, call.index) for call in calls] == [
+        ("call-1", 0),
+        ("call-2", 0),
+    ]
+
+
 @pytest.mark.parametrize(
     ("patch", "code"),
     [
@@ -379,3 +402,69 @@ def test_responses_reasoning_budget_uses_top_level_extension_and_preserves_reaso
             request_id="responses-budget-conflict",
         )
     assert exc_info.value.code == "conflicting_reasoning_budget"
+
+
+def test_responses_structured_output_guarantee_matrix() -> None:
+    base = {"model": "m", "input": "hello"}
+
+    json_object = ResponsesRequestAdapter().parse(
+        {**base, "text": {"format": {"type": "json_object"}}},
+        request_id="json-object",
+    ).serving.structured_output
+    assert json_object is not None
+    assert json_object.requested_guarantee is GenerationGuarantee.FORMAT
+    assert json_object.fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
+
+    non_strict = ResponsesRequestAdapter().parse(
+        {
+            **base,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "x",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                }
+            },
+        },
+        request_id="non-strict",
+    ).serving.structured_output
+    assert non_strict is not None
+    assert non_strict.requested_guarantee is GenerationGuarantee.NONE
+    assert non_strict.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+
+    omitted = ResponsesRequestAdapter().parse(
+        {
+            **base,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "x",
+                    "schema": {"type": "object"},
+                }
+            },
+        },
+        request_id="omitted",
+    ).serving.structured_output
+    assert omitted is not None
+    assert omitted.requested_guarantee is GenerationGuarantee.NONE
+    assert omitted.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+
+
+def test_responses_rejects_non_boolean_structured_output_strict() -> None:
+    body = {
+        "model": "m",
+        "input": "hello",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "x",
+                "schema": {"type": "object"},
+                "strict": 1,
+            }
+        },
+    }
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        ResponsesRequestAdapter().parse(body, request_id="bad-strict")
+    assert exc_info.value.code == "invalid_text_format"
+    assert exc_info.value.param == "text.format.strict"

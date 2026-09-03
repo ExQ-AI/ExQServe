@@ -9,7 +9,7 @@ from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.request import CanonicalRequest
-from exqserve.serving.contracts import ServingRejected, ServingRequest
+from exqserve.serving.contracts import MidSystemPolicy, ServingRejected, ServingRequest
 
 
 def _input() -> CanonicalRequest:
@@ -39,10 +39,12 @@ def test_serving_request_is_immutable_and_contains_no_wire_stream_field() -> Non
         "tools",
         "structured_output",
         "max_output_tokens",
+        "mid_system_policy",
         "seed",
         "sampling",
         "stop_conditions",
     }
+    assert request.mid_system_policy is MidSystemPolicy.LEGACY_UNSPECIFIED
     with pytest.raises(FrozenInstanceError):
         request.max_output_tokens = 64  # type: ignore[misc]
 

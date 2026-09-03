@@ -34,6 +34,7 @@ class CompletionReason(str, Enum):
     STOP = "stop"
     LENGTH = "length"
     TOOL_CALLS = "tool_calls"
+    FILTER = "filter"
 
 
 @dataclass(frozen=True, slots=True)

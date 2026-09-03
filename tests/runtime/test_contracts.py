@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
@@ -33,13 +34,22 @@ def test_runtime_capabilities_are_immutable_booleans() -> None:
 
 
 def test_runtime_model_metadata_is_truthful_and_immutable() -> None:
-    known = RuntimeModelMetadata(max_context_tokens=131072, architecture=" Qwen3_5ForConditionalGeneration ")
+    known = RuntimeModelMetadata(
+        max_context_tokens=131072,
+        architecture=" Qwen3_5ForConditionalGeneration ",
+        backend_context_tokens=131077,
+        generation_headroom_tokens=5,
+    )
     unknown = RuntimeModelMetadata()
 
     assert known.max_context_tokens == 131072
     assert known.architecture == "Qwen3_5ForConditionalGeneration"
+    assert known.backend_context_tokens == 131077
+    assert known.generation_headroom_tokens == 5
     assert unknown.max_context_tokens is None
     assert unknown.architecture is None
+    assert unknown.backend_context_tokens is None
+    assert unknown.generation_headroom_tokens is None
     with pytest.raises(ValueError, match="positive"):
         RuntimeModelMetadata(max_context_tokens=0)
     with pytest.raises(TypeError, match="integer"):
@@ -335,6 +345,61 @@ def test_generation_request_is_immutable_and_protocol_neutral() -> None:
         RuntimeGenerationRequest("req", (1,), 0)
     with pytest.raises(ValueError, match="stop"):
         RuntimeGenerationRequest("req", (1,), 1, stop_conditions=("",))
+
+
+def test_runtime_generation_request_preserves_guarantee_and_fallback_policy() -> None:
+    request = RuntimeGenerationRequest(
+        "req",
+        (1,),
+        4,
+        output_json_schema='{"type":"object"}',
+        generation_guarantee=GenerationGuarantee.SCHEMA,
+        constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+    )
+
+    assert request.generation_guarantee is GenerationGuarantee.SCHEMA
+    assert request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
+
+    with pytest.raises(TypeError, match="generation_guarantee"):
+        RuntimeGenerationRequest(
+            "req",
+            (1,),
+            4,
+            generation_guarantee="schema",  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="constraint_fallback_policy"):
+        RuntimeGenerationRequest(
+            "req",
+            (1,),
+            4,
+            constraint_fallback_policy="fail_closed",  # type: ignore[arg-type]
+        )
+
+
+def test_runtime_finished_effective_guarantee_requires_activation() -> None:
+    usage = TokenUsage(input_tokens=1, output_tokens=1)
+    timing = RuntimeTiming()
+    finished = RuntimeFinished(
+        "req",
+        RuntimeStopReason.FILTER,
+        usage,
+        timing,
+        hard_constraint_installed=True,
+        hard_constraint_activated=True,
+        effective_generation_guarantee=GenerationGuarantee.FORMAT,
+    )
+    assert finished.effective_generation_guarantee is GenerationGuarantee.FORMAT
+
+    with pytest.raises(ValueError, match="activated hard constraint"):
+        RuntimeFinished(
+            "req",
+            RuntimeStopReason.EOS,
+            usage,
+            timing,
+            hard_constraint_installed=True,
+            hard_constraint_activated=False,
+            effective_generation_guarantee=GenerationGuarantee.SCHEMA,
+        )
 
 
 def test_timing_preserves_unknown_and_rejects_invalid_measurements() -> None:

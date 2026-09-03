@@ -41,7 +41,7 @@ def _function_tool() -> dict[str, object]:
 def test_real_composed_http_agent_path_on_gpu() -> None:
     model_directory = _model_directory()
     config = ServerConfig(
-        model_directory,
+        model_directory=model_directory,
         cache_tokens=4096,
         max_batch_size=2,
         max_chunk_size=512,

@@ -21,6 +21,7 @@ from exqserve.plugin_api import (
     MessageRole,
     ModelCapabilities,
     ModelDialectPluginRegistration,
+    ParserTerminalIssue,
     ReasoningControlProvider,
     ReasoningControlSpec,
     ReasoningPolicy,
@@ -91,7 +92,7 @@ class _Compiler:
 @dataclass(frozen=True)
 class _Finish:
     events: tuple[GenerationEvent, ...]
-    incomplete_tool_call: bool = False
+    terminal_issue: ParserTerminalIssue | None = None
 
 
 class _Parser:

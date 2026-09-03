@@ -138,6 +138,33 @@ def test_assistant_reasoning_text_tool_call_and_result_group_into_template_histo
     }
 
 
+def test_tool_result_followed_by_user_meta_reminder_preserves_tool_association() -> None:
+    compiler = QwenPromptCompiler(_FakeTemplateAdapter())
+    reminder = "<system-reminder>\nlate rule\n</system-reminder>"
+    prepared = compiler.prepare(
+        _request(
+            MessageItem(MessageRole.SYSTEM, "stable"),
+            MessageItem(MessageRole.USER, "inspect"),
+            ToolCallItem("call-1", "list_files", '{"path":"/tmp"}', 0),
+            ToolResultItem("call-1", "a.txt"),
+            MessageItem(MessageRole.USER, reminder),
+        ),
+        ReasoningPolicy(),
+        _policy(_tool("list_files")),
+    )
+
+    assert [(message.role, message.content) for message in prepared.messages] == [
+        ("system", "stable"),
+        ("user", "inspect"),
+        ("assistant", ""),
+        ("tool", "a.txt"),
+        ("user", reminder),
+    ]
+    assert prepared.messages[2].tool_calls[0].name == "list_files"
+    assert prepared.messages[3].tool_call_id == "call-1"
+    assert prepared.messages[3].name == "list_files"
+
+
 def test_multimodal_tool_result_maps_to_tool_template_content() -> None:
     compiler = QwenPromptCompiler(_FakeTemplateAdapter())
     prepared = compiler.prepare(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 
@@ -40,6 +41,43 @@ def test_malformed_json_is_distinct_from_duplicate_keys() -> None:
 @pytest.mark.parametrize("text", ["NaN", "Infinity", "-Infinity", '{"x":NaN}'])
 def test_non_finite_constants_are_rejected(text: str) -> None:
     with pytest.raises(InvalidJsonError, match="non-finite"):
+        parse_json_strict(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1e999",
+        "-1e999",
+        "1e309",
+        '{"x":1e999}',
+        '[0,{"x":-1e999}]',
+    ],
+)
+def test_numeric_overflow_to_non_finite_float_is_rejected(text: str) -> None:
+    with pytest.raises(InvalidJsonError, match="non-finite JSON number"):
+        parse_json_strict(text)
+
+
+def test_large_finite_float_remains_valid_json() -> None:
+    assert parse_json_strict("1e308") == 1e308
+    assert parse_json_strict('{"x":-1e308}') == {"x": -1e308}
+
+
+def test_integer_beyond_python_digit_limit_is_rejected_as_invalid_json() -> None:
+    limit = sys.get_int_max_str_digits()
+    if limit == 0:
+        pytest.skip("Python integer digit safety limit is disabled")
+
+    accepted = "9" * limit
+    assert parse_json_strict(accepted) == int(accepted)
+    with pytest.raises(InvalidJsonError, match="supported digit limit"):
+        parse_json_strict("9" * (limit + 1))
+
+
+def test_decoder_recursion_limit_is_rejected_as_invalid_json() -> None:
+    text = "[" * 10_000 + "0" + "]" * 10_000
+    with pytest.raises(InvalidJsonError, match="decoder depth"):
         parse_json_strict(text)
 
 

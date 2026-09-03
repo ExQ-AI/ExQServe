@@ -27,7 +27,8 @@ from enum import Enum, auto
 from typing import Any, Protocol
 
 from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
@@ -47,9 +48,11 @@ from exqserve.runtime.contracts import (
     RuntimeStopReason,
     RuntimeTextDelta,
     RuntimeTiming,
+    RuntimeUnavailable,
 )
 from exqserve.runtime.literal_markers import (
     discover_marker_texts,
+    effective_marker_texts,
     encode_protected_prompt,
     marker_sentinels,
     protect_messages,
@@ -643,28 +646,30 @@ def translate_exllamav3_result(
     return tuple(events)
 
 
-def _merge_ready_stream_results(
+# ExLlamaV3 queues natural generator streaming results. Keep short ready bursts coalesced
+# while preventing long consumer backlogs from collapsing into one user-visible delta.
+_READY_STREAM_DRAIN_MAX_RESULTS = 16
+
+
+def _drain_ready_stream_results(
     job: object,
     first: Mapping[str, object],
-) -> Mapping[str, object]:
-    """Drain already-ready ExLlamaV3 streaming results and merge their text.
-
-    Speculative decoding may enqueue several results during one generator
-    iteration. Draining the ready queue before yielding keeps downstream token
-    delivery smooth instead of allowing queued deltas to surface as bursts.
-    Jobs without an asyncio queue keep the ordinary one-result path.
-    """
+) -> tuple[Mapping[str, object], ...]:
+    """Drain one bounded batch of already-ready ExLlamaV3 results in backend order."""
 
     if first.get("stage") != "streaming" or first.get("eos") is True:
-        return first
+        return (first,)
 
     queue = getattr(job, "queue", None)
     if not isinstance(queue, asyncio.Queue):
-        return first
+        return (first,)
 
     ready: list[Mapping[str, object]] = [first]
-    while not queue.empty():
-        item = queue.get_nowait()
+    for _ in range(_READY_STREAM_DRAIN_MAX_RESULTS - 1):
+        try:
+            item = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
         if isinstance(item, Exception):
             raise item
         if not isinstance(item, Mapping):
@@ -677,7 +682,16 @@ def _merge_ready_stream_results(
         ready.append(item)
         if item.get("eos") is True:
             break
+    return tuple(ready)
 
+
+def _merge_ready_stream_results(
+    job: object,
+    first: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Drain ready results and merge raw text when provenance is unavailable."""
+
+    ready = _drain_ready_stream_results(job, first)
     if len(ready) == 1:
         return first
 
@@ -693,6 +707,65 @@ def _merge_ready_stream_results(
     return merged
 
 
+def _verified_provenance_delta(event: RuntimeTextDelta) -> bool:
+    """Return whether one text delta has independently verified provenance."""
+
+    return event.native_token_provenance and event.native_token_spans is not None
+
+
+def _merge_verified_text_deltas(
+    first: RuntimeTextDelta,
+    second: RuntimeTextDelta,
+) -> RuntimeTextDelta:
+    """Merge adjacent verified deltas while preserving native-span offsets."""
+
+    if first.request_id != second.request_id:
+        raise ValueError("cannot merge runtime text deltas from different requests")
+    if not _verified_provenance_delta(first) or not _verified_provenance_delta(second):
+        raise ValueError("runtime text deltas must have verified provenance before merging")
+
+    first_spans = first.native_token_spans
+    assert first_spans is not None
+    assert second.native_token_spans is not None
+    offset = len(first.text)
+    shifted_spans = tuple(
+        NativeTokenSpan(
+            span.start + offset,
+            span.end + offset,
+            span.token_id,
+            span.text,
+        )
+        for span in second.native_token_spans
+    )
+    return RuntimeTextDelta(
+        request_id=first.request_id,
+        text=first.text + second.text,
+        token_ids=first.token_ids + second.token_ids,
+        native_token_spans=first_spans + shifted_spans,
+        native_token_provenance=True,
+    )
+
+
+def _coalesce_verified_runtime_text_deltas(
+    events: tuple[RuntimeEvent, ...],
+) -> tuple[RuntimeEvent, ...]:
+    """Coalesce only adjacent text events whose provenance was verified separately."""
+
+    coalesced: list[RuntimeEvent] = []
+    for event in events:
+        if (
+            isinstance(event, RuntimeTextDelta)
+            and _verified_provenance_delta(event)
+            and coalesced
+            and isinstance(previous := coalesced[-1], RuntimeTextDelta)
+            and _verified_provenance_delta(previous)
+        ):
+            coalesced[-1] = _merge_verified_text_deltas(previous, event)
+        else:
+            coalesced.append(event)
+    return tuple(coalesced)
+
+
 class _BackendJob(Protocol):
     def __aiter__(self) -> AsyncIterator[Mapping[str, object]]:
         ...
@@ -704,6 +777,46 @@ class _BackendJob(Protocol):
         ...
 
 
+@dataclass(slots=True)
+class _ConstraintEnforcementState:
+    installed: bool = False
+    trigger_token: int | None = None
+    activated: bool = False
+    guarantee: GenerationGuarantee = GenerationGuarantee.NONE
+
+    @classmethod
+    def installed_with_trigger(
+        cls,
+        trigger_token: int | None,
+        guarantee: GenerationGuarantee,
+    ) -> _ConstraintEnforcementState:
+        if not isinstance(guarantee, GenerationGuarantee):
+            raise TypeError("guarantee must be a GenerationGuarantee")
+        return cls(True, trigger_token, trigger_token is None, guarantee)
+
+    @property
+    def effective_guarantee(self) -> GenerationGuarantee:
+        return self.guarantee if self.installed and self.activated else GenerationGuarantee.NONE
+
+    def observe_token_ids(self, token_ids: tuple[int, ...]) -> None:
+        if not self.installed or self.activated or self.trigger_token is None:
+            return
+        if self.trigger_token in token_ids:
+            self.activated = True
+
+
+@dataclass(slots=True)
+class _BackendFailureEpisode:
+    cause: FailureCause | None = None
+
+    def mark_recovering(self) -> None:
+        if self.cause is None:
+            self.cause = FailureCause.RUNTIME_RECOVERING
+
+    def mark_restart_required(self) -> None:
+        self.cause = FailureCause.RESTART_REQUIRED
+
+
 class RuntimeSession:
     """Async lifecycle adapter over one already-submitted backend job."""
 
@@ -711,10 +824,11 @@ class RuntimeSession:
         self,
         request: RuntimeGenerationRequest,
         job: _BackendJob,
-        on_backend_failure: Callable[[], None] | None = None,
+        on_backend_failure: Callable[[], FailureCause | None] | None = None,
         *,
         id_to_piece: tuple[str, ...] | None = None,
         native_piece_ids: frozenset[int] | None = None,
+        constraint_state: _ConstraintEnforcementState | None = None,
     ) -> None:
         if not isinstance(request, RuntimeGenerationRequest):
             raise TypeError("request must be a RuntimeGenerationRequest")
@@ -723,6 +837,7 @@ class RuntimeSession:
         self._on_backend_failure = on_backend_failure
         self._id_to_piece = id_to_piece
         self._native_piece_ids = native_piece_ids
+        self._constraint_state = constraint_state or _ConstraintEnforcementState()
         self._iterator = job.__aiter__()
         self._pending: deque[RuntimeEvent] = deque()
         self._cancel_event = asyncio.Event()
@@ -770,7 +885,14 @@ class RuntimeSession:
     async def _next_backend_result(self) -> Mapping[str, object]:
         return await anext(self._iterator)
 
-    def _failure_event(self, code: str, message: str) -> RuntimeFailed:
+    def _failure_event(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        cause: FailureCause | None = None,
+    ) -> RuntimeFailed:
         self._terminal = True
         return RuntimeFailed(
             self._request.request_id,
@@ -778,17 +900,38 @@ class RuntimeSession:
                 category=ErrorCategory.RUNTIME_FAILURE,
                 code=code,
                 message=message,
-                retryable=False,
+                retryable=retryable,
+                cause=cause,
             ),
+        )
+
+    def _known_backend_failure_event(self) -> RuntimeFailed | None:
+        backend_generator = getattr(self._job, "generator", None)
+        if getattr(backend_generator, "error", None) is None:
+            return None
+        cause = None if self._on_backend_failure is None else self._on_backend_failure()
+        return self._failure_event(
+            "generation_failed",
+            "Inference backend generation failed.",
+            retryable=cause is FailureCause.RUNTIME_RECOVERING,
+            cause=cause,
         )
 
     async def __anext__(self) -> RuntimeEvent:
         if self._pending:
+            if not self._cancel_event.is_set():
+                backend_failure = self._known_backend_failure_event()
+                if backend_failure is not None:
+                    self._pending.clear()
+                    return backend_failure
             return self._pop_pending()
         if self._terminal:
             raise StopAsyncIteration
         if self._cancel_event.is_set():
             return self._cancelled_event()
+        backend_failure = self._known_backend_failure_event()
+        if backend_failure is not None:
+            return backend_failure
 
         while True:
             next_result = asyncio.create_task(self._next_backend_result())
@@ -804,8 +947,13 @@ class RuntimeSession:
 
                 try:
                     result = await next_result
-                    if self._id_to_piece is None:
-                        result = _merge_ready_stream_results(self._job, result)
+                    provenance_enabled = (
+                        self._id_to_piece is not None and self._native_piece_ids is not None
+                    )
+                    if provenance_enabled:
+                        results = _drain_ready_stream_results(self._job, result)
+                    else:
+                        results = (_merge_ready_stream_results(self._job, result),)
                 except StopAsyncIteration:
                     return self._failure_event(
                         "backend_ended_early",
@@ -825,24 +973,52 @@ class RuntimeSession:
                         "ExLlamaV3 generation failed for request_id=%s",
                         self._request.request_id,
                     )
-                    if self._on_backend_failure is not None:
-                        self._on_backend_failure()
+                    cause = (
+                        None
+                        if self._on_backend_failure is None
+                        else self._on_backend_failure()
+                    )
                     return self._failure_event(
                         "generation_failed",
                         "Inference backend generation failed.",
+                        retryable=cause is FailureCause.RUNTIME_RECOVERING,
+                        cause=cause,
                     )
 
                 if self._cancel_event.is_set():
                     return self._cancelled_event()
+                backend_failure = self._known_backend_failure_event()
+                if backend_failure is not None:
+                    return backend_failure
 
-                self._pending.extend(
-                    translate_exllamav3_result(
-                        self._request,
-                        result,
-                        id_to_piece=self._id_to_piece,
-                        native_piece_ids=self._native_piece_ids,
+                translated: list[RuntimeEvent] = []
+                for ready_result in results:
+                    self._constraint_state.observe_token_ids(
+                        _stream_token_ids(ready_result.get("token_ids"))
                     )
-                )
+                    translated.extend(
+                        translate_exllamav3_result(
+                            self._request,
+                            ready_result,
+                            id_to_piece=self._id_to_piece,
+                            native_piece_ids=self._native_piece_ids,
+                        )
+                    )
+                if provenance_enabled:
+                    translated = list(
+                        _coalesce_verified_runtime_text_deltas(tuple(translated))
+                    )
+                projected: list[RuntimeEvent] = []
+                for event in translated:
+                    if isinstance(event, RuntimeFinished):
+                        event = replace(
+                            event,
+                            hard_constraint_installed=self._constraint_state.installed,
+                            hard_constraint_activated=self._constraint_state.activated,
+                            effective_generation_guarantee=self._constraint_state.effective_guarantee,
+                        )
+                    projected.append(event)
+                self._pending.extend(projected)
                 if self._pending:
                     return self._pop_pending()
             except asyncio.CancelledError:
@@ -998,6 +1174,16 @@ def _backend_component_available(config: object, component: str) -> bool | None:
         return None
 
 
+def _resolved_draft_window(config: ExLlamaV3LoadConfig) -> int:
+    if config.mtp_enabled:
+        return config.mtp_draft_tokens
+    if config.draft_model_directory is not None:
+        return config.draft_tokens
+    if config.ngram_match_min:
+        return config.ngram_draft_size
+    return 0
+
+
 def _draft_history_size(draft_model: object, configured_size: int) -> int:
     caps = getattr(draft_model, "caps", None)
     if isinstance(caps, Mapping):
@@ -1014,6 +1200,35 @@ def _draft_cache_size(draft_model: object, target_cache_size: int) -> int:
         if compact is not None and compact > 0:
             return compact
     return target_cache_size
+
+
+_EXLLAMAV3_PAGE_SIZE = 256
+
+
+def _runtime_model_metadata(
+    config: ExLlamaV3LoadConfig,
+    backend_config: object,
+    cache: object,
+) -> RuntimeModelMetadata:
+    cache_tokens = _positive_int_attr(cache, "max_num_tokens")
+    if cache_tokens is None:
+        raise RuntimeError("ExLlamaV3 cache does not expose a positive max_num_tokens capacity")
+    cache_limit = (cache_tokens // _EXLLAMAV3_PAGE_SIZE) * _EXLLAMAV3_PAGE_SIZE
+    if cache_limit <= 0:
+        raise RuntimeError("ExLlamaV3 cache capacity is smaller than one backend page")
+
+    model_limit = _backend_context_limit(backend_config)
+    backend_limit = cache_limit if model_limit is None else min(cache_limit, model_limit)
+    headroom = 1 + _resolved_draft_window(config)
+    max_context = backend_limit - headroom
+    if max_context <= 0:
+        raise RuntimeError("ExLlamaV3 backend context capacity leaves no user-visible generation room")
+    return RuntimeModelMetadata(
+        max_context_tokens=max_context,
+        architecture=_backend_architecture(backend_config),
+        backend_context_tokens=backend_limit,
+        generation_headroom_tokens=headroom,
+    )
 
 
 def _tensor_to_token_ids(value: object) -> tuple[int, ...]:
@@ -1060,7 +1275,7 @@ def _build_output_filters(
     backend: Any,
     tokenizer: Any,
     request: RuntimeGenerationRequest,
-) -> list[object] | None:
+) -> tuple[list[object] | None, _ConstraintEnforcementState]:
     if request.generation_constraint is not None:
         constraint = request.generation_constraint
         try:
@@ -1073,10 +1288,18 @@ def _build_output_filters(
                 )
             )
         except (AttributeError, TypeError, ValueError) as exc:
+            if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+                raise RuntimeConstraintUnsupported(
+                    "Requested Tool generation guarantee cannot install its trigger."
+                ) from exc
             raise RuntimeError(
                 "Constrained tool generation trigger could not be tokenized by the loaded model."
             ) from exc
         if len(trigger_ids) != 1:
+            if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+                raise RuntimeConstraintUnsupported(
+                    "Requested Tool generation guarantee requires a single-token model-native trigger."
+                )
             raise RuntimeError(
                 "Constrained tool generation requires a single-token model-native tool trigger."
             )
@@ -1092,13 +1315,24 @@ def _build_output_filters(
                 raise RuntimeConstraintUnsupported(
                     "Tool JSON Schema uses semantics that the active LLGuidance runtime cannot enforce."
                 ) from exc
+            if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+                raise RuntimeConstraintUnsupported(
+                    "Requested Tool generation guarantee cannot be enforced by the active runtime."
+                ) from exc
             raise RuntimeError(
                 "Constrained tool generation grammar could not be initialized by the runtime."
             ) from exc
-        return [output_filter]
+        runtime_guarantee = (
+            GenerationGuarantee.UNKNOWN
+            if request.generation_guarantee is GenerationGuarantee.NONE
+            else request.generation_guarantee
+        )
+        return [output_filter], _ConstraintEnforcementState.installed_with_trigger(
+            trigger_ids[0], runtime_guarantee
+        )
 
     if request.output_json_schema is None:
-        return None
+        return None, _ConstraintEnforcementState()
 
     trigger_token: int | None = None
     if request.output_json_trigger is not None:
@@ -1112,19 +1346,27 @@ def _build_output_filters(
                 )
             )
         except (AttributeError, TypeError, ValueError) as exc:
+            if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+                raise RuntimeConstraintUnsupported(
+                    "Requested structured-output generation guarantee cannot install its trigger."
+                ) from exc
             logger.warning(
                 "Structured-output trigger unavailable for request %s; using validation-only fallback: %s",
                 request.request_id,
                 exc,
             )
-            return None
+            return None, _ConstraintEnforcementState()
         if len(trigger_ids) != 1:
+            if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+                raise RuntimeConstraintUnsupported(
+                    "Requested structured-output generation guarantee requires a single-token trigger."
+                )
             logger.warning(
                 "Structured-output trigger for request %s resolved to %d tokens; using validation-only fallback.",
                 request.request_id,
                 len(trigger_ids),
             )
-            return None
+            return None, _ConstraintEnforcementState()
         trigger_token = trigger_ids[0]
 
     filter_kwargs: dict[str, object] = {
@@ -1135,14 +1377,31 @@ def _build_output_filters(
         filter_kwargs["trigger_token"] = trigger_token
     try:
         output_filter = backend.LLGuidanceFilter(tokenizer, **filter_kwargs)
+    except (TypeError, RuntimeError) as exc:
+        if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+            raise RuntimeConstraintUnsupported(
+                "Requested structured-output generation guarantee cannot be enforced by the active runtime."
+            ) from exc
+        raise
     except ValueError as exc:
+        if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+            raise RuntimeConstraintUnsupported(
+                "Requested structured-output generation guarantee cannot be enforced by the active runtime."
+            ) from exc
         logger.warning(
             "Structured-output constraint unavailable for request %s; using validation-only fallback: %s",
             request.request_id,
             exc,
         )
-        return None
-    return [output_filter]
+        return None, _ConstraintEnforcementState()
+    runtime_guarantee = (
+        GenerationGuarantee.SCHEMA
+        if request.generation_guarantee is GenerationGuarantee.NONE
+        else request.generation_guarantee
+    )
+    return [output_filter], _ConstraintEnforcementState.installed_with_trigger(
+        trigger_token, runtime_guarantee
+    )
 
 
 def _create_backend_job(
@@ -1223,7 +1482,7 @@ def _create_draft_generator(
         8,
         resources.draft_model,
         resources.draft_cache,
-        config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
+        _resolved_draft_window(config),
         **options,
     )
 
@@ -1252,7 +1511,7 @@ def _create_async_generator(
             8,
             None,
             None,
-            config.ngram_draft_size,
+            _resolved_draft_window(config),
             cpu_cache_size=config.sysmem_kv_cache_mb * 1024**2,
             recurrent_cache_size=config.sysmem_recurrent_cache_mb * 1024**2,
             ngram_match_min=config.ngram_match_min,
@@ -1304,6 +1563,7 @@ class _ExLlamaV3PromptRenderer:
         *,
         add_generation_prompt: bool,
         protect_literal_tokens: bool,
+        structural_marker_texts: tuple[str, ...] = (),
     ) -> RuntimeRenderedPrompt:
         resources = self._resources
         text_codec = resources.tokenizer
@@ -1321,12 +1581,20 @@ class _ExLlamaV3PromptRenderer:
             raise TypeError("add_generation_prompt must be a bool")
         if not isinstance(protect_literal_tokens, bool):
             raise TypeError("protect_literal_tokens must be a bool")
+        if not isinstance(structural_marker_texts, tuple) or not all(
+            isinstance(marker, str) for marker in structural_marker_texts
+        ):
+            raise TypeError("structural_marker_texts must be a tuple of strings")
 
         sentinels: dict[str, str] = {}
         render_messages = messages
         render_tools = tools
-        if protect_literal_tokens:
-            marker_texts = discover_marker_texts(text_codec)
+        if protect_literal_tokens or structural_marker_texts:
+            marker_texts = (
+                effective_marker_texts(text_codec, structural_marker_texts)
+                if structural_marker_texts
+                else discover_marker_texts(text_codec)
+            )
             sentinels = marker_sentinels(messages, tools, marker_texts)
             render_messages = protect_messages(messages, sentinels)
             render_tools = protect_tools(tools, sentinels)
@@ -1438,13 +1706,17 @@ class ExLlamaV3Runtime:
         cache_usage=True,
         quantized_kv_cache=True,
         vision=True,
+        generation_constraints=True,
+        structural_token_provenance=True,
     )
 
     def __init__(self) -> None:
         self._resources: _ExLlamaV3Resources | None = None
         self._generator: Any | None = None
+        self._generator_episode: _BackendFailureEpisode | None = None
         self._generator_state = _GeneratorLifecycleState.READY
         self._quarantined_generator: Any | None = None
+        self._quarantined_episode: _BackendFailureEpisode | None = None
         self._recovery_task: asyncio.Task[None] | None = None
         self._generator_lifecycle_lock = asyncio.Lock()
         self._observed_generator: Any | None = None
@@ -1454,6 +1726,11 @@ class ExLlamaV3Runtime:
     def model_metadata(self) -> RuntimeModelMetadata:
         resources = self._resources
         return RuntimeModelMetadata() if resources is None else resources.model_metadata
+
+    @property
+    def vision_loaded(self) -> bool:
+        resources = self._resources
+        return resources is not None and resources.vision_model is not None
 
     @property
     def vision_cache_stats(self) -> VisionEmbeddingCacheStats | None:
@@ -1550,7 +1827,85 @@ class ExLlamaV3Runtime:
         done = getattr(iteration_task, "done", None)
         return bool(callable(done) and done())
 
-    def _register_generator_observer(self, generator: Any) -> None:
+    def _runtime_unavailable(self, cause: FailureCause) -> RuntimeUnavailable:
+        if cause is FailureCause.RUNTIME_RECOVERING:
+            error = CanonicalError(
+                ErrorCategory.OVERLOADED,
+                "runtime_recovering",
+                "Inference runtime is recovering from a backend generation failure.",
+                True,
+                cause,
+            )
+        elif cause is FailureCause.RESTART_REQUIRED:
+            error = CanonicalError(
+                ErrorCategory.RUNTIME_FAILURE,
+                "restart_required",
+                "Inference runtime requires a server restart before accepting more requests.",
+                False,
+                cause,
+            )
+        else:
+            raise ValueError("unsupported runtime-unavailable cause")
+        return RuntimeUnavailable(error)
+
+    def _project_backend_failure(
+        self,
+        generator: Any,
+        episode: _BackendFailureEpisode | None = None,
+        *,
+        allow_unstored_error: bool = False,
+    ) -> FailureCause | None:
+        if episode is None:
+            if self._generator is generator:
+                episode = self._generator_episode
+            elif self._quarantined_generator is generator:
+                episode = self._quarantined_episode
+        if episode is None:
+            return None
+        if episode.cause is not None:
+            return episode.cause
+
+        resources = self._resources
+        if resources is None or self._closing:
+            return None
+        owns_current = self._generator is generator and self._generator_episode is episode
+        owns_quarantine = (
+            self._quarantined_generator is generator and self._quarantined_episode is episode
+        )
+        if not owns_current and not owns_quarantine:
+            return episode.cause
+
+        if resources.config.sysmem_kv_cache_mb > 0:
+            if owns_current and self._generator_state is _GeneratorLifecycleState.READY:
+                episode.mark_restart_required()
+                self._generator_state = _GeneratorLifecycleState.FAILED
+                self._generator = None
+                self._generator_episode = None
+                self._quarantined_generator = generator
+                self._quarantined_episode = episode
+                logger.error(
+                    "ExLlamaV3 backend failure with sysmem KV cache requires process restart."
+                )
+            if self._quarantined_generator is generator:
+                episode.mark_restart_required()
+                self._generator_state = _GeneratorLifecycleState.FAILED
+            return episode.cause
+
+        if owns_current and self._generator_state is _GeneratorLifecycleState.READY:
+            self._begin_generator_recovery(
+                generator,
+                episode,
+                allow_unstored_error=allow_unstored_error,
+            )
+        if self._generator_state is _GeneratorLifecycleState.FAILED:
+            episode.mark_restart_required()
+        return episode.cause
+
+    def _register_generator_observer(
+        self,
+        generator: Any,
+        episode: _BackendFailureEpisode,
+    ) -> None:
         if self._observed_generator is generator:
             return
         iteration_task = getattr(generator, "iteration_task", None)
@@ -1559,21 +1914,37 @@ class ExLlamaV3Runtime:
             return
         self._observed_generator = generator
 
-        def on_done(_task: object, observed: Any = generator) -> None:
-            self._on_generator_iteration_done(observed)
+        def on_done(
+            _task: object,
+            observed: Any = generator,
+            observed_episode: _BackendFailureEpisode = episode,
+        ) -> None:
+            self._on_generator_iteration_done(observed, observed_episode)
 
         add_done_callback(on_done)
 
-    def _on_generator_iteration_done(self, generator: Any) -> None:
-        if self._closing or self._resources is None or self._generator is not generator:
+    def _on_generator_iteration_done(
+        self,
+        generator: Any,
+        episode: _BackendFailureEpisode,
+    ) -> None:
+        if (
+            self._closing
+            or self._resources is None
+            or self._generator is not generator
+            or self._generator_episode is not episode
+        ):
             return
         error = getattr(generator, "error", None)
         if error is None:
-            logger.error("ExLlamaV3 generator iteration task ended unexpectedly; starting recovery.")
-            self._begin_generator_recovery(generator, allow_unstored_error=True)
-            return
-        logger.warning("ExLlamaV3 shared generator failed; starting recovery.")
-        self._begin_generator_recovery(generator)
+            logger.error("ExLlamaV3 generator iteration task ended unexpectedly.")
+        else:
+            logger.warning("ExLlamaV3 shared generator failed.")
+        self._project_backend_failure(
+            generator,
+            episode,
+            allow_unstored_error=error is None,
+        )
 
     def _require_resources(self) -> _ExLlamaV3Resources:
         resources = self._resources
@@ -1596,6 +1967,7 @@ class ExLlamaV3Runtime:
     def _begin_generator_recovery(
         self,
         failed_generator: Any,
+        episode: _BackendFailureEpisode | None = None,
         *,
         allow_unstored_error: bool = False,
     ) -> None:
@@ -1604,42 +1976,56 @@ class ExLlamaV3Runtime:
             return
         if self._generator is not failed_generator:
             return
+        if episode is None:
+            episode = self._generator_episode
+        if episode is None or self._generator_episode is not episode:
+            return
         if self._generator_state is not _GeneratorLifecycleState.READY:
             return
         if not allow_unstored_error and getattr(failed_generator, "error", None) is None:
             return
 
+        episode.mark_recovering()
         self._generator_state = _GeneratorLifecycleState.RECOVERING
         self._generator = None
+        self._generator_episode = None
         self._quarantined_generator = failed_generator
+        self._quarantined_episode = episode
         logger.warning("ExLlamaV3 generator quarantined; recovery starting.")
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            episode.mark_restart_required()
             self._generator_state = _GeneratorLifecycleState.FAILED
             logger.exception("ExLlamaV3 generator recovery requires a running event loop.")
             return
-        task = loop.create_task(self._recover_generator(failed_generator, resources))
+        task = loop.create_task(self._recover_generator(failed_generator, resources, episode))
         self._recovery_task = task
 
     async def _recover_generator(
         self,
         failed_generator: Any,
         resources: _ExLlamaV3Resources,
+        episode: _BackendFailureEpisode,
     ) -> None:
         current_task = asyncio.current_task()
         try:
             async with self._generator_lifecycle_lock:
-                if self._quarantined_generator is not failed_generator:
+                if (
+                    self._quarantined_generator is not failed_generator
+                    or self._quarantined_episode is not episode
+                ):
                     return
                 try:
                     await self._quiesce_and_clear_generator(failed_generator)
                 except Exception:
+                    episode.mark_restart_required()
                     self._generator_state = _GeneratorLifecycleState.FAILED
                     logger.exception("ExLlamaV3 failed generator cleanup did not complete safely.")
                     return
 
                 if resources.config.sysmem_kv_cache_mb > 0:
+                    episode.mark_restart_required()
                     self._generator_state = _GeneratorLifecycleState.FAILED
                     logger.error(
                         "ExLlamaV3 generator recovery disabled while sysmem KV cache is enabled; "
@@ -1648,38 +2034,50 @@ class ExLlamaV3Runtime:
                     return
 
                 self._quarantined_generator = None
+                self._quarantined_episode = None
                 if self._closing or self._resources is not resources:
                     return
 
                 try:
                     replacement = self._ensure_generator()
-                    self._register_generator_observer(replacement)
+                    replacement_episode = self._generator_episode
+                    if replacement_episode is None:
+                        raise RuntimeError("replacement generator failure episode is unavailable")
+                    self._register_generator_observer(replacement, replacement_episode)
                 except Exception:
+                    episode.mark_restart_required()
                     self._generator_state = _GeneratorLifecycleState.FAILED
                     logger.exception("ExLlamaV3 replacement generator construction failed.")
                     return
 
                 if self._generator_is_known_dead(replacement):
+                    episode.mark_restart_required()
                     self._generator = None
+                    self._generator_episode = None
                     self._quarantined_generator = replacement
+                    self._quarantined_episode = replacement_episode
                     try:
                         await self._quiesce_and_clear_generator(replacement)
                     except Exception:
                         logger.exception("ExLlamaV3 dead replacement cleanup failed.")
                     else:
                         self._quarantined_generator = None
+                        self._quarantined_episode = None
                     self._generator_state = _GeneratorLifecycleState.FAILED
                     return
 
                 if self._closing or self._resources is not resources:
                     self._generator = None
+                    self._generator_episode = None
                     self._quarantined_generator = replacement
+                    self._quarantined_episode = replacement_episode
                     try:
                         await self._quiesce_and_clear_generator(replacement)
                     except Exception:
                         logger.exception("ExLlamaV3 replacement cleanup during teardown failed.")
                     else:
                         self._quarantined_generator = None
+                        self._quarantined_episode = None
                     return
 
                 self._generator_state = _GeneratorLifecycleState.READY
@@ -1687,6 +2085,7 @@ class ExLlamaV3Runtime:
         except Exception:
             logger.exception("Unexpected ExLlamaV3 generator recovery failure.")
             if self._resources is resources and not self._closing:
+                episode.mark_restart_required()
                 self._generator_state = _GeneratorLifecycleState.FAILED
         finally:
             if self._recovery_task is current_task:
@@ -1695,9 +2094,15 @@ class ExLlamaV3Runtime:
     def _ensure_generator(self) -> Any:
         if self._generator is not None:
             generator = self._generator
+            episode = self._generator_episode
+            if episode is None:
+                raise RuntimeError("ExLlamaV3 generator failure episode is unavailable")
             if getattr(generator, "error", None) is not None:
-                self._begin_generator_recovery(generator)
-                raise RuntimeError("ExLlamaV3 runtime is recovering after a backend generation failure")
+                cause = (
+                    self._project_backend_failure(generator, episode)
+                    or FailureCause.RESTART_REQUIRED
+                )
+                raise self._runtime_unavailable(cause)
             return generator
         resources = self._require_resources()
         try:
@@ -1719,6 +2124,7 @@ class ExLlamaV3Runtime:
             self._generator = _create_async_generator(resources, generator_options)
         else:
             self._generator = _create_async_generator(resources)
+        self._generator_episode = _BackendFailureEpisode()
         return self._generator
 
     def load(self, config: ExLlamaV3LoadConfig) -> None:
@@ -1732,8 +2138,10 @@ class ExLlamaV3Runtime:
         resources = self._build_resources(config)
         self._resources = resources
         self._generator = None
+        self._generator_episode = None
         self._generator_state = _GeneratorLifecycleState.READY
         self._quarantined_generator = None
+        self._quarantined_episode = None
         self._recovery_task = None
         self._generator_lifecycle_lock = asyncio.Lock()
         self._observed_generator = None
@@ -1766,10 +2174,6 @@ class ExLlamaV3Runtime:
                 )
                 if config.moe_cpu_threads is not None:
                     backend_config.infer_params.draft_moe_cpu_threads = config.moe_cpu_threads
-            model_metadata = RuntimeModelMetadata(
-                _backend_context_limit(backend_config),
-                _backend_architecture(backend_config),
-            )
             text_codec = backend.Tokenizer.from_config(backend_config)
             output_id_to_piece, output_native_piece_ids = _output_token_provenance_metadata(text_codec)
             raw_eos_token_ids = getattr(backend_config, "eos_token_id_list", ())
@@ -1809,13 +2213,13 @@ class ExLlamaV3Runtime:
             if draft_model is not None:
                 cache_kwargs["max_history"] = _draft_history_size(
                     draft_model,
-                    config.mtp_draft_tokens if config.mtp_enabled else config.draft_tokens,
+                    _resolved_draft_window(config),
                 )
             elif config.ngram_match_min:
                 # Native N-gram drafting still verifies multiple future positions at once. Recurrent
                 # cache layers therefore need the same history depth as the N-gram draft window,
                 # even though there is no separate draft model/cache.
-                cache_kwargs["max_history"] = config.ngram_draft_size
+                cache_kwargs["max_history"] = _resolved_draft_window(config)
             if config.cache_key_bits is not None and config.cache_value_bits is not None:
                 cache_kwargs.update(
                     {
@@ -1825,6 +2229,7 @@ class ExLlamaV3Runtime:
                     }
                 )
             cache_object = backend.Cache(model, config.cache_tokens, **cache_kwargs)
+            model_metadata = _runtime_model_metadata(config, backend_config, cache_object)
 
             if draft_model is not None:
                 draft_cache_kwargs: dict[str, object] = {
@@ -1937,6 +2342,48 @@ class ExLlamaV3Runtime:
         )
         return resources
 
+    def configure_output_structural_markers(self, markers: tuple[str, ...]) -> dict[str, int]:
+        """Add a verified built-in control-token allow-set and return active token IDs."""
+
+        if not isinstance(markers, tuple) or not all(isinstance(marker, str) for marker in markers):
+            raise TypeError("markers must be a tuple of strings")
+        if not markers or any(not marker for marker in markers):
+            raise ValueError("markers must contain non-empty strings")
+        if len(set(markers)) != len(markers):
+            raise ValueError("markers must not contain duplicates")
+
+        resources = self._require_resources()
+        id_to_piece = resources.output_id_to_piece
+        native_piece_ids = resources.output_native_piece_ids
+        if id_to_piece is None or native_piece_ids is None:
+            raise RuntimeError("runtime output token provenance metadata is unavailable")
+
+        verified_ids: dict[str, int] = {}
+        for marker in markers:
+            encoded = resources.tokenizer.encode(
+                marker,
+                add_bos=False,
+                add_eos=False,
+                encode_special_tokens=True,
+            )
+            token_ids = _tensor_to_token_ids(encoded)
+            if len(token_ids) != 1:
+                raise RuntimeError(
+                    f"output structural marker {marker!r} does not encode to exactly one native token"
+                )
+            token_id = token_ids[0]
+            if token_id >= len(id_to_piece) or id_to_piece[token_id] != marker:
+                raise RuntimeError(
+                    f"output structural marker {marker!r} does not match tokenizer native piece identity"
+                )
+            verified_ids[marker] = token_id
+
+        self._resources = replace(
+            resources,
+            output_native_piece_ids=frozenset((*native_piece_ids, *verified_ids.values())),
+        )
+        return verified_ids
+
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         """Tokenize a raw document-continuation prompt without applying a chat template."""
         return _ExLlamaV3PromptRenderer(self._require_resources()).tokenize_text(text)
@@ -1953,12 +2400,14 @@ class ExLlamaV3Runtime:
         *,
         add_generation_prompt: bool = True,
         protect_literal_tokens: bool = False,
+        structural_marker_texts: tuple[str, ...] = (),
     ) -> RuntimeRenderedPrompt:
         return _ExLlamaV3PromptRenderer(self._require_resources()).render_chat_template(
             messages,
             tools,
             template_kwargs,
             add_generation_prompt=add_generation_prompt,
+            structural_marker_texts=structural_marker_texts,
             protect_literal_tokens=protect_literal_tokens,
         )
 
@@ -1966,19 +2415,42 @@ class ExLlamaV3Runtime:
         resources = self._require_resources()
         backend = resources.backend
         text_codec = resources.tokenizer
-        if self._closing or self._generator_state is not _GeneratorLifecycleState.READY:
-            raise RuntimeError("ExLlamaV3 runtime is unhealthy after a backend generation failure")
+        if self._closing:
+            raise RuntimeError("ExLlamaV3 runtime is closing")
+        if self._generator_state is _GeneratorLifecycleState.RECOVERING:
+            raise self._runtime_unavailable(FailureCause.RUNTIME_RECOVERING)
+        if self._generator_state is _GeneratorLifecycleState.FAILED:
+            raise self._runtime_unavailable(FailureCause.RESTART_REQUIRED)
         config = resources.config
         if not isinstance(request, RuntimeGenerationRequest):
             raise TypeError("request must be a RuntimeGenerationRequest")
-        generator = self._ensure_generator()
-        self._register_generator_observer(generator)
-        if self._generator_is_known_dead(generator):
-            self._begin_generator_recovery(
-                generator,
-                allow_unstored_error=getattr(generator, "error", None) is None,
+        max_context = resources.model_metadata.max_context_tokens
+        if max_context is None:
+            raise RuntimeError("ExLlamaV3 runtime context capacity is unavailable")
+        if len(request.input_ids) + request.max_new_tokens > max_context:
+            raise RuntimeUnavailable(
+                CanonicalError(
+                    ErrorCategory.CONTEXT_LENGTH,
+                    "total_context_limit_exceeded",
+                    "Total requested context limit exceeded.",
+                    False,
+                )
             )
-            raise RuntimeError("ExLlamaV3 runtime is recovering after a backend generation failure")
+        generator = self._ensure_generator()
+        episode = self._generator_episode
+        if episode is None:
+            raise RuntimeError("ExLlamaV3 generator failure episode is unavailable")
+        self._register_generator_observer(generator, episode)
+        if self._generator_is_known_dead(generator):
+            cause = (
+                self._project_backend_failure(
+                    generator,
+                    episode,
+                    allow_unstored_error=True,
+                )
+                or FailureCause.RESTART_REQUIRED
+            )
+            raise self._runtime_unavailable(cause)
         embeddings: list[object] = []
         for attachment in request.prompt_attachments:
             if not isinstance(attachment, _VisionAttachment):
@@ -1987,7 +2459,7 @@ class ExLlamaV3Runtime:
         torch = _load_torch_module()
         input_tensor = torch.tensor([list(request.input_ids)], dtype=torch.long)
         sampler = _build_sampler(backend, request.sampling)
-        output_filters = _build_output_filters(backend, text_codec, request)
+        output_filters, constraint_state = _build_output_filters(backend, text_codec, request)
         return RuntimeSession(
             request,
             _create_backend_job(
@@ -2001,9 +2473,14 @@ class ExLlamaV3Runtime:
                 output_filters,
                 resources.native_eos_token_ids,
             ),
-            lambda: self._begin_generator_recovery(generator),
+            lambda: self._project_backend_failure(
+                generator,
+                episode,
+                allow_unstored_error=True,
+            ),
             id_to_piece=resources.output_id_to_piece,
             native_piece_ids=resources.output_native_piece_ids,
+            constraint_state=constraint_state,
         )
 
     async def close(self) -> None:
@@ -2033,6 +2510,7 @@ class ExLlamaV3Runtime:
                     "restart the server process."
                 )
             self._quarantined_generator = None
+            self._quarantined_episode = None
 
         generator = self._generator
         model = resources.model
@@ -2047,6 +2525,8 @@ class ExLlamaV3Runtime:
                 except Exception as exc:
                     self._generator = None
                     self._quarantined_generator = generator
+                    self._quarantined_episode = self._generator_episode
+                    self._generator_episode = None
                     self._generator_state = _GeneratorLifecycleState.FAILED
                     raise RuntimeError("Failed to clean poisoned ExLlamaV3 generator safely.") from exc
             else:
@@ -2083,7 +2563,9 @@ class ExLlamaV3Runtime:
             resources.vision_cache.clear()
         self._resources = None
         self._generator = None
+        self._generator_episode = None
         self._quarantined_generator = None
+        self._quarantined_episode = None
         self._recovery_task = None
         self._observed_generator = None
         self._generator_state = _GeneratorLifecycleState.READY

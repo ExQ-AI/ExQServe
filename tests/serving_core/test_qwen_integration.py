@@ -80,6 +80,13 @@ class _Controller:
         self.controlled = controlled
         self.requests: list[RuntimeGenerationRequest] = []
 
+    async def acquire(self, request_id: str):  # type: ignore[no-untyped-def]
+        del request_id
+        return self
+
+    async def release(self) -> None:
+        return None
+
     async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
         self.requests.append(request)
         return self.controlled
@@ -198,7 +205,7 @@ def test_qwen_provenance_loss_at_ambiguous_marker_fails_closed() -> None:
         failures = [event for event in events if isinstance(event, GenerationFailed)]
         assert len(failures) == 1
         assert failures[0].error.code == "output_token_provenance_unavailable"
-        assert failures[0].error.retryable is True
+        assert failures[0].error.retryable is False
         assert controlled.terminal_reason is RequestTerminalReason.APPLICATION_CANCELLED
         assert not any(isinstance(event, ToolCallCompleted) for event in events)
 
@@ -254,7 +261,7 @@ def test_qwen_provenance_loss_deferred_to_eof_fails_closed_through_serving() -> 
         failures = [event for event in events if isinstance(event, GenerationFailed)]
         assert len(failures) == 1
         assert failures[0].error.code == "output_" + "token_provenance_unavailable"
-        assert failures[0].error.retryable is True
+        assert failures[0].error.retryable is False
         assert controlled.terminal_reason is RequestTerminalReason.APPLICATION_CANCELLED
         assert not any(isinstance(event, GenerationCompleted) for event in events)
 

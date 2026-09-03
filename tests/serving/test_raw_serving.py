@@ -5,10 +5,13 @@ import threading
 from collections.abc import AsyncIterator
 from typing import cast
 
+import pytest
+
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
     GenerationEvent,
+    GenerationFailed,
     GenerationStarted,
     TextCompleted,
     TextDelta,
@@ -33,6 +36,7 @@ from exqserve.runtime.contracts import (
 from exqserve.serving.contracts import RawServingRequest
 from exqserve.serving.preprocessing import RendererLane, RendererLanePool
 from exqserve.serving.raw import RawServingEngine
+from exqserve.serving.terminal import TerminalPrimaryOwner
 
 
 class _Tokenizer:
@@ -68,6 +72,13 @@ class _Controller:
         self.events = events
         self.requests: list[RuntimeGenerationRequest] = []
         self.sessions: list[_ControlledSession] = []
+
+    async def acquire(self, request_id: str):  # type: ignore[no-untyped-def]
+        del request_id
+        return self
+
+    async def release(self) -> None:
+        return None
 
     async def submit(self, request: RuntimeGenerationRequest) -> _ControlledSession:
         self.requests.append(request)
@@ -231,5 +242,63 @@ def test_raw_serving_close_cancels_unfinished_runtime_once() -> None:
         await session.cancel()
         await session.cancel()
         assert controller.sessions[0].cancel_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_raw_serving_b1_loop_and_other_fail_closed() -> None:
+    async def run(reason: RuntimeStopReason) -> tuple[list[GenerationEvent], object]:
+        usage = TokenUsage(input_tokens=2, output_tokens=1)
+        controller = _Controller(
+            [RuntimeFinished("req_raw", reason, usage, RuntimeTiming())]
+        )
+        session = await RawServingEngine(_Tokenizer(), controller).submit(
+            _raw(RawPromptItem(text="PROMPT"))
+        )
+        return [event async for event in session], session
+
+    loop_events, loop_session = asyncio.run(run(RuntimeStopReason.LOOP))
+    assert isinstance(loop_events[-1], GenerationFailed)
+    assert loop_events[-1].error.code == "runtime_loop_detected"
+    assert loop_session.terminal_decision is not None
+    assert loop_session.terminal_decision.primary_owner is TerminalPrimaryOwner.RUNTIME_OWNERSHIP
+
+    other_events, other_session = asyncio.run(run(RuntimeStopReason.OTHER))
+    assert isinstance(other_events[-1], GenerationFailed)
+    assert other_events[-1].error.code == "runtime_terminal_unknown"
+    assert other_session.terminal_decision is not None
+    assert other_session.terminal_decision.primary_owner is TerminalPrimaryOwner.UNKNOWN_INTERNAL
+
+
+def test_raw_serving_b1_authority_commit_fault_rolls_back_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        usage = TokenUsage(input_tokens=2, output_tokens=1)
+        controller = _Controller(
+            [RuntimeFinished("req_raw", RuntimeStopReason.EOS, usage, RuntimeTiming())]
+        )
+        session = await RawServingEngine(_Tokenizer(), controller).submit(
+            _raw(RawPromptItem(text="PROMPT"))
+        )
+        evidence = session._terminal_evidence
+        original = evidence.commit_decision
+        first = True
+
+        def fail_once(decision):
+            nonlocal first
+            if first:
+                first = False
+                raise RuntimeError("authority commit fault")
+            return original(decision)
+
+        monkeypatch.setattr(evidence, "commit_decision", fail_once)
+        events = [event async for event in session]
+
+        assert not any(isinstance(event, GenerationCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "terminal_processing_failed"
+        assert session.terminal_decision is not None
+        assert session.terminal_decision.primary_owner is TerminalPrimaryOwner.UNKNOWN_INTERNAL
 
     asyncio.run(scenario())

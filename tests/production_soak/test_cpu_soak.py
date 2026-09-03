@@ -135,7 +135,7 @@ def test_cpu_mixed_multiclient_soak_switch_cancel_and_recovery(tmp_path: Path) -
 
         composed = compose_server(
             ServerConfig(
-                first,
+                model_directory=first,
                 model_root=tmp_path,
                 cache_tokens=4096,
                 max_batch_size=8,

@@ -9,9 +9,12 @@ from typing import Any, ClassVar
 
 import pytest
 
+from exqserve.core.errors import ErrorCategory, FailureCause
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
     LoRAAdapterConfig,
+    RuntimeCancelled,
     RuntimeConstraintUnsupported,
     RuntimeFinished,
     RuntimeGenerationConstraint,
@@ -20,6 +23,7 @@ from exqserve.runtime.contracts import (
     RuntimeSamplingConfig,
     RuntimeStarted,
     RuntimeTextDelta,
+    RuntimeUnavailable,
 )
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime
 from exqserve.serving.preprocessing import RendererLane, RendererLanePool
@@ -340,6 +344,7 @@ def _backend(
 
     class Cache:
         def __init__(self, model_arg: object, max_num_tokens: int, **kwargs: object) -> None:
+            self.max_num_tokens = max_num_tokens
             state["cache_calls"].append((model_arg, max_num_tokens, dict(kwargs)))
             state["cache_objects"].append(self)
 
@@ -410,7 +415,9 @@ def test_load_uses_official_q8_cache_and_normal_autosplit_arguments(monkeypatch:
         {"reserve_per_device": [1.0], "max_chunk_size": 512, "max_batch_size": 4}
     ]
     assert "generator" not in state
-    assert runtime.model_metadata.max_context_tokens == 131072
+    assert runtime.model_metadata.max_context_tokens == 4095
+    assert runtime.model_metadata.backend_context_tokens == 4096
+    assert runtime.model_metadata.generation_headroom_tokens == 1
     assert runtime.model_metadata.architecture == "Qwen3_5ForConditionalGeneration"
     assert "autosplit_no_forward" not in state["model"].load_calls[0]
 
@@ -432,12 +439,14 @@ def test_load_prefers_nested_gemma4_context_limit_over_backend_default(
     runtime.load(
         ExLlamaV3LoadConfig(
             "/models/gemma4",
-            cache_tokens=4096,
+            cache_tokens=262144,
             max_batch_size=1,
         )
     )
 
-    assert runtime.model_metadata.max_context_tokens == 262144
+    assert runtime.model_metadata.max_context_tokens == 262143
+    assert runtime.model_metadata.backend_context_tokens == 262144
+    assert runtime.model_metadata.generation_headroom_tokens == 1
     assert runtime.model_metadata.architecture == "Gemma4ForConditionalGeneration"
 
 
@@ -458,13 +467,85 @@ def test_load_prefers_nested_muse_glimmer_context_limit_over_backend_default(
     runtime.load(
         ExLlamaV3LoadConfig(
             "/models/muse-glimmer",
-            cache_tokens=4096,
+            cache_tokens=262144,
             max_batch_size=1,
         )
     )
 
-    assert runtime.model_metadata.max_context_tokens == 131072
+    assert runtime.model_metadata.max_context_tokens == 131071
+    assert runtime.model_metadata.backend_context_tokens == 131072
+    assert runtime.model_metadata.generation_headroom_tokens == 1
     assert runtime.model_metadata.architecture == "MuseGlimmerForConditionalGeneration"
+
+
+def test_runtime_can_extend_output_provenance_with_verified_structural_markers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(architecture="MuseGlimmerForConditionalGeneration")
+    tokenizer = backend._state["tokenizer"]
+    markers = ("<|start|>", "<|message|>", "<|eom|>", "<|eot|>")
+    marker_ids = {marker: 10 + index for index, marker in enumerate(markers)}
+    pieces = [f"piece-{index}" for index in range(20)]
+    for marker, token_id in marker_ids.items():
+        pieces[token_id] = marker
+
+    monkeypatch.setattr(
+        module,
+        "_output_token_provenance_metadata",
+        lambda text_codec: (tuple(pieces), frozenset({3})),
+    )
+
+    original_encode = tokenizer.encode
+
+    def encode_marker(
+        text: str,
+        *,
+        add_bos: bool,
+        add_eos: bool,
+        encode_special_tokens: bool,
+        embeddings: list[object] | None = None,
+    ) -> _FakeTensor:
+        if text in marker_ids and embeddings is None:
+            return _FakeTensor([[marker_ids[text]]])
+        return original_encode(
+            text,
+            add_bos=add_bos,
+            add_eos=add_eos,
+            encode_special_tokens=encode_special_tokens,
+            embeddings=embeddings,
+        )
+
+    monkeypatch.setattr(tokenizer, "encode", encode_marker)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/muse", cache_tokens=4096, max_batch_size=1))
+
+    configured = runtime.configure_output_structural_markers(markers)
+
+    assert configured == marker_ids
+    resources = runtime._require_resources()
+    assert resources.output_native_piece_ids == frozenset({3, *marker_ids.values()})
+
+
+def test_runtime_output_structural_marker_configuration_fails_on_non_native_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(architecture="MuseGlimmerForConditionalGeneration")
+    monkeypatch.setattr(
+        module,
+        "_output_token_provenance_metadata",
+        lambda text_codec: (("", "piece-1", "piece-2", "piece-3"), frozenset()),
+    )
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/muse", cache_tokens=4096, max_batch_size=1))
+
+    with pytest.raises(RuntimeError, match="exactly one native token"):
+        runtime.configure_output_structural_markers(("<|start|>",))
 
 
 def test_tensor_parallel_arguments_reach_target_model_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -665,6 +746,9 @@ def test_mtp_load_builds_draft_component_cache_history_and_lazy_generator(
     runtime.load(config)
 
     assert runtime.is_ready is True
+    assert runtime.model_metadata.backend_context_tokens == 4096
+    assert runtime.model_metadata.generation_headroom_tokens == 3
+    assert runtime.model_metadata.max_context_tokens == 4093
     state = backend._state
     assert state["model_from_config_calls"] == ["text", "mtp"]
     assert state["load_order"] == ["mtp", "model"]
@@ -731,6 +815,9 @@ def test_ngram_drafting_builds_generator_without_draft_model(monkeypatch: pytest
     )
 
     state = backend._state
+    assert runtime.model_metadata.backend_context_tokens == 4096
+    assert runtime.model_metadata.generation_headroom_tokens == 8
+    assert runtime.model_metadata.max_context_tokens == 4088
     assert state["model_from_config_calls"] == ["text"]
     assert len(state["cache_calls"]) == 1
     _, _, target_cache_kwargs = state["cache_calls"][0]
@@ -1125,6 +1212,9 @@ def test_external_draft_loads_separate_model_cache_and_lazy_generator(
     runtime.load(config)
 
     state = backend._state
+    assert runtime.model_metadata.backend_context_tokens == 4096
+    assert runtime.model_metadata.generation_headroom_tokens == 4
+    assert runtime.model_metadata.max_context_tokens == 4092
     assert state["config_directories"] == ["/models/qwen", "/models/draft"]
     assert state["model_from_config_calls"] == ["text", "text"]
     assert state["load_order"] == ["draft", "model"]
@@ -1241,6 +1331,63 @@ def test_lora_load_failure_rolls_back_prior_adapter_and_target(
     assert runtime._resources is None
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected_headroom"),
+    [
+        ({}, 1),
+        ({"mtp_enabled": True, "mtp_draft_tokens": 4}, 5),
+        ({"draft_model_directory": "/models/draft", "draft_tokens": 6}, 7),
+        ({"ngram_match_min": 3, "ngram_draft_size": 7}, 8),
+        ({"mtp_enabled": True, "mtp_draft_tokens": 9, "dynamic_draft_tokens": True}, 10),
+    ],
+)
+def test_model_metadata_reserves_resolved_generation_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: dict[str, object],
+    expected_headroom: int,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=4096, **extra))
+
+    assert runtime.model_metadata.backend_context_tokens == 4096
+    assert runtime.model_metadata.generation_headroom_tokens == expected_headroom
+    assert runtime.model_metadata.max_context_tokens == 4096 - expected_headroom
+
+
+def test_runtime_rejects_context_overflow_before_generator_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    exact_backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: exact_backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    exact_runtime = ExLlamaV3Runtime()
+    exact_runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=4096))
+
+    async def exact_fit() -> None:
+        exact_runtime.submit(RuntimeGenerationRequest("exact", tuple(range(4090)), 5))
+        assert "generator" in exact_backend._state
+        await exact_runtime.close()
+
+    asyncio.run(exact_fit())
+
+    over_backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: over_backend)
+    over_runtime = ExLlamaV3Runtime()
+    over_runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=4096))
+    with pytest.raises(RuntimeUnavailable) as raised:
+        over_runtime.submit(RuntimeGenerationRequest("over", tuple(range(4090)), 6))
+
+    assert raised.value.error.category is ErrorCategory.CONTEXT_LENGTH
+    assert raised.value.error.code == "total_context_limit_exceeded"
+    assert "generator" not in over_backend._state
+
+
 def test_model_metadata_falls_back_to_config_limit_when_rope_limit_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1249,12 +1396,14 @@ def test_model_metadata_falls_back_to_config_limit_when_rope_limit_is_unavailabl
     backend = _backend(32768, None)
     monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
     runtime = ExLlamaV3Runtime()
-    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=65536))
 
-    assert runtime.model_metadata.max_context_tokens == 32768
+    assert runtime.model_metadata.max_context_tokens == 32767
+    assert runtime.model_metadata.backend_context_tokens == 32768
+    assert runtime.model_metadata.generation_headroom_tokens == 1
 
 
-def test_model_metadata_preserves_unknown_or_invalid_backend_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_model_metadata_uses_cache_limit_when_backend_limit_is_unknown_or_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
     from exqserve.runtime import exllamav3 as module
 
     for raw_limit in (None, 0, -1, True, "131072"):
@@ -1262,7 +1411,9 @@ def test_model_metadata_preserves_unknown_or_invalid_backend_limit(monkeypatch: 
         monkeypatch.setattr(module, "_load_backend_module", lambda backend=backend: backend)
         runtime = ExLlamaV3Runtime()
         runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
-        assert runtime.model_metadata.max_context_tokens is None
+        assert runtime.model_metadata.max_context_tokens == 1023
+        assert runtime.model_metadata.backend_context_tokens == 1024
+        assert runtime.model_metadata.generation_headroom_tokens == 1
         assert "generator" not in backend._state
 
 
@@ -1399,6 +1550,93 @@ def test_render_chat_template_keeps_literal_qwen_markers_out_of_control_identity
     assert rendered.input_ids.count(248046) == 1
     assert rendered.input_ids.count(248068) == 1
     assert 248058 not in rendered.input_ids
+
+
+def test_render_chat_template_uses_explicit_muse_markers_plus_retained_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/muse", cache_tokens=1024))
+    tokenizer = backend._state["tokenizer"]
+
+    special_map = {
+        "<|begin_of_text|>": 200000,
+        "<|end_of_text|>": 200001,
+        "<|eom|>": 200007,
+        "<|eot|>": 200008,
+        "<|start|>": 200022,
+        "<|message|>": 200023,
+    }
+    tokenizer.extended_piece_to_id = {
+        "<|begin_of_text|>": 200000,
+        "<|end_of_text|>": 200001,
+    }
+
+    def render(
+        messages: list[dict[str, object]],
+        add_generation_prompt: bool = True,
+        **kwargs: object,
+    ) -> str:
+        del add_generation_prompt, kwargs
+        content = messages[0]["content"]
+        assert isinstance(content, str)
+        return (
+            f"<|begin_of_text|><|start|>user<|message|>{content}"
+            "<|eot|><|start|>assistant"
+        )
+
+    def encode(
+        text: str,
+        *,
+        add_bos: bool,
+        add_eos: bool,
+        encode_special_tokens: bool,
+        embeddings: list[object] | None = None,
+    ) -> _FakeTensor:
+        assert add_bos is False and add_eos is False and embeddings is None
+        values: list[int] = []
+        position = 0
+        while position < len(text):
+            if encode_special_tokens:
+                matched = False
+                for marker, token_id in sorted(
+                    special_map.items(), key=lambda item: len(item[0]), reverse=True
+                ):
+                    if text.startswith(marker, position):
+                        values.append(token_id)
+                        position += len(marker)
+                        matched = True
+                        break
+                if matched:
+                    continue
+            values.append(ord(text[position]))
+            position += 1
+        return _FakeTensor([values])
+
+    monkeypatch.setattr(tokenizer, "hf_render_chat_template", render)
+    monkeypatch.setattr(tokenizer, "encode", encode)
+    literal = (
+        "A<|message|>B<|eom|>C<|eot|>D<|start|>E"
+        "<|begin_of_text|>F<|end_of_text|>G"
+    )
+    rendered = runtime.render_chat_template(
+        [{"role": "tool", "content": literal}],
+        None,
+        {},
+        structural_marker_texts=("<|message|>", "<|eom|>", "<|eot|>", "<|start|>"),
+    )
+
+    assert literal in rendered.text
+    assert rendered.input_ids.count(200000) == 1
+    assert rendered.input_ids.count(200001) == 0
+    assert rendered.input_ids.count(200007) == 0
+    assert rendered.input_ids.count(200008) == 1
+    assert rendered.input_ids.count(200022) == 2
+    assert rendered.input_ids.count(200023) == 1
 
 
 def test_render_chat_template_forwards_operator_override_to_hf_renderer(
@@ -2126,6 +2364,126 @@ def test_submit_fails_when_runtime_rejects_explicit_generation_constraint(
     assert _FakeAsyncJob.calls == []
 
 
+
+def test_strict_tool_constraint_fail_closes_when_trigger_is_not_one_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="single-token"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-strict-tool-trigger",
+                    (1, 2, 3),
+                    8,
+                    generation_constraint=RuntimeGenerationConstraint(
+                        "not-a-single-token",
+                        'start: "ok"',
+                        True,
+                    ),
+                    generation_guarantee=GenerationGuarantee.SCHEMA,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeLLGuidanceFilter.calls == []
+    assert _FakeAsyncJob.calls == []
+
+
+def test_strict_tool_constraint_fail_closes_when_trigger_tokenization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    tokenizer = backend._state["tokenizer"]
+    original_encode = tokenizer.encode
+
+    def rejecting_encode(text: str, **kwargs: object) -> _FakeTensor:
+        if text == "broken-tool-trigger":
+            raise ValueError("cannot tokenize tool trigger")
+        return original_encode(text, **kwargs)
+
+    tokenizer.encode = rejecting_encode
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="cannot install its trigger"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-strict-tool-tokenize",
+                    (1, 2, 3),
+                    8,
+                    generation_constraint=RuntimeGenerationConstraint(
+                        "broken-tool-trigger",
+                        'start: "ok"',
+                        True,
+                    ),
+                    generation_guarantee=GenerationGuarantee.SCHEMA,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeLLGuidanceFilter.calls == []
+    assert _FakeAsyncJob.calls == []
+
+
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, RuntimeError])
+def test_strict_tool_constraint_fail_closes_when_filter_installation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+
+    class RejectingFilter:
+        def __init__(self, tokenizer: object, **kwargs: object) -> None:
+            del tokenizer, kwargs
+            raise error_type("constraint install failed")
+
+    backend.LLGuidanceFilter = RejectingFilter
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="cannot be enforced"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-strict-tool-filter",
+                    (1, 2, 3),
+                    8,
+                    generation_constraint=RuntimeGenerationConstraint(
+                        "</think>",
+                        'start: "ok"',
+                        True,
+                    ),
+                    generation_guarantee=GenerationGuarantee.SCHEMA,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeAsyncJob.calls == []
+
+
 def test_submit_maps_json_schema_constraint_to_fresh_llguidance_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2140,7 +2498,14 @@ def test_submit_maps_json_schema_constraint_to_fresh_llguidance_filter(
     schema = '{"type":"object","properties":{"ok":{"type":"boolean"}}}'
 
     async def scenario() -> None:
-        runtime.submit(RuntimeGenerationRequest("req-json", (1, 2, 3), 8, output_json_schema=schema))
+        session = runtime.submit(
+            RuntimeGenerationRequest("req-json", (1, 2, 3), 8, output_json_schema=schema)
+        )
+        events = [event async for event in session]
+        finished = next(event for event in events if isinstance(event, RuntimeFinished))
+        assert finished.hard_constraint_installed is True
+        assert finished.hard_constraint_activated is True
+        assert finished.effective_generation_guarantee is GenerationGuarantee.SCHEMA
 
     asyncio.run(scenario())
 
@@ -2171,7 +2536,7 @@ def test_submit_maps_single_special_token_trigger_to_llguidance_filter(
     schema = '{"type":"object"}'
 
     async def scenario() -> None:
-        runtime.submit(
+        session = runtime.submit(
             RuntimeGenerationRequest(
                 "req-trigger",
                 (1, 2, 3),
@@ -2180,6 +2545,11 @@ def test_submit_maps_single_special_token_trigger_to_llguidance_filter(
                 output_json_trigger="</think>",
             )
         )
+        events = [event async for event in session]
+        finished = next(event for event in events if isinstance(event, RuntimeFinished))
+        assert finished.hard_constraint_installed is True
+        assert finished.hard_constraint_activated is False
+        assert finished.effective_generation_guarantee is GenerationGuarantee.NONE
 
     asyncio.run(scenario())
 
@@ -2198,6 +2568,59 @@ def test_submit_maps_single_special_token_trigger_to_llguidance_filter(
     assert "filters" in _FakeAsyncJob.calls[0][3]
 
 
+def test_triggered_constraint_reports_activation_after_trigger_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+
+    class TriggeringJob(_FakeAsyncJob):
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                yield {"stage": "started", "eos": False}
+                yield {
+                    "stage": "streaming",
+                    "token_ids": [248069],
+                    "eos": False,
+                }
+                yield {
+                    "stage": "streaming",
+                    "eos": True,
+                    "prompt_tokens": 3,
+                    "new_tokens": 1,
+                    "cached_tokens": 0,
+                }
+
+            return stream()
+
+    backend.AsyncJob = TriggeringJob
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    async def scenario() -> None:
+        session = runtime.submit(
+            RuntimeGenerationRequest(
+                "req-trigger-active",
+                (1, 2, 3),
+                8,
+                output_json_schema='{"type":"object"}',
+                output_json_trigger="</think>",
+            )
+        )
+        events = [event async for event in session]
+        finished = next(event for event in events if isinstance(event, RuntimeFinished))
+        assert finished.hard_constraint_installed is True
+        assert finished.hard_constraint_activated is True
+        assert finished.effective_generation_guarantee is GenerationGuarantee.SCHEMA
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
 def test_submit_falls_back_when_constraint_trigger_is_not_one_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2211,7 +2634,7 @@ def test_submit_falls_back_when_constraint_trigger_is_not_one_token(
     runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
 
     async def scenario() -> None:
-        runtime.submit(
+        session = runtime.submit(
             RuntimeGenerationRequest(
                 "req-trigger",
                 (1, 2, 3),
@@ -2220,6 +2643,11 @@ def test_submit_falls_back_when_constraint_trigger_is_not_one_token(
                 output_json_trigger="not-a-single-token",
             )
         )
+        events = [event async for event in session]
+        finished = next(event for event in events if isinstance(event, RuntimeFinished))
+        assert finished.hard_constraint_installed is False
+        assert finished.hard_constraint_activated is False
+        assert finished.effective_generation_guarantee is GenerationGuarantee.NONE
 
     asyncio.run(scenario())
 
@@ -2246,7 +2674,7 @@ def test_submit_falls_back_when_llguidance_rejects_constraint(
     runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
 
     async def scenario() -> None:
-        runtime.submit(
+        session = runtime.submit(
             RuntimeGenerationRequest(
                 "req-json",
                 (1, 2, 3),
@@ -2254,11 +2682,162 @@ def test_submit_falls_back_when_llguidance_rejects_constraint(
                 output_json_schema='{"type":"object"}',
             )
         )
+        events = [event async for event in session]
+        finished = next(event for event in events if isinstance(event, RuntimeFinished))
+        assert finished.hard_constraint_installed is False
+        assert finished.hard_constraint_activated is False
+        assert finished.effective_generation_guarantee is GenerationGuarantee.NONE
 
     asyncio.run(scenario())
 
     _, _, _, job_kwargs = _FakeAsyncJob.calls[0]
     assert "filters" not in job_kwargs
+
+
+
+def test_submit_fail_closes_strong_structured_constraint_when_trigger_is_not_one_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="single-token trigger"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-trigger-strong",
+                    (1, 2, 3),
+                    8,
+                    output_json_schema='{"type":"object"}',
+                    output_json_trigger="not-a-single-token",
+                    generation_guarantee=GenerationGuarantee.FORMAT,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeLLGuidanceFilter.calls == []
+    assert _FakeAsyncJob.calls == []
+
+
+def test_submit_fail_closes_strong_structured_constraint_when_trigger_tokenization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    tokenizer = backend._state["tokenizer"]
+    original_encode = tokenizer.encode
+
+    def rejecting_encode(text: str, **kwargs: object) -> _FakeTensor:
+        if text == "broken-trigger":
+            raise ValueError("cannot tokenize trigger")
+        return original_encode(text, **kwargs)
+
+    tokenizer.encode = rejecting_encode
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="cannot install its trigger"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-trigger-tokenize-strong",
+                    (1, 2, 3),
+                    8,
+                    output_json_schema='{"type":"object"}',
+                    output_json_trigger="broken-trigger",
+                    generation_guarantee=GenerationGuarantee.SCHEMA,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeAsyncJob.calls == []
+
+
+def test_submit_fail_closes_strong_structured_constraint_when_llguidance_rejects_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+
+    class RejectingFilter:
+        def __init__(self, tokenizer: object, **kwargs: object) -> None:
+            del tokenizer, kwargs
+            raise ValueError("constraint unavailable")
+
+    backend.LLGuidanceFilter = RejectingFilter
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="cannot be enforced"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-json-strong",
+                    (1, 2, 3),
+                    8,
+                    output_json_schema='{"type":"object"}',
+                    generation_guarantee=GenerationGuarantee.SCHEMA,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeAsyncJob.calls == []
+
+
+
+@pytest.mark.parametrize("error_type", [TypeError, RuntimeError])
+def test_submit_fail_closes_strong_structured_constraint_on_non_value_filter_install_error(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+
+    class RejectingFilter:
+        def __init__(self, tokenizer: object, **kwargs: object) -> None:
+            del tokenizer, kwargs
+            raise error_type("constraint install failed")
+
+    backend.LLGuidanceFilter = RejectingFilter
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeConstraintUnsupported, match="cannot be enforced"):
+            runtime.submit(
+                RuntimeGenerationRequest(
+                    "req-json-strong-install-error",
+                    (1, 2, 3),
+                    8,
+                    output_json_schema='{"type":"object"}',
+                    generation_guarantee=GenerationGuarantee.SCHEMA,
+                    constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+                )
+            )
+
+    asyncio.run(scenario())
+    assert _FakeAsyncJob.calls == []
 
 
 def test_submit_passes_explicit_requeue_budget_to_exllamav3_job(
@@ -2383,7 +2962,8 @@ def test_runtime_session_drains_ready_exllamav3_results_and_preserves_terminal_r
     asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
 
 
-def test_runtime_session_keeps_ready_results_separate_when_provenance_is_enabled() -> None:
+
+def test_runtime_session_coalesces_ready_results_when_provenance_is_verified() -> None:
     from exqserve.runtime import exllamav3 as module
 
     class QueuedJob:
@@ -2431,11 +3011,488 @@ def test_runtime_session_keeps_ready_results_separate_when_provenance_is_enabled
             native_piece_ids=frozenset(),
         )
         events = [event async for event in session]
-        assert events[:2] == [
-            RuntimeTextDelta("req-provenance", "hello ", (1,), (), True),
-            RuntimeTextDelta("req-provenance", "world", (2,), (), True),
-        ]
+        assert events[0] == RuntimeTextDelta(
+            "req-provenance",
+            "hello world",
+            (1, 2),
+            (),
+            True,
+        )
         assert isinstance(events[-1], RuntimeFinished)
+        assert events[-1].usage.input_tokens == 3
+        assert events[-1].usage.output_tokens == 2
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_offsets_native_spans_when_coalescing_verified_results() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            self.queue.put_nowait(
+                {
+                    "stage": "streaming",
+                    "text": "ab",
+                    "token_ids": [[1, 3]],
+                    "eos": False,
+                }
+            )
+            self.queue.put_nowait(
+                {
+                    "stage": "streaming",
+                    "text": "<|x|>",
+                    "token_ids": [[2]],
+                    "eos": True,
+                    "eos_reason": "stop_token",
+                    "prompt_tokens": 1,
+                    "new_tokens": 3,
+                }
+            )
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    assert isinstance(item, dict)
+                    yield item
+                    if item.get("eos") is True:
+                        break
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-span-offset", (9,), 8),
+            QueuedJob(),
+            id_to_piece=("", "a", "<|x|>", "b"),
+            native_piece_ids=frozenset({2}),
+        )
+        events = [event async for event in session]
+        assert isinstance(events[0], RuntimeTextDelta)
+        assert events[0].text == "ab<|x|>"
+        assert events[0].token_ids == (1, 3, 2)
+        assert events[0].native_token_provenance is True
+        assert events[0].native_token_spans is not None
+        assert len(events[0].native_token_spans) == 1
+        span = events[0].native_token_spans[0]
+        assert (span.start, span.end, span.token_id, span.text) == (2, 7, 2, "<|x|>")
+        assert isinstance(events[-1], RuntimeFinished)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_does_not_coalesce_across_unverified_provenance() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            for item in (
+                {"stage": "streaming", "text": "a", "token_ids": [[1]], "eos": False},
+                {"stage": "streaming", "text": "?", "token_ids": [[2]], "eos": False},
+                {
+                    "stage": "streaming",
+                    "text": "c",
+                    "token_ids": [[3]],
+                    "eos": True,
+                    "eos_reason": "stop_token",
+                    "prompt_tokens": 1,
+                    "new_tokens": 3,
+                },
+            ):
+                self.queue.put_nowait(item)
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    assert isinstance(item, dict)
+                    yield item
+                    if item.get("eos") is True:
+                        break
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-unverified-boundary", (9,), 8),
+            QueuedJob(),
+            id_to_piece=("", "a", "b", "c"),
+            native_piece_ids=frozenset(),
+        )
+        events = [event async for event in session]
+        deltas = [event for event in events if isinstance(event, RuntimeTextDelta)]
+        assert [event.text for event in deltas] == ["a", "?", "c"]
+        assert deltas[0].native_token_spans == ()
+        assert deltas[0].native_token_provenance is True
+        assert deltas[1].native_token_spans is None
+        assert deltas[1].native_token_provenance is True
+        assert deltas[2].native_token_spans == ()
+        assert deltas[2].native_token_provenance is True
+        assert isinstance(events[-1], RuntimeFinished)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_bounds_ready_backlog_and_preserves_provenance() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            for token_id in range(1, 151):
+                piece = f"{token_id:03d}" + "x" * 26
+                item: dict[str, object] = {
+                    "stage": "streaming",
+                    "text": piece,
+                    "token_ids": [[token_id]],
+                    "eos": token_id == 150,
+                }
+                if token_id == 150:
+                    item.update(
+                        {
+                            "eos_reason": "stop_token",
+                            "prompt_tokens": 1,
+                            "new_tokens": 150,
+                            "cached_tokens": 0,
+                        }
+                    )
+                self.queue.put_nowait(item)
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    assert isinstance(item, dict)
+                    yield item
+                    if item.get("eos") is True:
+                        break
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        job = QueuedJob()
+        pieces = tuple([""] + [f"{token_id:03d}" + "x" * 26 for token_id in range(1, 151)])
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-bounded-provenance", (9,), 256),
+            job,
+            id_to_piece=pieces,
+            native_piece_ids=frozenset(range(1, 151)),
+        )
+
+        first = await anext(session)
+        assert isinstance(first, RuntimeTextDelta)
+        assert first.token_ids == tuple(range(1, 17))
+        assert len(first.text) == 16 * 29
+        assert job.queue.qsize() == 134
+
+        events = [first]
+        events.extend([event async for event in session])
+        deltas = [event for event in events if isinstance(event, RuntimeTextDelta)]
+        assert [len(delta.token_ids) for delta in deltas] == [16] * 9 + [6]
+        assert tuple(token_id for delta in deltas for token_id in delta.token_ids) == tuple(
+            range(1, 151)
+        )
+        assert "".join(delta.text for delta in deltas) == "".join(pieces[1:])
+        assert max(len(delta.text) for delta in deltas) == 16 * 29
+
+        for delta in deltas:
+            assert delta.native_token_provenance is True
+            assert delta.native_token_spans is not None
+            assert len(delta.native_token_spans) == len(delta.token_ids)
+            for index, (span, token_id) in enumerate(
+                zip(delta.native_token_spans, delta.token_ids, strict=True)
+            ):
+                assert span.start == index * 29
+                assert span.end == (index + 1) * 29
+                assert span.token_id == token_id
+                assert span.text == pieces[token_id]
+
+        assert isinstance(events[-1], RuntimeFinished)
+        assert events[-1].usage.input_tokens == 1
+        assert events[-1].usage.output_tokens == 150
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_bounds_ready_backlog_without_provenance() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            for token_id in range(1, 34):
+                item: dict[str, object] = {
+                    "stage": "streaming",
+                    "text": str(token_id),
+                    "token_ids": [[token_id]],
+                    "eos": token_id == 33,
+                }
+                if token_id == 33:
+                    item.update(
+                        {
+                            "eos_reason": "stop_token",
+                            "prompt_tokens": 2,
+                            "new_tokens": 33,
+                            "cached_tokens": 0,
+                        }
+                    )
+                self.queue.put_nowait(item)
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    assert isinstance(item, dict)
+                    yield item
+                    if item.get("eos") is True:
+                        break
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        job = QueuedJob()
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-bounded-raw", (1, 2), 64),
+            job,
+        )
+        events = [event async for event in session]
+        deltas = [event for event in events if isinstance(event, RuntimeTextDelta)]
+        assert [len(delta.token_ids) for delta in deltas] == [16, 16, 1]
+        assert tuple(token_id for delta in deltas for token_id in delta.token_ids) == tuple(
+            range(1, 34)
+        )
+        assert "".join(delta.text for delta in deltas) == "".join(str(i) for i in range(1, 34))
+        assert isinstance(events[-1], RuntimeFinished)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_known_backend_failure_preempts_ready_backlog() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            failure = RuntimeError("backend failed")
+            self.generator = SimpleNamespace(error=failure)
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            for token_id in range(1, 21):
+                self.queue.put_nowait(
+                    {
+                        "stage": "streaming",
+                        "text": "x",
+                        "token_ids": [[token_id]],
+                        "eos": False,
+                    }
+                )
+            self.queue.put_nowait(failure)
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    if isinstance(item, Exception):
+                        raise item
+                    assert isinstance(item, dict)
+                    yield item
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        job = QueuedJob()
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-known-backend-failure", (1,), 128),
+            job,
+            lambda: FailureCause.RUNTIME_RECOVERING,
+        )
+
+        event = await anext(session)
+        assert isinstance(event, module.RuntimeFailed)
+        assert event.error.code == "generation_failed"
+        assert event.error.retryable is True
+        assert event.error.cause is FailureCause.RUNTIME_RECOVERING
+        assert job.queue.qsize() == 21
+        with pytest.raises(StopAsyncIteration):
+            await anext(session)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_failure_recorded_during_first_await_preempts_drained_batch() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.failure = RuntimeError("backend failed")
+            self.generator = SimpleNamespace(error=None)
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            for token_id in range(1, 21):
+                self.queue.put_nowait(
+                    {
+                        "stage": "streaming",
+                        "text": "x",
+                        "token_ids": [[token_id]],
+                        "eos": False,
+                    }
+                )
+            self.queue.put_nowait(self.failure)
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    if isinstance(item, Exception):
+                        raise item
+                    assert isinstance(item, dict)
+                    self.generator.error = self.failure
+                    yield item
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        job = QueuedJob()
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-failure-during-await", (1,), 128),
+            job,
+            lambda: FailureCause.RUNTIME_RECOVERING,
+        )
+
+        event = await anext(session)
+        assert isinstance(event, module.RuntimeFailed)
+        assert event.error.retryable is True
+        assert event.error.cause is FailureCause.RUNTIME_RECOVERING
+        assert job.queue.qsize() == 5
+        with pytest.raises(StopAsyncIteration):
+            await anext(session)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_failure_after_first_batch_drops_unpublished_backlog() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.generator = SimpleNamespace(error=None)
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            for token_id in range(1, 33):
+                self.queue.put_nowait(
+                    {
+                        "stage": "streaming",
+                        "text": "x",
+                        "token_ids": [[token_id]],
+                        "eos": False,
+                    }
+                )
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    if isinstance(item, Exception):
+                        raise item
+                    assert isinstance(item, dict)
+                    yield item
+
+            return stream()
+
+        async def cancel(self) -> None:
+            pass
+
+    async def scenario() -> None:
+        job = QueuedJob()
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-failure-after-batch", (1,), 128),
+            job,
+            lambda: FailureCause.RUNTIME_RECOVERING,
+        )
+
+        first = await anext(session)
+        assert isinstance(first, RuntimeTextDelta)
+        assert first.token_ids == tuple(range(1, 17))
+        assert job.queue.qsize() == 16
+
+        failure = RuntimeError("backend failed")
+        job.generator.error = failure
+        job.queue.put_nowait(failure)
+        second = await anext(session)
+        assert isinstance(second, module.RuntimeFailed)
+        assert second.error.retryable is True
+        assert second.error.cause is FailureCause.RUNTIME_RECOVERING
+        assert job.queue.qsize() == 17
+        with pytest.raises(StopAsyncIteration):
+            await anext(session)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+
+def test_runtime_session_cancellation_interrupts_ready_backlog_between_batches() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    class QueuedJob:
+        def __init__(self) -> None:
+            self.queue: asyncio.Queue[object] = asyncio.Queue()
+            self.cancel_calls = 0
+            for token_id in range(1, 65):
+                self.queue.put_nowait(
+                    {
+                        "stage": "streaming",
+                        "text": "x",
+                        "token_ids": [[token_id]],
+                        "eos": False,
+                    }
+                )
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                while True:
+                    item = await self.queue.get()
+                    assert isinstance(item, dict)
+                    yield item
+
+            return stream()
+
+        async def cancel(self) -> None:
+            self.cancel_calls += 1
+
+    async def scenario() -> None:
+        job = QueuedJob()
+        session = module.RuntimeSession(
+            RuntimeGenerationRequest("req-bounded-cancel", (1,), 128),
+            job,
+        )
+        first = await anext(session)
+        assert isinstance(first, RuntimeTextDelta)
+        assert len(first.token_ids) == 16
+        assert job.queue.qsize() == 48
+
+        await session.cancel()
+        cancelled = await anext(session)
+        assert isinstance(cancelled, RuntimeCancelled)
+        assert job.cancel_calls == 1
+        assert job.queue.qsize() == 48
+        with pytest.raises(StopAsyncIteration):
+            await anext(session)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
 

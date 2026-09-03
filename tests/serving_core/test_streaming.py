@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.control.request import RequestTerminalReason
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -28,7 +28,12 @@ from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.timing import GenerationTiming
 from exqserve.core.usage import TokenUsage
-from exqserve.model.contracts import CompiledPrompt, TemplateRequest
+from exqserve.model.contracts import (
+    CompiledPrompt,
+    ParserTerminalIssue,
+    TemplateRequest,
+    incomplete_tool_terminal_issue,
+)
 from exqserve.runtime.contracts import (
     RuntimeCancelled,
     RuntimeEvent,
@@ -48,6 +53,10 @@ from exqserve.serving.engine import ServingEngine
 class _Finish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool = False
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class _Parser:
@@ -111,6 +120,13 @@ class _Controller:
     def __init__(self, controlled: _Controlled) -> None:
         self.controlled = controlled
         self.requests: list[RuntimeGenerationRequest] = []
+
+    async def acquire(self, request_id: str):  # type: ignore[no-untyped-def]
+        del request_id
+        return self
+
+    async def release(self) -> None:
+        return None
 
     async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
         self.requests.append(request)
@@ -296,6 +312,56 @@ def test_timeout_runtime_cancel_maps_to_safe_timeout_failure() -> None:
 
     asyncio.run(scenario())
 
+
+
+def test_transient_runtime_failure_is_replayable_only_before_semantic_commit() -> None:
+    async def precommit() -> None:
+        error = CanonicalError(
+            ErrorCategory.RUNTIME_FAILURE,
+            "generation_failed",
+            "Transient failure.",
+            True,
+            FailureCause.RUNTIME_RECOVERING,
+        )
+        controlled = _Controlled([RuntimeStarted("req"), RuntimeFailed("req", error)])
+        events = [
+            event
+            async for event in await ServingEngine(
+                _Compiler(), lambda request_id, reasoning, tool_policy: _Parser("req"), _Controller(controlled)
+            ).submit(_serving_request())
+        ]
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.retryable is True
+        assert events[-1].error.cause is FailureCause.RUNTIME_RECOVERING
+
+    async def postcommit() -> None:
+        error = CanonicalError(
+            ErrorCategory.RUNTIME_FAILURE,
+            "generation_failed",
+            "Transient failure.",
+            True,
+            FailureCause.RUNTIME_RECOVERING,
+        )
+        controlled = _Controlled(
+            [
+                RuntimeStarted("req"),
+                RuntimeTextDelta("req", "<think>why</think>answer"),
+                RuntimeFailed("req", error),
+            ]
+        )
+        events = [
+            event
+            async for event in await ServingEngine(
+                _Compiler(), lambda request_id, reasoning, tool_policy: _Parser("req"), _Controller(controlled)
+            ).submit(_serving_request())
+        ]
+        assert any(isinstance(event, TextDelta) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.retryable is False
+        assert events[-1].error.cause is FailureCause.RUNTIME_RECOVERING
+
+    asyncio.run(precommit())
+    asyncio.run(postcommit())
 
 def test_ordinary_runtime_cancel_maps_to_generation_cancelled() -> None:
     async def scenario() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -191,19 +191,158 @@ def test_responses_failure_and_cancel_have_distinct_terminal_statuses() -> None:
     failure = failure_serializer.feed(
         GenerationFailed(
             "r",
-            CanonicalError(ErrorCategory.MODEL_FAILURE, "bad_output", "Model output failed.", False),
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                "bad_output",
+                "Model output failed.",
+                False,
+                FailureCause.OUTPUT_EOS,
+            ),
         )
     )[-1]
     assert failure["type"] == "response.failed"
     assert failure["response"]["status"] == "failed"  # type: ignore[index]
     assert failure["response"]["error"]["code"] == "bad_output"  # type: ignore[index]
     assert failure["response"]["error"]["message"] == "Model output failed."  # type: ignore[index]
+    assert failure["response"]["error"]["exqserve_cause"] == "output_eos"  # type: ignore[index]
 
     cancel_serializer = ResponsesStreamSerializer("m", response_id="resp_c", created_at=1)
     cancelled = cancel_serializer.feed(GenerationCancelled("r"))[-1]
     assert cancelled["type"] == "response.incomplete"
     assert cancelled["response"]["status"] == "cancelled"  # type: ignore[index]
     assert cancelled["response"]["error"] is None  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    [
+        (FailureCause.OUTPUT_EOS, "tool_call_incomplete"),
+        (FailureCause.OUTPUT_LENGTH, "tool_call_incomplete"),
+    ],
+)
+def test_responses_incomplete_tool_failure_code_preserves_termination_fact(
+    cause: FailureCause,
+    expected_code: str,
+) -> None:
+    event = GenerationFailed(
+        "r",
+        CanonicalError(
+            ErrorCategory.MODEL_FAILURE,
+            "tool_call_incomplete",
+            "Model output ended with an incomplete tool call.",
+            False,
+            cause,
+        ),
+    )
+
+    serializer = ResponsesStreamSerializer("m", response_id="resp_tool_fail", created_at=1)
+    failure = serializer.feed(event)[-1]
+    assert failure["response"]["error"]["code"] == expected_code  # type: ignore[index]
+    assert failure["response"]["error"]["exqserve_cause"] == cause.value  # type: ignore[index]
+
+    accumulator = ResponsesAccumulator("m", response_id="resp_tool_fail_sync", created_at=1)
+    accumulator.consume(event)
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.exqserve_cause == cause.value
+
+
+def test_responses_model_tool_output_invalid_keeps_standard_code_and_optional_cause() -> None:
+    cause = FailureCause.MODEL_TOOL_OUTPUT_INVALID
+    event = GenerationFailed(
+        "r",
+        CanonicalError(
+            ErrorCategory.MODEL_FAILURE,
+            "tool_call_invalid",
+            "Model produced an invalid tool call.",
+            False,
+            cause,
+        ),
+    )
+    serializer = ResponsesStreamSerializer("m", response_id="resp_tool_invalid", created_at=1)
+    failure = serializer.feed(event)[-1]
+    assert failure["response"]["error"]["code"] == "tool_call_invalid"  # type: ignore[index]
+    assert failure["response"]["error"]["exqserve_cause"] == cause.value  # type: ignore[index]
+
+    accumulator = ResponsesAccumulator("m", response_id="resp_tool_invalid_sync", created_at=1)
+    accumulator.consume(event)
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == "tool_call_invalid"
+    assert exc_info.value.exqserve_cause == cause.value
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    [
+        (FailureCause.OUTPUT_EOS, "protocol_ambiguity"),
+        (FailureCause.OUTPUT_LENGTH, "protocol_ambiguity"),
+        (FailureCause.PARSER_AMBIGUITY_LIMIT, "protocol_ambiguity"),
+    ],
+)
+def test_responses_protocol_ambiguity_keeps_standard_code_and_optional_cause(
+    cause: FailureCause,
+    expected_code: str,
+) -> None:
+    event = GenerationFailed(
+        "r",
+        CanonicalError(
+            ErrorCategory.MODEL_FAILURE,
+            "protocol_ambiguity",
+            "Model output ended at an ambiguous protocol boundary.",
+            False,
+            cause,
+        ),
+    )
+
+    serializer = ResponsesStreamSerializer("m", response_id="resp_ambiguity", created_at=1)
+    failure = serializer.feed(event)[-1]
+    assert failure["response"]["error"]["code"] == expected_code  # type: ignore[index]
+    assert failure["response"]["error"]["exqserve_cause"] == cause.value  # type: ignore[index]
+
+    accumulator = ResponsesAccumulator("m", response_id="resp_ambiguity_sync", created_at=1)
+    accumulator.consume(event)
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.exqserve_cause == cause.value
+
+
+@pytest.mark.parametrize(
+    ("cause", "category", "code"),
+    [
+        (FailureCause.RUNTIME_RECOVERING, ErrorCategory.OVERLOADED, "runtime_recovering"),
+        (FailureCause.RESTART_REQUIRED, ErrorCategory.RUNTIME_FAILURE, "restart_required"),
+    ],
+)
+def test_responses_runtime_failure_preserves_standard_identity_and_cause(
+    cause: FailureCause,
+    category: ErrorCategory,
+    code: str,
+) -> None:
+    event = GenerationFailed(
+        "r",
+        CanonicalError(
+            category,
+            code,
+            "Inference backend generation failed.",
+            cause is FailureCause.RUNTIME_RECOVERING,
+            cause,
+        ),
+    )
+
+    serializer = ResponsesStreamSerializer("m", response_id="resp_runtime_fail", created_at=1)
+    failure = serializer.feed(event)[-1]
+    assert failure["response"]["error"]["code"] == code  # type: ignore[index]
+    assert failure["response"]["error"]["exqserve_cause"] == cause.value  # type: ignore[index]
+
+    accumulator = ResponsesAccumulator("m", response_id="resp_runtime_fail_sync", created_at=1)
+    accumulator.consume(event)
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        accumulator.result()
+    assert exc_info.value.code == code
+    assert exc_info.value.exqserve_cause == cause.value
 
 
 def test_responses_invalid_tool_candidate_keeps_tentative_item_open_then_fails() -> None:

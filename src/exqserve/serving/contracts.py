@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 
 from exqserve.agent.reasoning import ReasoningBudgetOverride, ReasoningPolicy
@@ -14,6 +15,7 @@ from exqserve.core.events import GenerationEvent
 from exqserve.core.request import CanonicalRequest, RawPromptRequest
 from exqserve.model.contracts import IncrementalParserLike, ParserFinishLike, PromptCompilerLike
 from exqserve.runtime.contracts import RuntimeSamplingConfig
+from exqserve.serving.terminal import TerminalDecision, request_rejection_decision
 
 __all__ = (
     "IncrementalParserLike",
@@ -29,6 +31,22 @@ __all__ = (
 )
 
 
+class MidSystemPolicy(str, Enum):
+    LEGACY_UNSPECIFIED = "legacy_unspecified"
+    STRICT = "strict"
+    BEST_EFFORT = "best_effort"
+
+
+class MidSystemCapability(str, Enum):
+    LEADING_ONLY = "leading_only"
+    INLINE = "inline"
+
+
+class BestEffortMidSystemLowering(str, Enum):
+    MERGED_LEADING = "merged_leading"
+    IN_PLACE_USER_META = "in_place_user_meta"
+
+
 @dataclass(frozen=True, slots=True)
 class ServingRequest:
     input: CanonicalRequest
@@ -40,6 +58,7 @@ class ServingRequest:
     sampling: RuntimeSamplingConfig | None = None
     stop_conditions: tuple[str | int, ...] = ()
     reasoning_budget: ReasoningBudgetOverride = field(default_factory=ReasoningBudgetOverride)
+    mid_system_policy: MidSystemPolicy = MidSystemPolicy.LEGACY_UNSPECIFIED
 
     def __post_init__(self) -> None:
         if not isinstance(self.input, CanonicalRequest):
@@ -65,6 +84,8 @@ class ServingRequest:
             raise TypeError("sampling must be RuntimeSamplingConfig or None")
         if not isinstance(self.reasoning_budget, ReasoningBudgetOverride):
             raise TypeError("reasoning_budget must be a ReasoningBudgetOverride")
+        if not isinstance(self.mid_system_policy, MidSystemPolicy):
+            raise TypeError("mid_system_policy must be a MidSystemPolicy")
         if not isinstance(self.stop_conditions, tuple):
             raise TypeError("stop_conditions must be a tuple")
         for condition in self.stop_conditions:
@@ -118,6 +139,7 @@ class ServingRejected(Exception):
         if not isinstance(error, CanonicalError):
             raise TypeError("error must be a CanonicalError")
         self.error = error
+        self.terminal_decision: TerminalDecision = request_rejection_decision(error)
         super().__init__(error.message)
 
 

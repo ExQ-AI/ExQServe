@@ -40,6 +40,7 @@ from exqserve.core.items import (
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
     ModelCapabilities,
+    ParserTerminalIssue,
     TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
@@ -47,9 +48,11 @@ from exqserve.model.contracts import (
     TemplateTool,
     TemplateToolCall,
     TemplateToolResponse,
+    ToolConstraintGuarantee,
     ToolConstraintMode,
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
+    incomplete_tool_terminal_issue,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
 from exqserve.model.tool_constraints import (
@@ -102,6 +105,15 @@ def gemma4_tool_constraint(
 
     lines = ["%llguidance {}", "start: tool"]
     lines.append("tool: " + " | ".join(f"tool_{index}" for index in range(len(tools))))
+    branch_guarantees = tuple(
+        (
+            tool.name,
+            ToolConstraintGuarantee.SCHEMA
+            if mode is ToolConstraintMode.SCHEMA or tool.strict
+            else ToolConstraintGuarantee.FORMAT,
+        )
+        for tool in tools
+    )
     for index, tool in enumerate(tools):
         if not _valid_gemma_tool_name(tool.name):
             raise ToolConstraintUnsupported(
@@ -119,6 +131,7 @@ def gemma4_tool_constraint(
         trigger=_TOOL_OPEN,
         lark_grammar="\n".join(lines),
         eos_after_completed=not tool_policy.allow_parallel,
+        branch_guarantees=branch_guarantees,
     )
 
 
@@ -354,6 +367,10 @@ class Gemma4ParserFinish:
         if not isinstance(self.incomplete_tool_call, bool):
             raise TypeError("incomplete_tool_call must be a bool")
 
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
+
 
 def _deterministic_call_id(request_id: str, index: int) -> str:
     digest = hashlib.sha256(f"{request_id}\0gemma4\0{index}".encode()).hexdigest()
@@ -368,6 +385,91 @@ def _longest_partial_marker_suffix(text: str) -> int:
             if marker.startswith(text[-size:]):
                 longest = max(longest, size)
     return longest
+
+
+def _trailing_backtick_run(text: str) -> int:
+    position = len(text)
+    while position > 0 and text[position - 1] == "`":
+        position -= 1
+    return len(text) - position
+
+
+class _GemmaPresentationTracker:
+    """Track only backtick presentation state needed to veto Gemma tool openers."""
+
+    def __init__(self) -> None:
+        self._inline_width: int | None = None
+        self._fence_width: int | None = None
+        self._fence_close_pending = False
+        self._leading_spaces: int | None = 0
+
+    @property
+    def active(self) -> bool:
+        return self._inline_width is not None or self._fence_width is not None
+
+    def reset(self) -> None:
+        self._inline_width = None
+        self._fence_width = None
+        self._fence_close_pending = False
+        self._leading_spaces = 0
+
+    def _newline(self) -> None:
+        if self._fence_width is not None and self._fence_close_pending:
+            self._fence_width = None
+        self._fence_close_pending = False
+        self._inline_width = None
+        self._leading_spaces = 0
+
+    def consume(self, text: str) -> None:
+        position = 0
+        while position < len(text):
+            character = text[position]
+            if character == "\n":
+                self._newline()
+                position += 1
+                continue
+
+            if self._fence_width is not None and self._fence_close_pending:
+                if character in " \t":
+                    position += 1
+                    continue
+                self._fence_close_pending = False
+                self._leading_spaces = None
+
+            if character == "`":
+                end = position + 1
+                while end < len(text) and text[end] == "`":
+                    end += 1
+                width = end - position
+                line_start_width = self._leading_spaces
+
+                if self._fence_width is not None:
+                    if (
+                        line_start_width is not None
+                        and line_start_width <= 3
+                        and width >= self._fence_width
+                    ):
+                        self._fence_close_pending = True
+                    self._leading_spaces = None
+                elif self._inline_width is not None:
+                    if width == self._inline_width:
+                        self._inline_width = None
+                    self._leading_spaces = None
+                elif line_start_width is not None and line_start_width <= 3 and width >= 3:
+                    self._fence_width = width
+                    self._leading_spaces = None
+                else:
+                    self._inline_width = width
+                    self._leading_spaces = None
+                position = end
+                continue
+
+            if self._leading_spaces is not None:
+                if character == " " and self._leading_spaces < 4:
+                    self._leading_spaces += 1
+                else:
+                    self._leading_spaces = None
+            position += 1
 
 
 class _GemmaArgumentReader:
@@ -409,6 +511,8 @@ class _GemmaArgumentReader:
             if colon < 0:
                 raise ValueError("Gemma 4 tool-call object key is missing ':'")
             key = self._text[self._position : colon].strip()
+            if _TOOL_CLOSE in key:
+                raise ValueError("Gemma 4 fallback object keys cannot contain the tool-call close marker")
             self._position = colon
         if not key:
             raise ValueError("Gemma 4 tool-call object key must not be empty")
@@ -497,6 +601,236 @@ def _parse_tool_body(body: str) -> tuple[str, str]:
     return name, canonical_json_dumps(cast(dict[str, JsonValue], arguments))
 
 
+def _tool_candidate_decision(text: str) -> tuple[str, int]:
+    """Classify a post-opener prefix as waiting, committed, or disqualified."""
+
+    position = 0
+    while position < len(text) and text[position].isspace():
+        position += 1
+
+    for expected in "call:":
+        if position >= len(text):
+            return "waiting", position
+        if text[position] != expected:
+            return "disqualified", position
+        position += 1
+
+    while position < len(text) and text[position].isspace():
+        position += 1
+    name_start = position
+    while position < len(text):
+        character = text[position]
+        if character == "{" or character.isspace():
+            break
+        if character in "}<>":
+            return "disqualified", position
+        position += 1
+
+    if position == len(text):
+        return "waiting", position
+    if position == name_start:
+        return "disqualified", position
+
+    if text[position] == "{":
+        return "committed", position + 1
+
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text):
+        return "waiting", position
+    if text[position] == "{":
+        return "committed", position + 1
+    return "disqualified", position
+
+
+def _find_tool_close(text: str) -> int:
+    """Find the first Gemma envelope close outside accepted argument literals."""
+
+    body_start = 0
+    while body_start < len(text) and text[body_start].isspace():
+        body_start += 1
+    if not text.startswith("call:", body_start):
+        return text.find(_TOOL_CLOSE)
+    object_start = text.find("{", body_start + len("call:"))
+    if object_start < 0:
+        return text.find(_TOOL_CLOSE)
+
+    # Each frame is (container kind, lexical state). This mirrors the accepted
+    # _GemmaArgumentReader domain closely enough to distinguish literal marker
+    # spellings from the outer envelope without validating values here.
+    frames: list[tuple[str, str]] = [("object", "key")]
+    position = object_start + 1
+    string_mode: str | None = None
+    string_role: str | None = None
+    backslash_run = 0
+
+    def set_state(state: str) -> None:
+        kind, _ = frames[-1]
+        frames[-1] = (kind, state)
+
+    def complete_value() -> None:
+        if frames:
+            set_state("after_value")
+
+    def close_container() -> None:
+        frames.pop()
+        if frames:
+            complete_value()
+
+    while position < len(text):
+        if string_mode == "native":
+            if text.startswith(_STRING_DELIMITER, position):
+                string_mode = None
+                position += len(_STRING_DELIMITER)
+                if string_role == "key":
+                    set_state("colon")
+                else:
+                    complete_value()
+                string_role = None
+            else:
+                position += 1
+            continue
+
+        if string_mode == "json":
+            character = text[position]
+            if character == "\\":
+                backslash_run += 1
+                position += 1
+                continue
+            if character == '"' and backslash_run % 2 == 0:
+                string_mode = None
+                if string_role == "key":
+                    set_state("colon")
+                else:
+                    complete_value()
+                string_role = None
+            backslash_run = 0
+            position += 1
+            continue
+
+        if not frames:
+            if text.startswith(_TOOL_CLOSE, position):
+                return position
+            position += 1
+            continue
+
+        kind, state = frames[-1]
+        if text.startswith(_TOOL_CLOSE, position):
+            return position
+
+        character = text[position]
+        if state in {"key", "value"} and character.isspace():
+            position += 1
+            continue
+
+        if kind == "object" and state == "key":
+            if character == "}":
+                close_container()
+                position += 1
+                continue
+            if text.startswith(_STRING_DELIMITER, position):
+                string_mode = "native"
+                string_role = "key"
+                position += len(_STRING_DELIMITER)
+                continue
+            if character == '"':
+                string_mode = "json"
+                string_role = "key"
+                backslash_run = 0
+                position += 1
+                continue
+            set_state("unquoted_key")
+            continue
+
+        if kind == "object" and state == "unquoted_key":
+            if character == ":":
+                set_state("value")
+            position += 1
+            continue
+
+        if kind == "object" and state == "colon":
+            if character.isspace():
+                position += 1
+                continue
+            if character == ":":
+                set_state("value")
+                position += 1
+                continue
+            position += 1
+            continue
+
+        if state == "value":
+            if character == "}" and kind == "object":
+                # Empty/missing values are invalid, but recognizing the
+                # container boundary keeps malformed-envelope handling local.
+                close_container()
+                position += 1
+                continue
+            if character == "]" and kind == "array":
+                close_container()
+                position += 1
+                continue
+            if text.startswith(_STRING_DELIMITER, position):
+                string_mode = "native"
+                string_role = "value"
+                position += len(_STRING_DELIMITER)
+                continue
+            if character == '"':
+                string_mode = "json"
+                string_role = "value"
+                backslash_run = 0
+                position += 1
+                continue
+            if character == "{":
+                frames.append(("object", "key"))
+                position += 1
+                continue
+            if character == "[":
+                frames.append(("array", "value"))
+                position += 1
+                continue
+            set_state("scalar")
+            continue
+
+        if state == "scalar":
+            if character == ",":
+                set_state("key" if kind == "object" else "value")
+                position += 1
+                continue
+            if character == "}" and kind == "object":
+                close_container()
+                position += 1
+                continue
+            if character == "]" and kind == "array":
+                close_container()
+                position += 1
+                continue
+            position += 1
+            continue
+
+        if state == "after_value":
+            if character.isspace():
+                position += 1
+                continue
+            if character == ",":
+                set_state("key" if kind == "object" else "value")
+                position += 1
+                continue
+            if character == "}" and kind == "object":
+                close_container()
+                position += 1
+                continue
+            if character == "]" and kind == "array":
+                close_container()
+                position += 1
+                continue
+            position += 1
+            continue
+
+        position += 1
+    return -1
+
+
 class Gemma4IncrementalParser:
     """Convert Gemma 4 native channels/tool calls into canonical events incrementally."""
 
@@ -517,6 +851,7 @@ class Gemma4IncrementalParser:
         self._reasoning_value = ""
         self._call_index = 0
         self._had_incomplete_tool = False
+        self._presentation = _GemmaPresentationTracker()
         self._finished = False
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
@@ -537,6 +872,11 @@ class Gemma4IncrementalParser:
         self._text_value += text
         events.append(TextDelta(self._request_id, text))
 
+    def _emit_plain_content(self, text: str, events: list[GenerationEvent]) -> None:
+        if text:
+            self._presentation.consume(text)
+            self._emit_content(text, events)
+
     def _close_channel(self, events: list[GenerationEvent]) -> None:
         if self._mode == "reasoning" and self._reasoning_open:
             events.append(ReasoningCompleted(self._request_id, self._reasoning_value))
@@ -547,9 +887,13 @@ class Gemma4IncrementalParser:
             self._text_open = False
             self._text_value = ""
 
-    def _enter_tool(self, events: list[GenerationEvent]) -> None:
-        self._close_channel(events)
+    def _enter_tool_candidate(self) -> None:
         self._tool_return_mode = self._mode
+        self._mode = "tool_candidate"
+
+    def _commit_tool(self, events: list[GenerationEvent]) -> None:
+        self._mode = self._tool_return_mode
+        self._close_channel(events)
         self._mode = "tool"
 
     def _process_plain(self, events: list[GenerationEvent]) -> bool:
@@ -560,28 +904,50 @@ class Gemma4IncrementalParser:
         ]
         if matches:
             position, marker = min(matches, key=lambda item: item[0])
-            self._emit_content(self._buffer[:position], events)
+            self._emit_plain_content(self._buffer[:position], events)
             self._buffer = self._buffer[position + len(marker) :]
-            if marker == _TOOL_OPEN:
-                self._enter_tool(events)
+            if self._presentation.active:
+                self._emit_plain_content(marker, events)
+            elif marker == _TOOL_OPEN:
+                self._enter_tool_candidate()
             elif marker == _THOUGHT_OPEN:
+                self._presentation.reset()
                 if self._mode != "reasoning":
                     self._close_channel(events)
                     self._mode = "reasoning"
-            elif self._mode == "reasoning":
-                self._close_channel(events)
-                self._mode = "text"
+            else:
+                self._presentation.reset()
+                if self._mode == "reasoning":
+                    self._close_channel(events)
+                    self._mode = "text"
             return True
 
-        held = _longest_partial_marker_suffix(self._buffer)
+        held = max(
+            _longest_partial_marker_suffix(self._buffer),
+            _trailing_backtick_run(self._buffer),
+        )
         safe_length = len(self._buffer) - held
         if safe_length > 0:
-            self._emit_content(self._buffer[:safe_length], events)
+            self._emit_plain_content(self._buffer[:safe_length], events)
             self._buffer = self._buffer[safe_length:]
         return False
 
+    def _process_tool_candidate(self, events: list[GenerationEvent]) -> bool:
+        decision, boundary = _tool_candidate_decision(self._buffer)
+        if decision == "waiting":
+            return False
+        if decision == "committed":
+            self._commit_tool(events)
+            return True
+
+        replay = _TOOL_OPEN + self._buffer[:boundary]
+        self._buffer = self._buffer[boundary:]
+        self._mode = self._tool_return_mode
+        self._emit_plain_content(replay, events)
+        return True
+
     def _process_tool(self, events: list[GenerationEvent]) -> bool:
-        close_at = self._buffer.find(_TOOL_CLOSE)
+        close_at = _find_tool_close(self._buffer)
         if close_at < 0:
             return False
         body = self._buffer[:close_at]
@@ -619,9 +985,12 @@ class Gemma4IncrementalParser:
         self._buffer += chunk
         events: list[GenerationEvent] = []
         while True:
-            progressed = (
-                self._process_tool(events) if self._mode == "tool" else self._process_plain(events)
-            )
+            if self._mode == "tool":
+                progressed = self._process_tool(events)
+            elif self._mode == "tool_candidate":
+                progressed = self._process_tool_candidate(events)
+            else:
+                progressed = self._process_plain(events)
             if not progressed:
                 break
         return tuple(events)
@@ -630,16 +999,18 @@ class Gemma4IncrementalParser:
         if self._finished:
             return Gemma4ParserFinish((), self._had_incomplete_tool)
         events: list[GenerationEvent] = []
-        if self._mode == "tool":
+        if self._mode in {"tool", "tool_candidate"}:
             self._had_incomplete_tool = True
             self._buffer = ""
             self._mode = self._tool_return_mode
         elif self._buffer:
-            if any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS):
+            if self._presentation.active:
+                self._emit_plain_content(self._buffer, events)
+            elif any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS):
                 if _TOOL_OPEN.startswith(self._buffer):
                     self._had_incomplete_tool = True
             else:
-                self._emit_content(self._buffer, events)
+                self._emit_plain_content(self._buffer, events)
             self._buffer = ""
         self._close_channel(events)
         self._finished = True

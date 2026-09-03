@@ -17,7 +17,11 @@ from exqserve.agent.reasoning import (
     ReasoningMode,
     ReasoningPolicy,
 )
-from exqserve.agent.structured_output import StructuredOutputSpec, validate_structured_output
+from exqserve.agent.structured_output import (
+    StructuredOutputSpec,
+    validate_structured_output,
+    violates_structured_constraint_guarantee,
+)
 from exqserve.agent.tools import ToolPolicy
 from exqserve.agent.validation import validate_tool_calls, validate_tool_history
 from exqserve.control.request import (
@@ -26,7 +30,13 @@ from exqserve.control.request import (
     RequestRejected,
     RequestTerminalReason,
 )
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import (
+    CanonicalError,
+    ErrorCategory,
+    FailureCause,
+    SemanticCommitClass,
+    commit_aware_error,
+)
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -42,11 +52,24 @@ from exqserve.core.events import (
     ToolCallStarted,
     UsageUpdated,
 )
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
+from exqserve.core.items import (
+    MessageItem,
+    MessageRole,
+    MultimodalMessageItem,
+    MultimodalToolResultItem,
+    TextContentPart,
+    ToolResultItem,
+)
+from exqserve.core.request import CanonicalRequest
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenAwareIncrementalParser,
     NativeTokenProvenanceError,
+    ParserAmbiguityDetail,
+    ParserTerminalIssue,
+    ParserTerminalIssueKind,
     ReasoningControlSpec,
     RenderedPrompt,
     TemplateImagePart,
@@ -56,9 +79,9 @@ from exqserve.model.contracts import (
     TemplateTool,
     TemplateToolCall,
     TemplateToolResponse,
+    ToolConstraintGuarantee,
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
-    has_exposed_strict_tool,
 )
 from exqserve.runtime.contracts import (
     RuntimeConstraintUnsupported,
@@ -73,17 +96,29 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
 )
 from exqserve.serving.contracts import (
+    BestEffortMidSystemLowering,
     IncrementalParserLike,
+    MidSystemCapability,
+    MidSystemPolicy,
     PromptCompilerLike,
     ServingRejected,
     ServingRequest,
 )
+from exqserve.serving.guarantees import RequestGuaranteeResolver, guarantee_satisfies
 from exqserve.serving.preprocessing import RendererLanePool, await_task_termination
-from exqserve.serving.runtime_events import (
-    completion_reason_from_runtime,
-    timing_event_from_runtime,
+from exqserve.serving.runtime_events import timing_event_from_runtime
+from exqserve.serving.terminal import (
+    TerminalDecision,
+    TerminalDisposition,
+    TerminalEvidence,
+    TerminalPrimaryOwner,
 )
-from exqserve.serving.tool_batch import ToolCallBatchGate, tool_validation_failure
+from exqserve.serving.tool_batch import (
+    ToolCallBatchGate,
+    is_model_tool_output_invalid,
+    tool_validation_failure,
+    violates_tool_constraint_guarantee,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +134,7 @@ class RuntimeTemplateRenderer(Protocol):
         *,
         add_generation_prompt: bool = True,
         protect_literal_tokens: bool = False,
+        structural_marker_texts: tuple[str, ...] = (),
     ) -> RuntimeRenderedPrompt:
         ...
 
@@ -173,15 +209,29 @@ def _tool_dict(tool: TemplateTool) -> dict[str, object]:
 class RuntimeTemplateAdapter:
     """Bridge model template values into a structural runtime renderer."""
 
-    def __init__(self, renderer: RuntimeTemplateRenderer) -> None:
+    def __init__(
+        self,
+        renderer: RuntimeTemplateRenderer,
+        structural_marker_texts: tuple[str, ...] = (),
+    ) -> None:
         self._renderer = renderer
+        self._structural_marker_texts = structural_marker_texts
 
     def render_and_tokenize(self, request: TemplateRequest) -> RenderedPrompt:
         if not isinstance(request, TemplateRequest):
             raise TypeError("request must be a TemplateRequest")
         messages = [_message_dict(message) for message in request.messages]
         tools = [_tool_dict(tool) for tool in request.tools] if request.tools else None
-        if request.protect_literal_tokens:
+        if self._structural_marker_texts:
+            rendered = self._renderer.render_chat_template(
+                messages,
+                tools,
+                dict(request.template_kwargs),
+                add_generation_prompt=request.add_generation_prompt,
+                protect_literal_tokens=True,
+                structural_marker_texts=self._structural_marker_texts,
+            )
+        elif request.protect_literal_tokens:
             rendered = self._renderer.render_chat_template(
                 messages,
                 tools,
@@ -221,8 +271,16 @@ class ControlledSessionLike(Protocol):
         ...
 
 
-class RequestControllerLike(Protocol):
+class RequestLeaseLike(Protocol):
     async def submit(self, request: RuntimeGenerationRequest) -> ControlledSessionLike:
+        ...
+
+    async def release(self) -> None:
+        ...
+
+
+class RequestControllerLike(Protocol):
+    async def acquire(self, request_id: str) -> RequestLeaseLike:
         ...
 
 
@@ -268,6 +326,149 @@ def _safe_error(
     return CanonicalError(category, code, message, retryable)
 
 
+def _is_instruction_item(item: object) -> bool:
+    return isinstance(item, MessageItem) and item.role in {MessageRole.SYSTEM, MessageRole.DEVELOPER}
+
+
+def _mid_system_counts(items: tuple[object, ...], leading_end: int) -> tuple[int, int]:
+    message_count = 0
+    section_count = 0
+    in_section = False
+    for item in items[leading_end:]:
+        is_system = isinstance(item, MessageItem) and item.role is MessageRole.SYSTEM
+        if is_system:
+            message_count += 1
+            if not in_section:
+                section_count += 1
+        in_section = is_system
+    return message_count, section_count
+
+
+def _render_mid_system_reminder(section: tuple[MessageItem, ...]) -> str:
+    return "\n\n".join(
+        f"<system-reminder>\n{item.text}\n</system-reminder>" for item in section
+    )
+
+
+def _invalid_mid_system_attachment(source: CanonicalRequest) -> ServingRejected:
+    logger.warning(
+        "mid-system in-place lowering found invalid predecessor request_id=%s",
+        source.request_id,
+    )
+    return ServingRejected(
+        _safe_error(
+            ErrorCategory.INVALID_REQUEST,
+            "mid_conversation_system_invalid_placement",
+            "A mid-conversation system section could not be attached to the preceding user turn.",
+        )
+    )
+
+
+def _lower_mid_system_in_place(source: CanonicalRequest, leading_end: int) -> CanonicalRequest:
+    items = source.items
+    lowered = list(items[:leading_end])
+    position = leading_end
+
+    while position < len(items):
+        item = items[position]
+        if not (isinstance(item, MessageItem) and item.role is MessageRole.SYSTEM):
+            lowered.append(item)
+            position += 1
+            continue
+
+        section: list[MessageItem] = []
+        while position < len(items):
+            candidate = items[position]
+            if not (isinstance(candidate, MessageItem) and candidate.role is MessageRole.SYSTEM):
+                break
+            section.append(candidate)
+            position += 1
+
+        if not lowered:
+            raise _invalid_mid_system_attachment(source)
+        reminder = _render_mid_system_reminder(tuple(section))
+        predecessor = lowered[-1]
+        if isinstance(predecessor, MessageItem) and predecessor.role is MessageRole.USER:
+            lowered[-1] = MessageItem(MessageRole.USER, predecessor.text + "\n\n" + reminder)
+            continue
+        if isinstance(predecessor, MultimodalMessageItem) and predecessor.role is MessageRole.USER:
+            lowered[-1] = MultimodalMessageItem(
+                MessageRole.USER,
+                predecessor.parts + (TextContentPart("\n\n" + reminder),),
+            )
+            continue
+        if isinstance(predecessor, ToolResultItem | MultimodalToolResultItem):
+            lowered.append(MessageItem(MessageRole.USER, reminder))
+            continue
+        raise _invalid_mid_system_attachment(source)
+
+    return CanonicalRequest(source.request_id, source.model, tuple(lowered))
+
+
+def _normalize_mid_system_input(
+    request: ServingRequest,
+    capability: MidSystemCapability,
+    best_effort_lowering: BestEffortMidSystemLowering,
+) -> CanonicalRequest:
+    source = request.input
+    items = source.items
+    leading_end = 0
+    while leading_end < len(items) and _is_instruction_item(items[leading_end]):
+        leading_end += 1
+
+    message_count, section_count = _mid_system_counts(items, leading_end)
+    if message_count == 0 or request.mid_system_policy is MidSystemPolicy.LEGACY_UNSPECIFIED:
+        return source
+    if capability is MidSystemCapability.INLINE:
+        return source
+    if request.mid_system_policy is MidSystemPolicy.STRICT:
+        logger.info(
+            "mid-system normalization rejected request_id=%s policy=%s capability=%s sections=%d messages=%d",
+            source.request_id,
+            request.mid_system_policy.value,
+            capability.value,
+            section_count,
+            message_count,
+        )
+        raise ServingRejected(
+            _safe_error(
+                ErrorCategory.UNSUPPORTED_CAPABILITY,
+                "mid_conversation_system_unsupported",
+                "The active model dialect cannot preserve mid-conversation system authority; use an explicit compatibility profile for best-effort lowering.",
+            )
+        )
+
+    if best_effort_lowering is BestEffortMidSystemLowering.IN_PLACE_USER_META:
+        effective = _lower_mid_system_in_place(source, leading_end)
+    else:
+        late_system = tuple(
+            item
+            for item in items[leading_end:]
+            if isinstance(item, MessageItem) and item.role is MessageRole.SYSTEM
+        )
+        retained_tail = tuple(
+            item
+            for item in items[leading_end:]
+            if not (isinstance(item, MessageItem) and item.role is MessageRole.SYSTEM)
+        )
+        effective = CanonicalRequest(
+            source.request_id,
+            source.model,
+            items[:leading_end] + late_system + retained_tail,
+        )
+
+    logger.info(
+        "mid-system normalization applied request_id=%s policy=%s capability=%s best_effort_lowering=%s sections=%d messages=%d",
+        source.request_id,
+        request.mid_system_policy.value,
+        capability.value,
+        best_effort_lowering.value,
+        section_count,
+        message_count,
+    )
+    return effective
+
+
 class ServingEngine:
     def __init__(
         self,
@@ -282,6 +483,10 @@ class ServingEngine:
         reasoning_control_tokenizer: ReasoningControlTokenizer | None = None,
         reasoning_budget_default: ReasoningBudgetDefault | None = None,
         preprocessing_pool: RendererLanePool | None = None,
+        mid_system_capability: MidSystemCapability = MidSystemCapability.LEADING_ONLY,
+        best_effort_mid_system_lowering: BestEffortMidSystemLowering = (
+            BestEffortMidSystemLowering.MERGED_LEADING
+        ),
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
@@ -299,7 +504,7 @@ class ServingEngine:
         self._preprocessing_pool = preprocessing_pool
         self._parser_factory = parser_factory
         self._controller = controller
-        self._tool_constraint_factory = tool_constraint_factory
+        self._guarantee_resolver = RequestGuaranteeResolver(tool_constraint_factory)
         self._tool_call_fanout_limit = tool_call_fanout_limit
         if reasoning_budget_default is not None and not isinstance(
             reasoning_budget_default, ReasoningBudgetDefault
@@ -310,6 +515,14 @@ class ServingEngine:
         self._reasoning_control_factory = reasoning_control_factory
         self._reasoning_control_tokenizer = reasoning_control_tokenizer
         self._reasoning_budget_default = reasoning_budget_default or ReasoningBudgetDefault()
+        if not isinstance(mid_system_capability, MidSystemCapability):
+            raise TypeError("mid_system_capability must be a MidSystemCapability")
+        if not isinstance(best_effort_mid_system_lowering, BestEffortMidSystemLowering):
+            raise TypeError(
+                "best_effort_mid_system_lowering must be a BestEffortMidSystemLowering"
+            )
+        self._mid_system_capability = mid_system_capability
+        self._best_effort_mid_system_lowering = best_effort_mid_system_lowering
         self._compile_lock = asyncio.Lock()
 
     def _reasoning_budget_rejected(
@@ -443,7 +656,12 @@ class ServingEngine:
         if not isinstance(request, ServingRequest):
             raise TypeError("request must be a ServingRequest")
 
-        history_result = validate_tool_history(request.input.items)
+        effective_input = _normalize_mid_system_input(
+            request,
+            self._mid_system_capability,
+            self._best_effort_mid_system_lowering,
+        )
+        history_result = validate_tool_history(effective_input.items)
         if not history_result.is_valid:
             raise ServingRejected(
                 _safe_error(
@@ -454,7 +672,7 @@ class ServingEngine:
             )
 
         try:
-            return compiler.compile(request.input, request.reasoning, request.tools)
+            return compiler.compile(effective_input, request.reasoning, request.tools)
         except (TypeError, ValueError) as exc:
             logger.warning(
                 "Prompt compilation rejected for request %s: %s: %s",
@@ -507,55 +725,68 @@ class ServingEngine:
                 raise
 
     async def count_input_tokens(self, request: ServingRequest) -> int:
-        return len((await self._compile_request_async(request, kind="count_tokens")).input_ids)
+        try:
+            lease = await self._controller.acquire(request.input.request_id)
+        except RequestRejected as exc:
+            raise ServingRejected(exc.error) from exc
+        try:
+            compiled = await self._compile_request_async(request, kind="count_tokens")
+            return len(compiled.input_ids)
+        finally:
+            await lease.release()
 
     async def submit(self, request: ServingRequest) -> ServingSession:
-        if (
-            self._tool_constraint_factory is None
-            and has_exposed_strict_tool(request.tools)
-        ):
+        try:
+            self._guarantee_resolver.ensure_tool_request_supported(request.tools)
+        except ToolConstraintUnsupported as exc:
             raise ServingRejected(
                 _safe_error(
                     ErrorCategory.INVALID_REQUEST,
                     "tool_constraint_unsupported",
-                    "Strict function tools are not supported by the selected model dialect.",
+                    str(exc),
                 )
-            )
-        compiled = await self._compile_request_async(request)
-        max_output_tokens = request.max_output_tokens
-        if max_output_tokens is None:
-            if self._output_limit_resolver is None:
+            ) from exc
+
+        try:
+            lease = await self._controller.acquire(request.input.request_id)
+        except RequestRejected as exc:
+            raise ServingRejected(exc.error) from exc
+
+        controlled: ControlledSessionLike | None = None
+        try:
+            compiled = await self._compile_request_async(request)
+            max_output_tokens = request.max_output_tokens
+            if max_output_tokens is None:
+                if self._output_limit_resolver is None:
+                    raise ServingRejected(
+                        _safe_error(
+                            ErrorCategory.INTERNAL,
+                            "serving_internal_error",
+                            "Automatic output token resolution is unavailable.",
+                        )
+                    )
+                try:
+                    max_output_tokens = self._output_limit_resolver(
+                        len(compiled.input_ids), max_output_tokens
+                    )
+                except RequestRejected as exc:
+                    raise ServingRejected(exc.error) from exc
+
+            try:
+                parser = self._parser_factory(
+                    request.input.request_id, request.reasoning, request.tools
+                )
+            except Exception as exc:
                 raise ServingRejected(
                     _safe_error(
                         ErrorCategory.INTERNAL,
                         "serving_internal_error",
-                        "Automatic output token resolution is unavailable.",
+                        "Serving parser initialization failed internally.",
                     )
-                )
-            try:
-                max_output_tokens = self._output_limit_resolver(
-                    len(compiled.input_ids), max_output_tokens
-                )
-            except RequestRejected as exc:
-                raise ServingRejected(exc.error) from exc
+                ) from exc
 
-        try:
-            parser = self._parser_factory(
-                request.input.request_id, request.reasoning, request.tools
-            )
-        except Exception as exc:
-            raise ServingRejected(
-                _safe_error(
-                    ErrorCategory.INTERNAL,
-                    "serving_internal_error",
-                    "Serving parser initialization failed internally.",
-                )
-            ) from exc
-
-        tool_constraint = None
-        if self._tool_constraint_factory is not None:
             try:
-                tool_constraint = self._tool_constraint_factory(request.tools)
+                tool_plan = self._guarantee_resolver.resolve_tool_policy(request.tools)
             except ToolConstraintUnsupported as exc:
                 logger.warning(
                     "Tool constraint compilation rejected for request %s: %s",
@@ -585,87 +816,130 @@ class ServingEngine:
                         "Tool constraint initialization failed internally.",
                     )
                 ) from exc
+            tool_constraint = tool_plan.constraint
 
-        schema_hint = None
-        schema_trigger = None
-        if request.structured_output is not None:
-            if compiled.raw_output_is_text_only:
-                schema_hint = request.structured_output.schema.canonical_json
-            elif compiled.structured_output_trigger is not None:
-                schema_hint = request.structured_output.schema.canonical_json
-                schema_trigger = compiled.structured_output_trigger
-
-        if tool_constraint is not None and schema_hint is not None:
-            raise ServingRejected(
-                _safe_error(
-                    ErrorCategory.INVALID_REQUEST,
-                    "tool_constraint_conflict",
-                    "Constrained tool generation cannot be combined with structured output in one request.",
+            structured_plan = self._guarantee_resolver.resolve_structured_output(
+                request.structured_output,
+                raw_output_is_text_only=compiled.raw_output_is_text_only,
+                structured_output_trigger=compiled.structured_output_trigger,
+            )
+            if structured_plan is not None and not structured_plan.is_supported:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INVALID_REQUEST,
+                        "structured_output_constraint_unsupported",
+                        "Requested structured-output generation guarantee is not supported by the selected model/runtime constraint path.",
+                    )
                 )
+            schema_hint = None if structured_plan is None else structured_plan.schema_json
+            schema_trigger = None if structured_plan is None else structured_plan.trigger
+
+            if tool_constraint is not None and schema_hint is not None:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INVALID_REQUEST,
+                        "tool_constraint_conflict",
+                        "Constrained tool generation cannot be combined with structured output in one request.",
+                    )
+                )
+
+            if tool_constraint is not None:
+                runtime_guarantee = tool_plan.runtime_guarantee
+                runtime_fallback = tool_plan.fallback_policy
+            elif structured_plan is not None and schema_hint is not None:
+                runtime_guarantee = structured_plan.planned_guarantee
+                runtime_fallback = structured_plan.fallback_policy
+            else:
+                runtime_guarantee = GenerationGuarantee.NONE
+                runtime_fallback = ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+
+            reasoning_budget = self._resolve_reasoning_budget(
+                request,
+                active_generation_constraint=schema_hint is not None or tool_constraint is not None,
             )
 
-        reasoning_budget = self._resolve_reasoning_budget(
-            request,
-            active_generation_constraint=schema_hint is not None or tool_constraint is not None,
-        )
+            runtime_request = RuntimeGenerationRequest(
+                request_id=request.input.request_id,
+                input_ids=compiled.input_ids,
+                max_new_tokens=max_output_tokens,
+                seed=request.seed,
+                stop_conditions=(*compiled.stop_conditions, *request.stop_conditions),
+                sampling=request.sampling,
+                prompt_attachments=compiled.runtime_attachments,
+                output_json_schema=schema_hint,
+                output_json_trigger=schema_trigger,
+                generation_constraint=(
+                    None
+                    if tool_constraint is None
+                    else RuntimeGenerationConstraint(
+                        tool_constraint.trigger,
+                        tool_constraint.lark_grammar,
+                        tool_constraint.eos_after_completed,
+                    )
+                ),
+                generation_guarantee=runtime_guarantee,
+                constraint_fallback_policy=runtime_fallback,
+                use_native_eos=compiled.use_native_eos,
+            )
+            try:
+                controlled = await lease.submit(runtime_request)
+            except RuntimeConstraintUnsupported as exc:
+                if schema_hint is not None:
+                    raise ServingRejected(
+                        _safe_error(
+                            ErrorCategory.INVALID_REQUEST,
+                            "structured_output_constraint_unsupported",
+                            "Requested structured-output generation guarantee is not supported by the selected model/runtime constraint path.",
+                        )
+                    ) from exc
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INVALID_REQUEST,
+                        "tool_constraint_unsupported",
+                        "Tool schema or policy cannot be represented by the active constrained-generation runtime.",
+                    )
+                ) from exc
+            except RequestRejected as exc:
+                raise ServingRejected(exc.error) from exc
+            except Exception as exc:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.RUNTIME_FAILURE,
+                        "runtime_submission_failed",
+                        "Inference runtime submission failed.",
+                    )
+                ) from exc
 
-        runtime_request = RuntimeGenerationRequest(
-            request_id=request.input.request_id,
-            input_ids=compiled.input_ids,
-            max_new_tokens=max_output_tokens,
-            seed=request.seed,
-            stop_conditions=(*compiled.stop_conditions, *request.stop_conditions),
-            sampling=request.sampling,
-            prompt_attachments=compiled.runtime_attachments,
-            output_json_schema=schema_hint,
-            output_json_trigger=schema_trigger,
-            generation_constraint=(
-                None
-                if tool_constraint is None
-                else RuntimeGenerationConstraint(
-                    tool_constraint.trigger,
-                    tool_constraint.lark_grammar,
-                    tool_constraint.eos_after_completed,
+            try:
+                session = ServingSession(
+                    request.input.request_id,
+                    controlled,
+                    parser,
+                    compiled,
+                    request.tools,
+                    request.structured_output,
+                    request.stop_conditions,
+                    self._tool_call_fanout_limit,
+                    request.tools.allow_parallel and tool_constraint is not None,
+                    self._constrained_parallel_tool_call_limit,
+                    reasoning_budget,
+                    tool_constraint=tool_constraint,
                 )
-            ),
-            use_native_eos=compiled.use_native_eos,
-        )
-        try:
-            controlled = await self._controller.submit(runtime_request)
-        except RuntimeConstraintUnsupported as exc:
-            raise ServingRejected(
-                _safe_error(
-                    ErrorCategory.INVALID_REQUEST,
-                    "tool_constraint_unsupported",
-                    "Tool schema or policy cannot be represented by the active constrained-generation runtime.",
-                )
-            ) from exc
-        except RequestRejected as exc:
-            raise ServingRejected(exc.error) from exc
-        except Exception as exc:
-            raise ServingRejected(
-                _safe_error(
-                    ErrorCategory.RUNTIME_FAILURE,
-                    "runtime_submission_failed",
-                    "Inference runtime submission failed.",
-                )
-            ) from exc
-
-        session = ServingSession(
-            request.input.request_id,
-            controlled,
-            parser,
-            compiled,
-            request.tools,
-            request.structured_output,
-            request.stop_conditions,
-            self._tool_call_fanout_limit,
-            request.tools.allow_parallel and tool_constraint is not None,
-            self._constrained_parallel_tool_call_limit,
-            reasoning_budget,
-        )
-        await session._initialize_reasoning_budget()
-        return session
+                await session._initialize_reasoning_budget()
+            except asyncio.CancelledError:
+                try:
+                    await controlled.cancel(RequestTerminalReason.CLIENT_CANCELLED)
+                finally:
+                    raise
+            except Exception:  # noqa: BLE001 - runtime ownership must roll back on any wrapper failure
+                try:
+                    await controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+                finally:
+                    raise
+            return session
+        finally:
+            if controlled is None:
+                await lease.release()
 
 
 class ServingSession:
@@ -684,6 +958,7 @@ class ServingSession:
         atomic_parallel_tools: bool = False,
         constrained_parallel_tool_call_limit: int = 8,
         reasoning_budget: _EffectiveReasoningBudget | None = None,
+        tool_constraint: ToolGenerationConstraint | None = None,
     ) -> None:
         self._request_id = request_id
         self._controlled = controlled
@@ -692,6 +967,7 @@ class ServingSession:
         self._compiled_prompt = compiled_prompt
         self._tool_policy = tool_policy
         self._structured_output = structured_output
+        self._tool_constraint = tool_constraint
         self._requested_stop_sequences = frozenset(
             condition for condition in requested_stop_conditions if isinstance(condition, str)
         )
@@ -702,6 +978,8 @@ class ServingSession:
             constrained_parallel_tool_call_limit=constrained_parallel_tool_call_limit,
         )
         self._pending: deque[GenerationEvent] = deque()
+        self._commit_class = SemanticCommitClass.NO_SEMANTIC_COMMIT
+        self._terminal_evidence = TerminalEvidence()
         self._terminal = False
         self._parser_finished = False
         self._text_parts: list[str] = []
@@ -722,21 +1000,102 @@ class ServingSession:
     def input_token_count(self) -> int:
         return len(self._compiled_prompt.input_ids)
 
+    @property
+    def commit_class(self) -> SemanticCommitClass:
+        return self._commit_class
+
+    @property
+    def terminal_decision(self) -> TerminalDecision | None:
+        return self._terminal_evidence.decision
+
+    def _observe_semantic_commit(self, event: GenerationEvent) -> None:
+        if isinstance(event, ToolCallCompleted):
+            self._commit_class = SemanticCommitClass.TOOL_COMPLETED
+            return
+        if self._commit_class is SemanticCommitClass.TOOL_COMPLETED:
+            return
+        if isinstance(event, ToolCallStarted | ToolCallArgumentsDelta):
+            self._commit_class = SemanticCommitClass.PARTIAL_TOOL_COMMITTED
+            return
+        if self._commit_class is SemanticCommitClass.PARTIAL_TOOL_COMMITTED:
+            return
+        if isinstance(event, TextDelta | ReasoningDelta):
+            self._commit_class = SemanticCommitClass.CONTENT_COMMITTED
+            return
+
+    def _queue_event(self, event: GenerationEvent) -> None:
+        self._observe_semantic_commit(event)
+        self._pending.append(event)
+
+    def _queue_events(self, events: tuple[GenerationEvent, ...]) -> None:
+        for event in events:
+            self._queue_event(event)
+
+    def _committed_error(self, error: CanonicalError) -> CanonicalError:
+        return commit_aware_error(error, self._commit_class)
+
+    def _record_controlled_terminal_reason(self) -> None:
+        self._terminal_evidence.record_controlled_reason(self._controlled.terminal_reason)
+
+    def _emit_recorded_failure_or_cancellation(self) -> TerminalDecision:
+        decision = self._terminal_evidence.resolve(error_transform=self._committed_error)
+        self._abort_tool_batch()
+        if decision.disposition is TerminalDisposition.FAILURE:
+            error = decision.canonical_error
+            if error is None:  # pragma: no cover - TerminalDecision validates this invariant.
+                raise RuntimeError("failure terminal decision is missing canonical error")
+            self._pending.append(GenerationFailed(self._request_id, error))
+        elif decision.disposition is TerminalDisposition.CANCELLATION:
+            self._pending.append(GenerationCancelled(self._request_id))
+        else:
+            raise RuntimeError("failure/cancellation emitter received a successful decision")
+        self._terminal_evidence.commit_decision(decision)
+        self._terminal = True
+        return decision
+
+    def _tool_constraint_guarantee(self, tool_name: str) -> ToolConstraintGuarantee:
+        if self._tool_constraint is None:
+            return ToolConstraintGuarantee.NONE
+        return self._tool_constraint.guarantee_for_tool(tool_name)
+
+    def _tool_requires_schema_guarantee(self, tool_name: str) -> bool:
+        for tool in self._tool_policy.tools:
+            if tool.name == tool_name:
+                return tool.strict
+        return False
+
+    def _fail_tool_constraint_unavailable(self) -> None:
+        if self._terminal:
+            return
+        error = self._committed_error(
+            CanonicalError(
+                ErrorCategory.INVALID_REQUEST,
+                "tool_constraint_unsupported",
+                "Requested strict Tool generation guarantee was not established by the selected model/runtime constraint path.",
+                False,
+            )
+        )
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_semantic_failure(error)
+        self._terminal_evidence.record_constraint_failure(error)
+        self._emit_recorded_failure_or_cancellation()
+
     async def _reasoning_budget_failure(self, code: str, message: str) -> None:
         if self._terminal:
             return
-        error = _safe_error(ErrorCategory.RUNTIME_FAILURE, code, message)
-        self._discard_atomic_tool_batch()
-        self._terminal = True
+        error = self._committed_error(_safe_error(ErrorCategory.RUNTIME_FAILURE, code, message))
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_unknown_failure(error)
+        decision = self._emit_recorded_failure_or_cancellation()
         self._reasoning_budget_state = _ReasoningBudgetState.DONE
-        try:
-            await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
-        except Exception:
-            logger.exception(
-                "runtime cancellation failed after reasoning-budget failure request_id=%s",
-                self._request_id,
-            )
-        self._pending.append(GenerationFailed(self._request_id, error))
+        if decision.primary_owner is TerminalPrimaryOwner.UNKNOWN_INTERNAL:
+            try:
+                await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            except Exception:
+                logger.exception(
+                    "runtime cancellation failed after reasoning-budget failure request_id=%s",
+                    self._request_id,
+                )
 
     def _disable_reasoning_budget(self, reason: str) -> None:
         budget = self._reasoning_budget
@@ -1017,110 +1376,265 @@ class ServingSession:
             await self.cancel()
         return False
 
-    def _discard_atomic_tool_batch(self) -> None:
+    def _abort_tool_batch(self) -> None:
         self._tool_batch.abort()
 
-    def _flush_atomic_tool_batch(self) -> None:
-        self._pending.extend(self._tool_batch.commit_events())
+    def _commit_tool_batch(self) -> None:
+        self._queue_events(self._tool_batch.commit_events())
 
     async def cancel(self) -> None:
         if self._terminal:
             return
-        self._discard_atomic_tool_batch()
+        self._abort_tool_batch()
         await self._controlled.cancel(RequestTerminalReason.CLIENT_CANCELLED)
 
-    async def _model_failure(self, code: str, message: str) -> None:
+    def _fail_structured_constraint_unavailable(self, message: str) -> None:
         if self._terminal:
             return
-        error = _safe_error(ErrorCategory.MODEL_FAILURE, code, message)
-        self._discard_atomic_tool_batch()
-        self._terminal = True
-        try:
-            await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
-        except Exception:
-            logger.exception(
-                "runtime cancellation failed after local model failure request_id=%s",
-                self._request_id,
+        error = self._committed_error(
+            CanonicalError(
+                ErrorCategory.INVALID_REQUEST,
+                "structured_output_constraint_unsupported",
+                message,
+                False,
             )
-        self._pending.append(GenerationFailed(self._request_id, error))
+        )
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_semantic_failure(error)
+        self._terminal_evidence.record_constraint_failure(error)
+        self._emit_recorded_failure_or_cancellation()
+
+    async def _model_failure(
+        self,
+        code: str,
+        message: str,
+        *,
+        cause: FailureCause | None = None,
+    ) -> None:
+        if self._terminal:
+            return
+        error = self._committed_error(
+            CanonicalError(
+                ErrorCategory.MODEL_FAILURE,
+                code,
+                message,
+                False,
+                cause,
+            )
+        )
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_semantic_failure(error)
+        if cause is FailureCause.CONSTRAINT_FAILURE:
+            self._terminal_evidence.record_constraint_failure(error)
+        decision = self._emit_recorded_failure_or_cancellation()
+        if decision.primary_owner in {
+            TerminalPrimaryOwner.CONSTRAINT_INTEGRITY,
+            TerminalPrimaryOwner.SEMANTIC_CONTRACT,
+        }:
+            try:
+                await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            except Exception:
+                logger.exception(
+                    "runtime cancellation failed after local model failure request_id=%s",
+                    self._request_id,
+                )
 
     async def _process_semantic(self, event: GenerationEvent) -> None:
         if self._terminal:
             return
         if isinstance(event, TextDelta):
             self._text_parts.append(event.text)
-            self._pending.append(event)
+            self._queue_event(event)
             return
         if isinstance(event, ToolCallStarted):
             decision = self._tool_batch.on_started(event)
             if decision.failure is not None:
                 await self._model_failure(decision.failure.code, decision.failure.message)
                 return
-            self._pending.extend(decision.events)
+            self._queue_events(decision.events)
             return
         if isinstance(event, ToolCallArgumentsDelta):
             decision = self._tool_batch.on_arguments_delta(event)
             if decision.failure is not None:
                 await self._model_failure(decision.failure.code, decision.failure.message)
                 return
-            self._pending.extend(decision.events)
+            self._queue_events(decision.events)
             return
         if isinstance(event, ToolCallCompleted):
             decision = self._tool_batch.on_completed(event)
             if decision.failure is not None:
-                await self._model_failure(decision.failure.code, decision.failure.message)
+                guarantee = self._tool_constraint_guarantee(event.call.name)
+                cause = (
+                    FailureCause.CONSTRAINT_FAILURE
+                    if violates_tool_constraint_guarantee(decision.failure, guarantee)
+                    else FailureCause.MODEL_TOOL_OUTPUT_INVALID
+                    if is_model_tool_output_invalid(decision.failure, guarantee)
+                    else None
+                )
+                await self._model_failure(
+                    decision.failure.code,
+                    decision.failure.message,
+                    cause=cause,
+                )
                 return
-            self._pending.extend(decision.events)
+            self._queue_events(decision.events)
             return
-        self._pending.append(event)
+        self._queue_event(event)
+
+    async def _parser_integrity_failure(
+        self,
+        *,
+        category: ErrorCategory,
+        code: str,
+        message: str,
+        issue: str,
+    ) -> None:
+        if self._terminal:
+            return
+        error = self._committed_error(_safe_error(category, code, message, retryable=False))
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_parser_issue(issue)
+        self._terminal_evidence.record_parser_integrity_failure(error)
+        decision = self._emit_recorded_failure_or_cancellation()
+        if decision.primary_owner is TerminalPrimaryOwner.PARSER_INTEGRITY:
+            try:
+                await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            except Exception:
+                logger.exception(
+                    "runtime cancellation failed after parser integrity failure request_id=%s",
+                    self._request_id,
+                )
 
     async def _fail_native_token_provenance(self) -> None:
-        error = _safe_error(
-            ErrorCategory.RUNTIME_FAILURE,
-            "output_token_provenance_unavailable",
-            "Inference output provenance was insufficient to classify a Qwen structural marker safely.",
-            retryable=True,
+        await self._parser_integrity_failure(
+            category=ErrorCategory.RUNTIME_FAILURE,
+            code="output_token_provenance_unavailable",
+            message="Inference output provenance was insufficient to classify a structural marker safely.",
+            issue="native_token_provenance",
         )
-        self._discard_atomic_tool_batch()
-        self._terminal = True
-        try:
-            await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
-        except Exception:
-            logger.exception(
-                "runtime cancellation failed after local provenance failure request_id=%s",
-                self._request_id,
-            )
-        self._pending.append(GenerationFailed(self._request_id, error))
 
-    async def _finish_parser_events(self) -> bool:
+    async def _finish_parser_events(self) -> ParserTerminalIssue | None:
         if self._parser_finished:
-            return False
+            return None
         self._parser_finished = True
         try:
             finish = self._parser.finish()
         except NativeTokenProvenanceError:
             await self._fail_native_token_provenance()
-            return False
+            return None
+        except Exception:
+            logger.exception("parser finish failed request_id=%s", self._request_id)
+            await self._parser_integrity_failure(
+                category=ErrorCategory.INTERNAL,
+                code="parser_finish_failed",
+                message="Incremental parser failed while finalizing model output.",
+                issue="parser_finish_exception",
+            )
+            return None
+        terminal_issue = finish.terminal_issue
+        if terminal_issue is not None:
+            detail = (
+                terminal_issue.kind.value
+                if terminal_issue.ambiguity_detail is None
+                else f"{terminal_issue.kind.value}:{terminal_issue.ambiguity_detail.value}"
+            )
+            self._terminal_evidence.record_parser_issue(detail)
         for event in finish.events:
             await self._process_semantic(event)
             if self._terminal:
-                return finish.incomplete_tool_call
-        return finish.incomplete_tool_call
+                return terminal_issue
+        return terminal_issue
 
-    async def _handle_runtime_finished(self, event: RuntimeFinished) -> None:
-        incomplete_tool = await self._finish_parser_events()
-        if self._terminal:
-            return
-        if incomplete_tool:
-            logger.warning(
-                "model output ended with an incomplete tool call request_id=%s",
-                self._request_id,
+    def _early_parser_terminal_issue(self) -> ParserTerminalIssue | None:
+        if not isinstance(self._parser, NativeTokenAwareIncrementalParser):
+            return None
+        issue = self._parser.early_terminal_issue
+        if issue is not None and not isinstance(issue, ParserTerminalIssue):
+            raise TypeError("early_terminal_issue must be a ParserTerminalIssue or None")
+        return issue
+
+    async def _handle_parser_terminal_issue(
+        self,
+        issue: ParserTerminalIssue,
+        *,
+        runtime_event: RuntimeFinished | None = None,
+    ) -> None:
+        detail_text = (
+            issue.kind.value
+            if issue.ambiguity_detail is None
+            else f"{issue.kind.value}:{issue.ambiguity_detail.value}"
+        )
+        self._terminal_evidence.record_parser_issue(detail_text)
+        if issue.kind is ParserTerminalIssueKind.INCOMPLETE_TOOL:
+            if runtime_event is None:
+                raise RuntimeError("incomplete Tool terminal issue requires a runtime terminal event")
+            constraint_integrity_active = (
+                runtime_event.hard_constraint_installed
+                and runtime_event.hard_constraint_activated
+                and runtime_event.effective_generation_guarantee
+                in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
+            )
+            cause = (
+                FailureCause.OUTPUT_LENGTH
+                if runtime_event.reason is RuntimeStopReason.LENGTH
+                else FailureCause.CONSTRAINT_FAILURE
+                if runtime_event.reason in {RuntimeStopReason.EOS, RuntimeStopReason.FILTER}
+                and constraint_integrity_active
+                else FailureCause.OUTPUT_EOS
+                if runtime_event.reason is RuntimeStopReason.EOS
+                else None
             )
             message = "Model output ended with an incomplete tool call."
-            if event.reason is RuntimeStopReason.LENGTH:
+            if runtime_event.reason is RuntimeStopReason.LENGTH:
                 message = "Model output reached the output token limit with an incomplete tool call."
-            await self._model_failure("tool_call_incomplete", message)
+            await self._model_failure("tool_call_incomplete", message, cause=cause)
             return
+
+        if issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY:
+            raise RuntimeError(f"unsupported parser terminal issue: {issue.kind.value}")
+        detail = issue.ambiguity_detail
+        if detail is ParserAmbiguityDetail.HOLD_LIMIT:
+            cause = FailureCause.PARSER_AMBIGUITY_LIMIT
+            message = "Model output exceeded the bounded protocol-ambiguity hold limit."
+        else:
+            constraint_integrity_active = (
+                runtime_event is not None
+                and runtime_event.hard_constraint_installed
+                and runtime_event.hard_constraint_activated
+                and runtime_event.effective_generation_guarantee
+                in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
+            )
+            reason = None if runtime_event is None else runtime_event.reason
+            cause = (
+                FailureCause.OUTPUT_LENGTH
+                if reason is RuntimeStopReason.LENGTH
+                else FailureCause.CONSTRAINT_FAILURE
+                if reason in {RuntimeStopReason.EOS, RuntimeStopReason.FILTER}
+                and constraint_integrity_active
+                else FailureCause.OUTPUT_EOS
+                if reason is RuntimeStopReason.EOS
+                else None
+            )
+            message = "Model output ended with unresolved protocol ambiguity."
+        await self._model_failure("protocol_ambiguity", message, cause=cause)
+
+    async def _handle_runtime_finished(self, event: RuntimeFinished) -> None:
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_runtime_finished(event)
+
+        terminal_issue = await self._finish_parser_events()
+        if self._terminal:
+            return
+        if terminal_issue is not None:
+            await self._handle_parser_terminal_issue(terminal_issue, runtime_event=event)
+            return
+        if self._terminal_evidence.causal_owner is TerminalPrimaryOwner.LIFECYCLE_TERMINATION:
+            self._emit_recorded_failure_or_cancellation()
+            return
+
+        hard_constraint_active = (
+            event.hard_constraint_installed and event.hard_constraint_activated
+        )
 
         completed_calls = self._tool_batch.completed_calls
         final_tool_validation = validate_tool_calls(completed_calls, self._tool_policy)
@@ -1134,70 +1648,113 @@ class ServingSession:
             await self._model_failure(code, message)
             return
 
-        if not incomplete_tool and not completed_calls and self._structured_output is not None:
+        if completed_calls:
+            for call in completed_calls:
+                if not self._tool_requires_schema_guarantee(call.name):
+                    continue
+                branch_guarantee = self._tool_constraint_guarantee(call.name)
+                if (
+                    not hard_constraint_active
+                    or not guarantee_satisfies(
+                        branch_guarantee,
+                        GenerationGuarantee.SCHEMA,
+                    )
+                ):
+                    self._fail_tool_constraint_unavailable()
+                    return
+
+        if not completed_calls and self._structured_output is not None:
+            requested_guarantee = self._structured_output.requested_guarantee
+            if (
+                requested_guarantee is not GenerationGuarantee.NONE
+                and not guarantee_satisfies(
+                    event.effective_generation_guarantee,
+                    requested_guarantee,
+                )
+            ):
+                self._fail_structured_constraint_unavailable(
+                    "Requested structured-output generation guarantee was not activated by the selected model/runtime constraint path."
+                )
+                return
             structured = validate_structured_output("".join(self._text_parts), self._structured_output)
             if not structured.is_valid:
+                constraint_contradiction = (
+                    hard_constraint_active
+                    and violates_structured_constraint_guarantee(
+                        structured,
+                        event.effective_generation_guarantee,
+                    )
+                )
                 await self._model_failure(
                     "structured_output_invalid",
                     "Model output did not satisfy the requested structured-output schema.",
+                    cause=(
+                        FailureCause.CONSTRAINT_FAILURE
+                        if constraint_contradiction
+                        else None
+                    ),
                 )
                 return
 
-        reason = (
-            CompletionReason.TOOL_CALLS
-            if completed_calls
-            else completion_reason_from_runtime(event.reason)
-        )
+        success_reason = CompletionReason.TOOL_CALLS if completed_calls else None
+        decision = self._terminal_evidence.resolve(success_reason=success_reason)
+        if decision.disposition is not TerminalDisposition.SUCCESS:
+            self._emit_recorded_failure_or_cancellation()
+            return
+        reason = decision.completion_reason
+        if reason is None:  # pragma: no cover - TerminalDecision validates success.
+            raise RuntimeError("successful terminal decision is missing completion reason")
 
-        self._flush_atomic_tool_batch()
         timing_event = timing_event_from_runtime(self._request_id, event.timing)
-        if timing_event is not None:
-            self._pending.append(timing_event)
-        self._pending.append(UsageUpdated(self._request_id, event.usage))
+        usage_event = UsageUpdated(self._request_id, event.usage)
         exposed_stop_sequence = (
             event.stop_sequence
             if reason is CompletionReason.STOP
             and event.stop_sequence in self._requested_stop_sequences
             else None
         )
-        self._pending.append(
-            GenerationCompleted(
-                self._request_id,
-                reason,
-                event.usage,
-                exposed_stop_sequence,
-            )
+        completed_event = GenerationCompleted(
+            self._request_id,
+            reason,
+            event.usage,
+            exposed_stop_sequence,
         )
+
+        pending_checkpoint = len(self._pending)
+        commit_class_checkpoint = self._commit_class
+        try:
+            # These events remain local to this session until __anext__ returns.
+            # If authority commit fails, roll the local publication queue back before
+            # the normal UNKNOWN_INTERNAL fallback is allowed to terminate the request.
+            self._commit_tool_batch()
+            if timing_event is not None:
+                self._pending.append(timing_event)
+            self._pending.append(usage_event)
+            self._pending.append(completed_event)
+            self._terminal_evidence.commit_decision(decision)
+        except Exception:
+            while len(self._pending) > pending_checkpoint:
+                self._pending.pop()
+            self._commit_class = commit_class_checkpoint
+            raise
         self._terminal = True
 
     async def _handle_runtime_failure(self, event: RuntimeFailed) -> None:
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_runtime_failure(self._committed_error(event.error))
         await self._finish_parser_events()
         if self._terminal:
             return
-        self._discard_atomic_tool_batch()
-        self._pending.append(GenerationFailed(self._request_id, event.error))
-        self._terminal = True
+        self._emit_recorded_failure_or_cancellation()
 
     async def _handle_runtime_cancelled(self) -> None:
+        self._record_controlled_terminal_reason()
+        if self._terminal_evidence.causal_owner is not TerminalPrimaryOwner.LIFECYCLE_TERMINATION:
+            self._terminal_evidence.record_runtime_cancelled()
         await self._finish_parser_events()
         if self._terminal:
             return
-        self._discard_atomic_tool_batch()
-        if self._controlled.terminal_reason is RequestTerminalReason.TIMEOUT:
-            self._pending.append(
-                GenerationFailed(
-                    self._request_id,
-                    _safe_error(
-                        ErrorCategory.RUNTIME_FAILURE,
-                        "request_timeout",
-                        "Inference request exceeded its serving deadline.",
-                        retryable=True,
-                    ),
-                )
-            )
-        else:
-            self._pending.append(GenerationCancelled(self._request_id))
-        self._terminal = True
+        self._emit_recorded_failure_or_cancellation()
 
     async def _process_runtime(self, event: RuntimeEvent) -> None:
         if self._runtime_trace is not None:
@@ -1260,6 +1817,33 @@ class ServingSession:
             except NativeTokenProvenanceError:
                 await self._fail_native_token_provenance()
                 return
+            except Exception:
+                logger.exception("parser feed failed request_id=%s", self._request_id)
+                await self._parser_integrity_failure(
+                    category=ErrorCategory.INTERNAL,
+                    code="parser_feed_failed",
+                    message="Incremental parser failed while consuming model output.",
+                    issue="parser_feed_exception",
+                )
+                return
+            try:
+                early_terminal_issue = self._early_parser_terminal_issue()
+            except Exception:
+                logger.exception("parser terminal evidence failed request_id=%s", self._request_id)
+                await self._parser_integrity_failure(
+                    category=ErrorCategory.INTERNAL,
+                    code="parser_terminal_evidence_failed",
+                    message="Incremental parser exposed invalid terminal evidence.",
+                    issue="parser_terminal_evidence_exception",
+                )
+                return
+            if early_terminal_issue is not None:
+                for semantic in semantic_events:
+                    await self._process_semantic(semantic)
+                    if self._terminal:
+                        return
+                await self._handle_parser_terminal_issue(early_terminal_issue)
+                return
             await self._apply_reasoning_budget(event, semantic_events)
             if self._terminal:
                 return
@@ -1286,22 +1870,52 @@ class ServingSession:
             try:
                 runtime_event = await anext(self._runtime_iterator)
             except StopAsyncIteration:
+                self._record_controlled_terminal_reason()
+                error = self._committed_error(
+                    _safe_error(
+                        ErrorCategory.RUNTIME_FAILURE,
+                        "runtime_stream_ended",
+                        "Inference runtime stream ended without a terminal event.",
+                    )
+                )
+                self._terminal_evidence.record_runtime_failure(error)
                 await self._finish_parser_events()
                 if self._pending:
                     continue
                 if not self._terminal:
-                    self._discard_atomic_tool_batch()
-                    self._pending.append(
-                        GenerationFailed(
-                            self._request_id,
-                            _safe_error(
-                                ErrorCategory.RUNTIME_FAILURE,
-                                "runtime_stream_ended",
-                                "Inference runtime stream ended without a terminal event.",
-                            ),
-                        )
+                    self._emit_recorded_failure_or_cancellation()
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("runtime stream iteration failed request_id=%s", self._request_id)
+                self._record_controlled_terminal_reason()
+                error = self._committed_error(
+                    _safe_error(
+                        ErrorCategory.INTERNAL,
+                        "runtime_stream_exception",
+                        "Inference runtime stream failed without a typed terminal event.",
                     )
-                    self._terminal = True
+                )
+                self._terminal_evidence.record_unknown_failure(error)
+                self._emit_recorded_failure_or_cancellation()
                 continue
 
-            await self._process_runtime(runtime_event)
+            try:
+                await self._process_runtime(runtime_event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("serving terminal processing failed request_id=%s", self._request_id)
+                if not self._terminal:
+                    self._record_controlled_terminal_reason()
+                    self._terminal_evidence.record_unknown_failure(
+                        self._committed_error(
+                            _safe_error(
+                                ErrorCategory.INTERNAL,
+                                "terminal_processing_failed",
+                                "Inference terminal processing failed unexpectedly.",
+                            )
+                        )
+                    )
+                    self._emit_recorded_failure_or_cancellation()

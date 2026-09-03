@@ -4,7 +4,7 @@ import pytest
 
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.usage import TokenUsage
@@ -14,6 +14,7 @@ from exqserve.protocol.openai.common import (
     ParsedOpenAIRequest,
     chat_usage,
     map_canonical_error,
+    map_stream_canonical_error,
     parse_sampling,
     responses_usage,
 )
@@ -68,6 +69,194 @@ def test_canonical_error_mapping_preserves_safe_message_and_category_status() ->
     )
     assert failure.status_code == 500
     assert failure.type == "server_error"
+
+
+
+def test_exqserve_cause_is_optional_and_runtime_recovering_uses_503() -> None:
+    recovering = map_canonical_error(
+        CanonicalError(
+            ErrorCategory.OVERLOADED,
+            "runtime_recovering",
+            "Runtime is rebuilding.",
+            True,
+            FailureCause.RUNTIME_RECOVERING,
+        )
+    )
+    assert recovering.status_code == 503
+    assert recovering.code == "runtime_recovering"
+    assert recovering.to_body()["error"]["exqserve_cause"] == "runtime_recovering"
+
+    restart = map_canonical_error(
+        CanonicalError(
+            ErrorCategory.RUNTIME_FAILURE,
+            "restart_required",
+            "Restart required.",
+            False,
+            FailureCause.RESTART_REQUIRED,
+        )
+    )
+    assert restart.status_code == 500
+    assert restart.code == "restart_required"
+    assert restart.to_body()["error"]["exqserve_cause"] == "restart_required"
+
+    ordinary = map_canonical_error(
+        CanonicalError(ErrorCategory.RUNTIME_FAILURE, "runtime_failed", "Runtime failed.", False)
+    )
+    assert "exqserve_cause" not in ordinary.to_body()["error"]
+
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    [
+        (FailureCause.OUTPUT_EOS, "tool_call_incomplete"),
+        (FailureCause.OUTPUT_LENGTH, "tool_call_incomplete"),
+    ],
+)
+def test_openai_common_mapper_projects_incomplete_tool_facts(
+    cause: FailureCause,
+    expected_code: str,
+) -> None:
+    mapped = map_canonical_error(
+        CanonicalError(
+            ErrorCategory.MODEL_FAILURE,
+            "tool_call_incomplete",
+            "Model output ended with an incomplete tool call.",
+            False,
+            cause,
+        )
+    )
+    assert mapped.status_code == 500
+    assert mapped.type == "server_error"
+    assert mapped.code == expected_code
+    assert mapped.message == "Model output ended with an incomplete tool call."
+    assert mapped.exqserve_cause == cause.value
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected_code"),
+    [
+        (FailureCause.OUTPUT_EOS, "protocol_ambiguity"),
+        (FailureCause.OUTPUT_LENGTH, "protocol_ambiguity"),
+        (FailureCause.PARSER_AMBIGUITY_LIMIT, "protocol_ambiguity"),
+    ],
+)
+def test_openai_common_mapper_projects_protocol_ambiguity_facts(
+    cause: FailureCause,
+    expected_code: str,
+) -> None:
+    source = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "protocol_ambiguity",
+        "Model output ended at an ambiguous protocol boundary.",
+        False,
+        cause,
+    )
+    mapped = map_canonical_error(source)
+    assert mapped.status_code == 500
+    assert mapped.type == "server_error"
+    assert mapped.code == expected_code
+    assert mapped.exqserve_cause == cause.value
+
+    streamed = map_stream_canonical_error(source)
+    assert streamed.code == expected_code
+    assert streamed.message == source.message
+
+
+def test_openai_common_mapper_projects_model_tool_output_invalid_fact() -> None:
+    source = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "tool_call_invalid",
+        "Model produced an invalid tool call.",
+        False,
+        FailureCause.MODEL_TOOL_OUTPUT_INVALID,
+    )
+    mapped = map_canonical_error(source)
+    assert mapped.status_code == 500
+    assert mapped.code == "tool_call_invalid"
+    assert mapped.exqserve_cause == "model_tool_output_invalid"
+
+    streamed = map_stream_canonical_error(source)
+    assert streamed.code == "tool_call_invalid"
+    assert streamed.message == (
+        "Model produced an invalid tool call."
+    )
+
+
+def test_openai_stream_mapper_does_not_prefix_private_recovery_facts() -> None:
+    source = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "tool_call_incomplete",
+        "Model output ended with an incomplete tool call.",
+        False,
+        FailureCause.OUTPUT_EOS,
+    )
+    mapped = map_stream_canonical_error(source)
+    assert mapped.code == "tool_call_incomplete"
+    assert mapped.message == (
+        "Model output ended with an incomplete tool call."
+    )
+
+    ordinary = map_stream_canonical_error(
+        CanonicalError(ErrorCategory.MODEL_FAILURE, "bad_output", "Bad output.", False)
+    )
+    assert ordinary.code == "bad_output"
+    assert ordinary.message == "Bad output."
+
+
+def test_openai_model_failure_causes_do_not_become_hidden_retry_statuses() -> None:
+    cases = (
+        ("tool_call_incomplete", FailureCause.OUTPUT_EOS),
+        ("tool_call_incomplete", FailureCause.OUTPUT_LENGTH),
+        ("protocol_ambiguity", FailureCause.OUTPUT_EOS),
+        ("protocol_ambiguity", FailureCause.OUTPUT_LENGTH),
+        ("protocol_ambiguity", FailureCause.PARSER_AMBIGUITY_LIMIT),
+        ("tool_call_invalid", FailureCause.MODEL_TOOL_OUTPUT_INVALID),
+    )
+    projections = []
+    for code, cause in cases:
+        source = CanonicalError(ErrorCategory.MODEL_FAILURE, code, "Model output failed.", False, cause)
+        mapped = map_canonical_error(source)
+        streamed = map_stream_canonical_error(source)
+        projections.append((mapped.status_code, mapped.type, mapped.code))
+        assert (streamed.status_code, streamed.type, streamed.code) == (
+            mapped.status_code,
+            mapped.type,
+            mapped.code,
+        )
+        assert streamed.message == mapped.message == source.message
+
+    assert all(status == 500 for status, _, _ in projections)
+    assert all(error_type == "server_error" for _, error_type, _ in projections)
+    assert [code for _, _, code in projections] == [case[0] for case in cases]
+
+
+def test_context_length_errors_use_stable_openai_wire_semantics() -> None:
+    for internal_code in ("prompt_limit_exceeded", "total_context_limit_exceeded"):
+        source = CanonicalError(
+            ErrorCategory.CONTEXT_LENGTH,
+            internal_code,
+            "Internal context detail.",
+            retryable=False,
+        )
+        mapped = map_canonical_error(source)
+
+        assert source.code == internal_code
+        assert mapped.status_code == 400
+        assert mapped.type == "invalid_request_error"
+        assert mapped.code == "context_length_exceeded"
+        assert mapped.message == "Request exceeds the model context window."
+        assert "context window" in mapped.message
+        assert "retryable" not in mapped.to_body()["error"]
+
+    output_limit = map_canonical_error(
+        CanonicalError(
+            ErrorCategory.INVALID_REQUEST,
+            "output_limit_exceeded",
+            "Requested output limit exceeds the configured maximum.",
+            retryable=False,
+        )
+    )
+    assert output_limit.code == "output_limit_exceeded"
+    assert output_limit.message == "Requested output limit exceeds the configured maximum."
 
 
 def test_sampling_accepts_local_sampler_extensions() -> None:

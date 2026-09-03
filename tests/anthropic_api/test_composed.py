@@ -8,6 +8,7 @@ import httpx
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
+    RuntimeCapabilities,
     RuntimeFinished,
     RuntimeGenerationRequest,
     RuntimeModelMetadata,
@@ -58,12 +59,23 @@ class _Session:
 
 
 class _Runtime:
+    capabilities = RuntimeCapabilities(
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        generation_constraints=True,
+    )
+
     def __init__(self) -> None:
         self.is_ready = False
         self.is_healthy = True
         self.model_metadata = RuntimeModelMetadata(32768, "Qwen3_5ForConditionalGeneration")
         self.close_calls = 0
         self.submit_calls = 0
+        self.render_calls: list[list[dict[str, object]]] = []
 
     def load(self, config: ExLlamaV3LoadConfig) -> None:
         self.model_directory = config.model_directory
@@ -85,6 +97,7 @@ class _Runtime:
         protect_literal_tokens: bool = False,
     ) -> RuntimeRenderedPrompt:
         del template_kwargs, add_generation_prompt, protect_literal_tokens
+        self.render_calls.append(messages)
         if tools:
             return RuntimeRenderedPrompt("tool", (77,))
         rendered = repr(messages)
@@ -132,7 +145,7 @@ def test_composed_anthropic_text_thinking_tool_and_model_switch(tmp_path: Path) 
             return runtime
 
         composed = compose_server(
-            ServerConfig(first, model_root=tmp_path, api_keys=("secret",)),
+            ServerConfig(model_directory=first, model_root=tmp_path, api_keys=("secret",)),
             runtime=initial,
             runtime_factory=runtime_factory,
         )
@@ -259,5 +272,66 @@ def test_composed_anthropic_text_thinking_tool_and_model_switch(tmp_path: Path) 
             assert new.status_code == 200
 
         assert all(runtime.close_calls == 1 for runtime in runtimes)
+
+    asyncio.run(scenario())
+
+
+def test_composed_mid_system_strict_rejects_and_claude_code_best_effort_compiles(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        body = {
+            "model": "model",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "dynamic system update"},
+            ],
+        }
+
+        strict = compose_server(ServerConfig(model_dir), runtime=_Runtime())
+        async with strict.app.router.lifespan_context(strict.app):
+            generated = await _request(
+                strict.app, "POST", "/v1/messages", headers=_headers(), json=body
+            )
+            counted = await _request(
+                strict.app,
+                "POST",
+                "/v1/messages/count_tokens",
+                headers=_headers(),
+                json={"model": "model", "messages": body["messages"]},
+            )
+            assert generated.status_code == counted.status_code == 400
+            assert "cannot preserve mid-conversation system authority" in generated.text
+            assert "cannot preserve mid-conversation system authority" in counted.text
+
+        compatible_runtime = _Runtime()
+        compatible = compose_server(
+            ServerConfig(model_directory=model_dir, anthropic_compatibility_profile="claude-code"),
+            runtime=compatible_runtime,
+        )
+        async with compatible.app.router.lifespan_context(compatible.app):
+            generated = await _request(
+                compatible.app, "POST", "/v1/messages", headers=_headers(), json=body
+            )
+            counted = await _request(
+                compatible.app,
+                "POST",
+                "/v1/messages/count_tokens",
+                headers=_headers(),
+                json={"model": "model", "messages": body["messages"]},
+            )
+            assert generated.status_code == 200, generated.text
+            assert counted.status_code == 200, counted.text
+            expected_messages = [
+                {
+                    "role": "user",
+                    "content": "hello\n\n<system-reminder>\ndynamic system update\n</system-reminder>",
+                }
+            ]
+            assert compatible_runtime.render_calls == [expected_messages, expected_messages]
 
     asyncio.run(scenario())

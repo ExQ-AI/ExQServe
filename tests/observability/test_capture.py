@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCompleted,
@@ -210,7 +210,13 @@ def test_full_replay_preserves_safe_failure_error() -> None:
     async def scenario() -> None:
         sink = MemoryCaptureSink()
         manager = CaptureManager(CaptureMode.FULL, sink)
-        error = CanonicalError(ErrorCategory.RUNTIME_FAILURE, "backend_failed", "Runtime failed.", True)
+        error = CanonicalError(
+            ErrorCategory.RUNTIME_FAILURE,
+            "backend_failed",
+            "Runtime failed.",
+            True,
+            FailureCause.RUNTIME_RECOVERING,
+        )
         events = (GenerationStarted("r"), GenerationFailed("r", error))
         await manager.record_terminal(
             request=_request(),
@@ -222,6 +228,19 @@ def test_full_replay_preserves_safe_failure_error() -> None:
             error=error,
             events=events,
         )
-        assert replay_events(sink.records[0]) == events
+        record = sink.records[0]
+        assert record["error"]["cause"] == "runtime_recovering"  # type: ignore[index]
+        assert record["events"][1]["error"]["cause"] == "runtime_recovering"  # type: ignore[index]
+        assert replay_events(record) == events
+
+        legacy = dict(record)
+        legacy_events = [dict(item) for item in record["events"]]  # type: ignore[arg-type]
+        legacy_error = dict(legacy_events[1]["error"])  # type: ignore[arg-type]
+        legacy_error.pop("cause")
+        legacy_events[1]["error"] = legacy_error
+        legacy["events"] = legacy_events
+        replayed = replay_events(legacy)
+        assert isinstance(replayed[1], GenerationFailed)
+        assert replayed[1].error.cause is None
 
     asyncio.run(scenario())

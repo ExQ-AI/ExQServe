@@ -45,7 +45,7 @@ def test_auto_output_limit_uses_remaining_context_and_operator_cap() -> None:
     context_limited = RequestControlConfig(max_in_flight=1, max_total_tokens=100)
     capped = RequestControlConfig(max_in_flight=1, max_output_tokens=20, max_total_tokens=100)
 
-    assert context_limited.resolve_output_limit(prompt_tokens=30, requested=None) == 69
+    assert context_limited.resolve_output_limit(prompt_tokens=30, requested=None) == 70
     assert capped.resolve_output_limit(prompt_tokens=30, requested=None) == 20
     assert capped.resolve_output_limit(prompt_tokens=30, requested=7) == 7
 
@@ -53,7 +53,7 @@ def test_auto_output_limit_uses_remaining_context_and_operator_cap() -> None:
 def test_auto_output_limit_rejects_exhausted_or_unbounded_context() -> None:
     with pytest.raises(RequestRejected, match="no room"):
         RequestControlConfig(max_in_flight=1, max_total_tokens=10).resolve_output_limit(
-            prompt_tokens=9,
+            prompt_tokens=10,
             requested=None,
         )
     with pytest.raises(ValueError, match="requires max_total_tokens or max_output_tokens"):
@@ -61,6 +61,20 @@ def test_auto_output_limit_rejects_exhausted_or_unbounded_context() -> None:
             prompt_tokens=1,
             requested=None,
         )
+
+
+def test_codex_auto_output_budget_stays_dynamic_across_262k_context_boundaries() -> None:
+    config = RequestControlConfig(
+        max_in_flight=1,
+        max_output_tokens=32768,
+        max_total_tokens=262144,
+    )
+
+    assert config.resolve_output_limit(prompt_tokens=219999, requested=None) == 32768
+    assert config.resolve_output_limit(prompt_tokens=235929, requested=None) == 26215
+    assert config.resolve_output_limit(prompt_tokens=255000, requested=None) == 7144
+    assert config.resolve_output_limit(prompt_tokens=262142, requested=None) == 2
+    assert config.resolve_output_limit(prompt_tokens=235929, requested=32768) == 32768
 
 
 def test_terminal_reason_is_closed_protocol_neutral_vocabulary() -> None:
@@ -72,6 +86,7 @@ def test_terminal_reason_is_closed_protocol_neutral_vocabulary() -> None:
         "application_cancelled",
         "timeout",
         "server_shutdown",
+        "model_switch",
     }
 
 

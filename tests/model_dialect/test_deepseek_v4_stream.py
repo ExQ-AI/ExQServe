@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 
 from exqserve.core.events import GenerationEvent, ReasoningDelta, TextDelta, ToolCallCompleted
@@ -145,6 +146,54 @@ def test_deepseek_v4_accepts_direct_json_invoke_variant_seen_in_serving_framewor
     assert _calls(events)[0].call.arguments_json == '{"count":2,"id":"123"}'
 
 
+def test_deepseek_v4_direct_json_preserves_dsml_closes_across_every_split() -> None:
+    value = (
+        f'a </{_DSML}invoke> b </{_DSML}tool_calls> c '
+        '"quoted" and \\ escaped'
+    )
+    payload = json.dumps(
+        {"query": value, "nested": {"items": [1, {"text": "ok"}]}},
+        ensure_ascii=False,
+    )
+    invoke = f'<{_DSML}invoke name="lookup">\n{payload}\n</{_DSML}invoke>'
+    source = "</think>" + _tool_block(invoke)
+
+    for split in range(len(source) + 1):
+        events, incomplete = _parse([source[:split], source[split:]])
+        calls = _calls(events)
+        assert incomplete is False, split
+        assert len(calls) == 1, split
+        assert json.loads(calls[0].call.arguments_json) == {
+            "query": value,
+            "nested": {"items": [1, {"text": "ok"}]},
+        }, split
+
+
+def test_deepseek_v4_parallel_direct_json_scan_state_resets_across_invokes() -> None:
+    first_value = f'a </{_DSML}tool_calls> b'
+    second_value = f'c </{_DSML}invoke> d'
+    first = (
+        f'<{_DSML}invoke name="lookup">\n'
+        f'{json.dumps({"query": first_value}, ensure_ascii=False)}\n'
+        f'</{_DSML}invoke>'
+    )
+    second = (
+        f'<{_DSML}invoke name="first">\n'
+        f'{json.dumps({"x": second_value}, ensure_ascii=False)}\n'
+        f'</{_DSML}invoke>'
+    )
+    source = "</think>" + _tool_block(first + "\n" + second)
+
+    for split in range(len(source) + 1):
+        events, incomplete = _parse([source[:split], source[split:]])
+        calls = _calls(events)
+        assert incomplete is False, split
+        assert [json.loads(call.call.arguments_json) for call in calls] == [
+            {"query": first_value},
+            {"x": second_value},
+        ], split
+
+
 def test_deepseek_v4_unwraps_arguments_wrapper_only_when_schema_proves_it_is_wrapper() -> None:
     wrapped = _invoke(
         "wrapped",
@@ -192,6 +241,41 @@ def test_deepseek_v4_tool_block_is_safe_across_every_two_chunk_split() -> None:
         assert incomplete is False, split
         assert _reasoning(events) == "reason", split
         assert [(event.call.name, event.call.arguments_json) for event in _calls(events)] == baseline_calls, split
+
+
+def test_deepseek_v4_json_string_preserves_dsml_close_markers_across_splits() -> None:
+    markers = (
+        f"</{_DSML}parameter>",
+        f"</{_DSML}invoke>",
+        f"</{_DSML}tool_calls>",
+    )
+    for marker in markers:
+        value = f'a {marker} b "quoted"'
+        json_value = json.dumps(value, ensure_ascii=False)
+        source = "</think>" + _tool_block(
+            _invoke("lookup", _param("query", json_value, string=False))
+        )
+
+        for split in range(len(source) + 1):
+            events, incomplete = _parse([source[:split], source[split:]])
+            calls = _calls(events)
+            assert incomplete is False, (marker, split)
+            assert len(calls) == 1, (marker, split)
+            assert json.loads(calls[0].call.arguments_json) == {"query": value}, (marker, split)
+
+
+def test_deepseek_v4_raw_string_dsml_parameter_close_remains_native_wire_limit() -> None:
+    source = "</think>" + _tool_block(
+        _invoke(
+            "lookup",
+            _param("query", f"a </{_DSML}parameter> b", string=True),
+        )
+    )
+
+    events, incomplete = _parse([source])
+
+    assert incomplete is True
+    assert _calls(events) == []
 
 
 def test_deepseek_v4_name_and_arguments_in_same_first_chunk_are_not_lost() -> None:

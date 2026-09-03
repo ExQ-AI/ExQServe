@@ -430,11 +430,7 @@ class ResponsesStreamSerializer:
         if isinstance(event, GenerationFailed):
             self._terminal = True
             mapped = map_canonical_error(event.error)
-            error: dict[str, object] = {
-                "code": mapped.code,
-                "message": mapped.message,
-                "type": mapped.type,
-            }
+            error = mapped.to_error_object(include_param=False)
             return (
                 self._emit(
                     "response.failed",

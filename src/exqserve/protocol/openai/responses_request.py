@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from exqserve.agent.schema import JsonSchema, validate_strict_function_schema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     CanonicalItem,
     ImageContentPart,
@@ -271,6 +272,7 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
                     items.append(MessageItem(MessageRole.USER, content))
                 else:
                     items.append(MultimodalMessageItem(MessageRole.USER, content))
+                call_index = 0
                 assistant_text_in_segment = False
                 assistant_tool_call_in_segment = False
             else:
@@ -279,6 +281,7 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
                 if role == "assistant":
                     assistant_text_in_segment = assistant_text_in_segment or bool(text.strip())
                 else:
+                    call_index = 0
                     assistant_text_in_segment = False
                     assistant_tool_call_in_segment = False
             continue
@@ -441,10 +444,27 @@ def _parse_structured_output(value: object) -> StructuredOutputSpec | None:
     if format_type in {None, "text"}:
         return None
     if format_type == "json_object":
-        return StructuredOutputSpec(_schema_from_object({"type": "object"}, param="text.format"))
-    if format_type == "json_schema":
         return StructuredOutputSpec(
-            _schema_from_object(format_object.get("schema"), param="text.format.schema")
+            _schema_from_object({"type": "object"}, param="text.format"),
+            GenerationGuarantee.FORMAT,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
+    if format_type == "json_schema":
+        strict = format_object.get("strict", False)
+        if not isinstance(strict, bool):
+            raise invalid_request(
+                "invalid_text_format",
+                "text.format.strict must be boolean.",
+                "text.format.strict",
+            )
+        return StructuredOutputSpec(
+            _schema_from_object(format_object.get("schema"), param="text.format.schema"),
+            GenerationGuarantee.SCHEMA if strict else GenerationGuarantee.NONE,
+            (
+                ConstraintFallbackPolicy.FAIL_CLOSED
+                if strict
+                else ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+            ),
         )
     raise invalid_request("invalid_text_format", "Unsupported Responses text format.", "text.format.type")
 

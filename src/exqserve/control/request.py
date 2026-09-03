@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -18,7 +19,10 @@ from exqserve.runtime.contracts import (
     RuntimeGenerationRequest,
     RuntimeInjectionUnavailable,
     RuntimeSessionLike,
+    RuntimeUnavailable,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +72,7 @@ class RequestControlConfig:
 
         candidates: list[int] = []
         if self.max_total_tokens is not None:
-            candidates.append(self.max_total_tokens - prompt_tokens - 1)
+            candidates.append(self.max_total_tokens - prompt_tokens)
         if self.max_output_tokens is not None:
             candidates.append(self.max_output_tokens)
         if not candidates:
@@ -94,6 +98,7 @@ class RequestTerminalReason(str, Enum):
     APPLICATION_CANCELLED = "application_cancelled"
     TIMEOUT = "timeout"
     SERVER_SHUTDOWN = "server_shutdown"
+    MODEL_SWITCH = "model_switch"
 
 
 class RequestRejected(Exception):
@@ -139,6 +144,36 @@ def _rejection(
             retryable=retryable,
         )
     )
+
+
+class _RequestLeaseState(str, Enum):
+    RESERVED = "reserved"
+    SUBMITTED = "submitted"
+    RELEASED = "released"
+
+
+class RequestLease:
+    """One max-in-flight reservation spanning preprocessing through runtime release."""
+
+    def __init__(self, controller: RequestController, request_id: str) -> None:
+        self._controller = controller
+        self._request_id = request_id
+        self._state = _RequestLeaseState.RESERVED
+        self._session: ControlledSession | None = None
+
+    @property
+    def request_id(self) -> str:
+        return self._request_id
+
+    async def submit(self, request: RuntimeGenerationRequest) -> ControlledSession:
+        if not isinstance(request, RuntimeGenerationRequest):
+            raise TypeError("request must be a RuntimeGenerationRequest")
+        if request.request_id != self._request_id:
+            raise ValueError("runtime request id must match the reserved request id")
+        return await self._controller._submit_reserved(self, request)
+
+    async def release(self) -> None:
+        await self._controller._release_reserved(self)
 
 
 class ControlledSession:
@@ -227,6 +262,7 @@ class ControlledSession:
             RequestTerminalReason.APPLICATION_CANCELLED,
             RequestTerminalReason.TIMEOUT,
             RequestTerminalReason.SERVER_SHUTDOWN,
+            RequestTerminalReason.MODEL_SWITCH,
         }
         if not isinstance(reason, RequestTerminalReason):
             raise TypeError("reason must be a RequestTerminalReason")
@@ -333,8 +369,11 @@ class RequestController:
         self._lock = asyncio.Lock()
         self._in_flight = 0
         self._closed = False
+        self._leases_by_request_id: dict[str, RequestLease] = {}
         self._sessions: set[ControlledSession] = set()
         self._sessions_by_request_id: dict[str, ControlledSession] = {}
+        self._drained = asyncio.Event()
+        self._drained.set()
 
     @property
     def in_flight(self) -> int:
@@ -375,21 +414,32 @@ class RequestController:
                 retryable=False,
             )
 
-    async def _release(self, session: ControlledSession) -> None:
-        async with self._lock:
-            if session not in self._sessions:
-                return
-            self._sessions.remove(session)
-            if self._sessions_by_request_id.get(session.request_id) is session:
-                del self._sessions_by_request_id[session.request_id]
-            self._in_flight -= 1
-            if self._in_flight < 0:  # pragma: no cover - defensive invariant
-                raise RuntimeError("request-control in-flight count became negative")
+    def _release_lease_locked(self, lease: RequestLease) -> None:
+        if self._leases_by_request_id.get(lease.request_id) is not lease:
+            return
+        if lease._state is _RequestLeaseState.RELEASED:
+            return
 
-    async def submit(self, request: RuntimeGenerationRequest) -> ControlledSession:
-        if not isinstance(request, RuntimeGenerationRequest):
-            raise TypeError("request must be a RuntimeGenerationRequest")
-        self._validate_limits(request)
+        session = lease._session
+        if session is not None:
+            self._sessions.discard(session)
+            if self._sessions_by_request_id.get(lease.request_id) is session:
+                del self._sessions_by_request_id[lease.request_id]
+
+        del self._leases_by_request_id[lease.request_id]
+        lease._session = None
+        lease._state = _RequestLeaseState.RELEASED
+        self._in_flight -= 1
+        if self._in_flight < 0:  # pragma: no cover - defensive invariant
+            raise RuntimeError("request-control in-flight count became negative")
+        if self._in_flight == 0:
+            self._drained.set()
+
+    async def acquire(self, request_id: str) -> RequestLease:
+        if not isinstance(request_id, str):
+            raise TypeError("request_id must be a string")
+        if not request_id.strip():
+            raise ValueError("request_id must not be empty")
 
         async with self._lock:
             if self._closed:
@@ -399,7 +449,7 @@ class RequestController:
                     "Server is shutting down.",
                     retryable=True,
                 )
-            if request.request_id in self._sessions_by_request_id:
+            if request_id in self._leases_by_request_id:
                 raise _rejection(
                     ErrorCategory.INVALID_REQUEST,
                     "duplicate_request_id",
@@ -414,7 +464,52 @@ class RequestController:
                     retryable=True,
                 )
 
+            lease = RequestLease(self, request_id)
+            self._leases_by_request_id[request_id] = lease
             self._in_flight += 1
+            self._drained.clear()
+            return lease
+
+    async def _release_reserved(self, lease: RequestLease) -> None:
+        async with self._lock:
+            if self._leases_by_request_id.get(lease.request_id) is not lease:
+                return
+            if lease._state is _RequestLeaseState.SUBMITTED:
+                return
+            self._release_lease_locked(lease)
+
+    async def _release(self, session: ControlledSession) -> None:
+        async with self._lock:
+            lease = self._leases_by_request_id.get(session.request_id)
+            if lease is None or lease._session is not session:
+                return
+            self._release_lease_locked(lease)
+
+    async def _submit_reserved(
+        self, lease: RequestLease, request: RuntimeGenerationRequest
+    ) -> ControlledSession:
+        try:
+            self._validate_limits(request)
+        except BaseException:
+            await self._release_reserved(lease)
+            raise
+
+        runtime_session: RuntimeSessionLike | None = None
+        setup_error: BaseException | None = None
+        async with self._lock:
+            if self._leases_by_request_id.get(lease.request_id) is not lease:
+                raise RuntimeError("request lease is no longer active")
+            if lease._state is not _RequestLeaseState.RESERVED:
+                raise RuntimeError("request lease has already been submitted")
+            if self._closed:
+                self._release_lease_locked(lease)
+                raise _rejection(
+                    ErrorCategory.OVERLOADED,
+                    "server_shutting_down",
+                    "Server is shutting down.",
+                    retryable=True,
+                )
+
             try:
                 runtime_session = self._runtime.submit(request)
                 controlled = ControlledSession(
@@ -426,12 +521,42 @@ class RequestController:
                     timeout_seconds=self._config.timeout_seconds,
                     release=self._release,
                 )
-            except BaseException:
-                self._in_flight -= 1
-                raise
-            self._sessions.add(controlled)
-            self._sessions_by_request_id[request.request_id] = controlled
-            return controlled
+            except RuntimeUnavailable as exc:
+                self._release_lease_locked(lease)
+                raise RequestRejected(exc.error) from exc
+            except BaseException as exc:  # noqa: BLE001 - runtime ownership rollback boundary
+                self._release_lease_locked(lease)
+                setup_error = exc
+            else:
+                lease._state = _RequestLeaseState.SUBMITTED
+                lease._session = controlled
+                self._sessions.add(controlled)
+                self._sessions_by_request_id[request.request_id] = controlled
+                return controlled
+
+        if setup_error is not None:
+            if runtime_session is not None:
+                try:
+                    await runtime_session.cancel()
+                except Exception as cancel_exc:  # noqa: BLE001 - preserve original setup failure
+                    logger.warning(
+                        "runtime session rollback cancellation failed request_id=%s: %s",
+                        lease.request_id,
+                        cancel_exc,
+                    )
+            raise setup_error
+        raise RuntimeError("runtime session setup ended without a result")  # pragma: no cover
+
+    async def submit(self, request: RuntimeGenerationRequest) -> ControlledSession:
+        """Compatibility entry point for callers that have no preprocessing phase."""
+        if not isinstance(request, RuntimeGenerationRequest):
+            raise TypeError("request must be a RuntimeGenerationRequest")
+        lease = await self.acquire(request.request_id)
+        try:
+            return await lease.submit(request)
+        except BaseException:
+            await lease.release()
+            raise
 
     async def inject_text(self, request_id: str, text: str) -> None:
         if not isinstance(request_id, str):
@@ -449,14 +574,20 @@ class RequestController:
             raise RequestInjectionNotFound(request_id)
         session.inject_text(text)
 
-    async def close(self) -> None:
+    async def close(
+        self,
+        reason: RequestTerminalReason = RequestTerminalReason.SERVER_SHUTDOWN,
+    ) -> None:
+        if not isinstance(reason, RequestTerminalReason):
+            raise TypeError("reason must be a RequestTerminalReason")
+        if reason not in {RequestTerminalReason.SERVER_SHUTDOWN, RequestTerminalReason.MODEL_SWITCH}:
+            raise ValueError("controller close reason must be server shutdown or model switch")
         async with self._lock:
-            if self._closed and not self._sessions:
+            if self._closed and self._in_flight == 0:
                 return
             self._closed = True
             sessions = tuple(self._sessions)
 
         if sessions:
-            await asyncio.gather(
-                *(session.cancel(RequestTerminalReason.SERVER_SHUTDOWN) for session in sessions)
-            )
+            await asyncio.gather(*(session.cancel(reason) for session in sessions))
+        await self._drained.wait()

@@ -56,7 +56,7 @@ def _text(body: dict[str, object]) -> str:
 def test_real_qwen_anthropic_messages_count_stream_tool_and_continuation() -> None:
     model_directory = _model_directory()
     config = ServerConfig(
-        model_directory,
+        model_directory=model_directory,
         cache_tokens=4096,
         max_batch_size=2,
         max_chunk_size=512,

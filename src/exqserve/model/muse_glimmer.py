@@ -38,14 +38,19 @@ from exqserve.core.items import (
     ToolResultItem,
 )
 from exqserve.core.request import CanonicalRequest
+from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     ModelCapabilities,
+    NativeTokenAwareIncrementalParser,
+    NativeTokenProvenanceError,
+    ParserTerminalIssue,
     TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
     TemplateTextPart,
     TemplateTool,
     TemplateToolCall,
+    incomplete_tool_terminal_issue,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
 
@@ -59,8 +64,21 @@ MUSE_GLIMMER_CAPABILITIES = ModelCapabilities(
     vision=True,
 )
 
-_MUSE_STOP_CONDITIONS = ("<|eot|>", "<|end_of_text|>")
-_START_ASSISTANT = "<|start|>assistant"
+MUSE_GLIMMER_PROMPT_STRUCTURAL_MARKERS = (
+    "<|message|>",
+    "<|eom|>",
+    "<|eot|>",
+    "<|start|>",
+)
+MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS = (
+    "<|start|>",
+    "<|message|>",
+    "<|eom|>",
+    "<|eot|>",
+)
+
+_MUSE_END_OF_TEXT = "<|end_of_text|>"
+_MUSE_STOP_CONDITIONS = ("<|eot|>", _MUSE_END_OF_TEXT)
 _MESSAGE = "<|message|>"
 _EOM = "<|eom|>"
 _EOT = "<|eot|>"
@@ -68,8 +86,6 @@ _FUNCTIONS_OPEN = "<atem:function_calls>"
 _FUNCTIONS_CLOSE = "</atem:function_calls>"
 _INVOKE_RE = re.compile(r'<atem:invoke name="([^"]+)">\n?(.*?)</atem:invoke>', re.DOTALL)
 _PARAMETER_RE = re.compile(r'<atem:parameter name="([^"]+)">(.*?)</atem:parameter>', re.DOTALL)
-_HEADER_PREFIXES = (_START_ASSISTANT, " to=", _MESSAGE)
-_CONTENT_MARKERS = (_EOM, _EOT, _START_ASSISTANT)
 
 
 def _reasoning_kwargs(policy: ReasoningPolicy) -> tuple[tuple[str, str], ...]:
@@ -105,7 +121,22 @@ class MuseGlimmerPromptCompiler(HFTemplatePromptCompiler):
     """Compile canonical Agent history through Muse Glimmer's HF ATEM template."""
 
     capabilities = MUSE_GLIMMER_CAPABILITIES
-    stop_conditions = _MUSE_STOP_CONDITIONS
+    stop_conditions: tuple[str | int, ...] = _MUSE_STOP_CONDITIONS
+
+    def configure_native_eot_stop(self, token_id: int) -> None:
+        """Use verified native EOT identity instead of a decoded-text stop string."""
+
+        if not isinstance(token_id, int) or isinstance(token_id, bool):
+            raise TypeError("token_id must be an integer")
+        if token_id < 0:
+            raise ValueError("token_id must be non-negative")
+        self.stop_conditions = (token_id, _MUSE_END_OF_TEXT)
+
+    def configure_native_output_stop(self, marker: str, marker_id: int) -> None:
+        """Configure the dialect-declared native output stop without class-name coupling."""
+        if marker != MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS[-1]:
+            raise ValueError("unsupported Muse native output stop marker")
+        self.configure_native_eot_stop(marker_id)
 
     def prepare(
         self,
@@ -251,20 +282,14 @@ class MuseGlimmerParserFinish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool
 
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
+
 
 def _deterministic_call_id(request_id: str, index: int) -> str:
     digest = hashlib.sha256(f"{request_id}\0muse-glimmer\0{index}".encode()).hexdigest()
     return f"call_{digest[:24]}"
-
-
-def _longest_partial_suffix(text: str, markers: tuple[str, ...]) -> int:
-    longest = 0
-    for marker in markers:
-        limit = min(len(text), len(marker) - 1)
-        for size in range(1, limit + 1):
-            if marker.startswith(text[-size:]):
-                longest = max(longest, size)
-    return longest
 
 
 def _atem_value(raw: str) -> JsonValue:
@@ -310,8 +335,8 @@ def _parse_atem_calls(body: str) -> list[tuple[str, str]]:
     return calls
 
 
-class MuseGlimmerIncrementalParser:
-    """Parse Muse Glimmer recipient channels and ATEM tool calls incrementally."""
+class MuseGlimmerIncrementalParser(NativeTokenAwareIncrementalParser):
+    """Parse Muse Glimmer channels while preserving native control-token identity."""
 
     def __init__(self, request_id: str) -> None:
         if not isinstance(request_id, str):
@@ -320,6 +345,8 @@ class MuseGlimmerIncrementalParser:
             raise ValueError("request_id must not be empty")
         self._request_id = request_id
         self._buffer = ""
+        self._verified: list[bool] = []
+        self._native_controls: dict[int, str] = {}
         self._state = "header"
         self._recipient: str | None = None
         self._text_open = False
@@ -330,6 +357,84 @@ class MuseGlimmerIncrementalParser:
         self._call_index = 0
         self._had_incomplete_tool = False
         self._finished = False
+
+    def _append(
+        self,
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+    ) -> None:
+        base = len(self._buffer)
+        self._buffer += chunk
+        verified = native_token_spans is not None
+        self._verified.extend([verified] * len(chunk))
+        if native_token_spans is None:
+            return
+        cursor = 0
+        for span in native_token_spans:
+            if not isinstance(span, NativeTokenSpan):
+                raise TypeError("native_token_spans must contain NativeTokenSpan values")
+            if span.start < cursor or span.end > len(chunk) or chunk[span.start : span.end] != span.text:
+                raise ValueError("native token spans do not match the supplied chunk")
+            if span.text in MUSE_GLIMMER_OUTPUT_STRUCTURAL_MARKERS:
+                self._native_controls[base + span.start] = span.text
+            cursor = span.end
+
+    def _consume(self, length: int) -> None:
+        if length <= 0:
+            return
+        self._buffer = self._buffer[length:]
+        del self._verified[:length]
+        self._native_controls = {
+            position - length: marker
+            for position, marker in self._native_controls.items()
+            if position >= length
+        }
+
+    def _range_verified(self, start: int, end: int) -> bool:
+        return end <= len(self._verified) and all(self._verified[start:end])
+
+    def _control_status(self, position: int, marker: str) -> str:
+        end = position + len(marker)
+        if end > len(self._buffer) or self._buffer[position:end] != marker:
+            raise ValueError("control status requires a complete matching marker")
+        if self._native_controls.get(position) == marker:
+            return "native"
+        if self._range_verified(position, end):
+            return "ordinary"
+        return "unknown"
+
+    def _raise_provenance(self, message: str) -> None:
+        raise NativeTokenProvenanceError(message)
+
+    def _native_start_decision(self, position: int) -> tuple[str, int]:
+        marker = "<|start|>"
+        if not self._buffer.startswith(marker, position):
+            return "none", 0
+        status = self._control_status(position, marker)
+        if status == "unknown":
+            self._raise_provenance("Muse output control token provenance is unavailable")
+        if status == "ordinary":
+            return "ordinary", len(marker)
+
+        suffix = self._buffer[position + len(marker) :]
+        expected = "assistant"
+        common = min(len(suffix), len(expected))
+        if suffix[:common] != expected[:common]:
+            self._raise_provenance("Muse native <|start|> has an invalid assistant header suffix")
+        if len(suffix) < len(expected):
+            return "waiting", len(marker) + len(suffix)
+        return "native", len(marker) + len(expected)
+
+    def _ambiguous_partial_suffix(self, markers: tuple[str, ...]) -> int:
+        longest = 0
+        for marker in markers:
+            limit = min(len(self._buffer), len(marker) - 1)
+            for size in range(1, limit + 1):
+                start = len(self._buffer) - size
+                if marker.startswith(self._buffer[start:]) and not self._range_verified(start, len(self._buffer)):
+                    longest = max(longest, size)
+        return longest
+
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
@@ -390,60 +495,109 @@ class MuseGlimmerIncrementalParser:
             self._call_index += 1
 
     def _process_header(self) -> bool:
-        if self._buffer.startswith(_START_ASSISTANT):
-            self._buffer = self._buffer[len(_START_ASSISTANT) :]
-            return True
-        if any(prefix.startswith(self._buffer) for prefix in _HEADER_PREFIXES) and self._buffer:
+        if self._buffer and " to=".startswith(self._buffer):
             return False
-        if self._buffer.startswith(" to="):
-            marker_at = self._buffer.find(_MESSAGE, len(" to="))
-            if marker_at < 0:
+        if self._buffer.startswith("<|start|>"):
+            decision, length = self._native_start_decision(0)
+            if decision == "waiting":
                 return False
-            recipient = self._buffer[len(" to=") : marker_at].strip()
-            if not recipient:
-                self._had_incomplete_tool = True
-                recipient = "user"
-            self._recipient = recipient
-            self._buffer = self._buffer[marker_at + len(_MESSAGE) :]
-            self._state = "content"
-            return True
+            if decision == "native":
+                self._consume(length)
+                return True
+
+        if self._buffer.startswith(" to="):
+            search_from = len(" to=")
+            marker_at = self._buffer.find(_MESSAGE, search_from)
+            while marker_at >= 0:
+                status = self._control_status(marker_at, _MESSAGE)
+                if status == "unknown":
+                    self._raise_provenance("Muse output control token provenance is unavailable")
+                if status == "native":
+                    recipient = self._buffer[search_from:marker_at].strip()
+                    if not recipient:
+                        self._had_incomplete_tool = True
+                        recipient = "user"
+                    self._recipient = recipient
+                    self._consume(marker_at + len(_MESSAGE))
+                    self._state = "content"
+                    return True
+                marker_at = self._buffer.find(_MESSAGE, marker_at + len(_MESSAGE))
+            held = self._ambiguous_partial_suffix((_MESSAGE,))
+            if held:
+                return False
+            return False
+
         if self._buffer.startswith(_MESSAGE):
-            self._recipient = "user"
-            self._buffer = self._buffer[len(_MESSAGE) :]
-            self._state = "content"
-            return True
-        if self._buffer and not any(prefix.startswith(self._buffer) for prefix in _HEADER_PREFIXES):
+            status = self._control_status(0, _MESSAGE)
+            if status == "unknown":
+                self._raise_provenance("Muse output control token provenance is unavailable")
+            if status == "native":
+                self._recipient = "user"
+                self._consume(len(_MESSAGE))
+                self._state = "content"
+                return True
+
+        held = self._ambiguous_partial_suffix(("<|start|>", _MESSAGE))
+        if held == len(self._buffer) and self._buffer:
+            return False
+        if self._buffer:
             self._recipient = "user"
             self._state = "content"
             return True
         return False
 
     def _process_content(self, events: list[GenerationEvent]) -> bool:
-        matches = [
-            (position, marker)
-            for marker in _CONTENT_MARKERS
-            if (position := self._buffer.find(marker)) >= 0
-        ]
-        if matches:
-            position, marker = min(matches, key=lambda item: item[0])
+        candidates: list[tuple[int, str]] = []
+        for marker in (_EOM, _EOT, "<|start|>"):
+            position = self._buffer.find(marker)
+            if position >= 0:
+                candidates.append((position, marker))
+        if candidates:
+            position, marker = min(candidates, key=lambda item: item[0])
+            if marker == "<|start|>":
+                status = self._control_status(position, marker)
+                if status == "unknown":
+                    self._raise_provenance("Muse output control token provenance is unavailable")
+                if status == "ordinary":
+                    length = position + len(marker)
+                    self._emit_content(self._buffer[:length], events)
+                    self._consume(length)
+                    return True
+                decision, length = self._native_start_decision(position)
+                if decision == "waiting":
+                    if position:
+                        self._emit_content(self._buffer[:position], events)
+                        self._consume(position)
+                        return True
+                    return False
+                self._emit_content(self._buffer[:position], events)
+                self._consume(position + length)
+                self._close_channel(events)
+                self._state = "header"
+                return True
+
+            status = self._control_status(position, marker)
+            if status == "unknown":
+                self._raise_provenance("Muse output control token provenance is unavailable")
+            if status == "ordinary":
+                length = position + len(marker)
+                self._emit_content(self._buffer[:length], events)
+                self._consume(length)
+                return True
             self._emit_content(self._buffer[:position], events)
-            self._buffer = self._buffer[position + len(marker) :]
+            self._consume(position + len(marker))
             self._close_channel(events)
             self._state = "header"
             return True
-        held = _longest_partial_suffix(self._buffer, _CONTENT_MARKERS)
+
+        held = self._ambiguous_partial_suffix((_EOM, _EOT, "<|start|>"))
         safe_length = len(self._buffer) - held
         if safe_length > 0:
             self._emit_content(self._buffer[:safe_length], events)
-            self._buffer = self._buffer[safe_length:]
+            self._consume(safe_length)
         return False
 
-    def feed(self, chunk: str) -> tuple[GenerationEvent, ...]:
-        if self._finished:
-            raise RuntimeError("cannot feed a finished Muse Glimmer parser")
-        if not isinstance(chunk, str):
-            raise TypeError("chunk must be a string")
-        self._buffer += chunk
+    def _drain(self) -> tuple[GenerationEvent, ...]:
         events: list[GenerationEvent] = []
         while True:
             progressed = self._process_header() if self._state == "header" else self._process_content(events)
@@ -451,19 +605,51 @@ class MuseGlimmerIncrementalParser:
                 break
         return tuple(events)
 
+    def feed_with_native_tokens(
+        self,
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+    ) -> tuple[GenerationEvent, ...]:
+        if self._finished:
+            raise RuntimeError("cannot feed a finished Muse Glimmer parser")
+        if not isinstance(chunk, str):
+            raise TypeError("chunk must be a string")
+        if native_token_spans is not None and not isinstance(native_token_spans, tuple):
+            raise TypeError("native_token_spans must be a tuple or None")
+        self._append(chunk, native_token_spans)
+        return self._drain()
+
+    def feed(self, chunk: str) -> tuple[GenerationEvent, ...]:
+        if self._finished:
+            raise RuntimeError("cannot feed a finished Muse Glimmer parser")
+        if not isinstance(chunk, str):
+            raise TypeError("chunk must be a string")
+        self._append(chunk, None)
+        return self._drain()
+
     def finish(self) -> MuseGlimmerParserFinish:
         if self._finished:
             return MuseGlimmerParserFinish((), self._had_incomplete_tool)
         events: list[GenerationEvent] = []
+        if self._buffer:
+            if self._state == "header" and self._buffer.startswith("<|start|>"):
+                decision, _ = self._native_start_decision(0)
+                if decision == "waiting":
+                    self._raise_provenance("Muse native <|start|> ended with an incomplete assistant header")
+            if self._ambiguous_partial_suffix(
+                ("<|start|>", _MESSAGE) if self._state == "header" else (_EOM, _EOT, "<|start|>")
+            ):
+                self._raise_provenance("Muse output control token provenance is unavailable")
+
         if self._state == "header":
             if self._buffer.strip():
                 self._recipient = "user"
                 self._state = "content"
             else:
-                self._buffer = ""
+                self._consume(len(self._buffer))
         if self._state == "content" and self._buffer:
             self._emit_content(self._buffer, events)
-            self._buffer = ""
+            self._consume(len(self._buffer))
         if self._state == "content":
             self._close_channel(events)
         self._finished = True

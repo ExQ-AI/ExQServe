@@ -43,15 +43,20 @@ from exqserve.model.contracts import (
     ModelCapabilities,
     NativeTokenAwareIncrementalParser,
     NativeTokenProvenanceError,
+    ParserAmbiguityDetail,
+    ParserTerminalIssue,
+    ParserTerminalIssueKind,
     TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
     TemplateTextPart,
     TemplateTool,
     TemplateToolCall,
+    ToolConstraintGuarantee,
     ToolConstraintMode,
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
+    incomplete_tool_terminal_issue,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
 from exqserve.model.tool_constraints import (
@@ -74,6 +79,8 @@ QWEN38_CAPABILITIES = ModelCapabilities(
 
 _QWEN_TOOL_TRIGGER = "<tool_call>"
 _QWEN_STRUCTURAL_WS_MAX = 8
+_QWEN_AMBIGUOUS_SUFFIX_MAX_BYTES = 64 * 1024
+_QWEN_AMBIGUOUS_SUFFIX_WORK_FACTOR = 8
 _QWEN_NATIVE_STRING_ALLOWED_KEYS = frozenset(
     {
         "$defs",
@@ -233,6 +240,15 @@ def qwen_tool_constraint(
         trigger=_QWEN_TOOL_TRIGGER,
         lark_grammar="\n".join(lines),
         eos_after_completed=True,
+        branch_guarantees=tuple(
+            (
+                tool.name,
+                ToolConstraintGuarantee.SCHEMA
+                if branch_mode is ToolConstraintMode.SCHEMA
+                else ToolConstraintGuarantee.FORMAT,
+            )
+            for tool, branch_mode in zip(tools, branch_modes, strict=True)
+        ),
     )
 
 
@@ -472,12 +488,24 @@ class QwenPromptCompiler(HFTemplatePromptCompiler):
 class QwenParserFinish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool
+    protocol_terminal_issue: ParserTerminalIssue | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.events, tuple):
             raise TypeError("events must be a tuple")
         if not isinstance(self.incomplete_tool_call, bool):
             raise TypeError("incomplete_tool_call must be a bool")
+        if self.protocol_terminal_issue is not None:
+            if not isinstance(self.protocol_terminal_issue, ParserTerminalIssue):
+                raise TypeError("protocol_terminal_issue must be a ParserTerminalIssue or None")
+            if self.protocol_terminal_issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY:
+                raise ValueError("protocol_terminal_issue must be PROTOCOL_AMBIGUITY")
+            if self.incomplete_tool_call:
+                raise ValueError("protocol ambiguity and incomplete Tool Call cannot coexist")
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return self.protocol_terminal_issue or incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class _QwenMode(Enum):
@@ -505,6 +533,7 @@ _FUNCTION_OPEN = "<function="
 _FUNCTION_CLOSE = "</function>"
 _PARAMETER_OPEN = "<parameter="
 _PARAMETER_CLOSE = "</parameter>"
+_TOOL_OPEN = "<tool_call>"
 _TOOL_CLOSE = "</tool_call>"
 _LITERAL_MARKER_QUOTES = frozenset({"'", '"', "`"})
 
@@ -515,11 +544,58 @@ class _MarkdownCodeContext:
 
     delimiter_width: int | None = None
     delimiter_is_fence: bool = False
+    inline_crossed_newline: bool = False
     pending_backticks: int = 0
     pending_at_line_start: bool = False
     indent_spaces: int | None = 0
+    pending_inline_close_backticks: int = 0
+    fence_close_tail_candidate: bool = False
 
-    def _commit_pending_backticks(self) -> None:
+    @staticmethod
+    def _contains_exact_inline_delimiter(
+        text: str,
+        width: int,
+        *,
+        final: bool,
+    ) -> bool:
+        run = 0
+        for character in text:
+            if character == "`":
+                run += 1
+                continue
+            if run == width:
+                return True
+            run = 0
+        return final and run == width
+
+    def _scan_pending_inline_close(self, text: str, *, final: bool) -> bool:
+        width = self.delimiter_width
+        if width is None:
+            self.pending_inline_close_backticks = 0
+            return False
+        run = self.pending_inline_close_backticks
+        for character in text:
+            if character == "`":
+                run += 1
+                continue
+            if run == width:
+                self.pending_inline_close_backticks = 0
+                return True
+            run = 0
+        if final and run == width:
+            self.pending_inline_close_backticks = 0
+            return True
+        self.pending_inline_close_backticks = run
+        return False
+
+    def _clear_delimiter(self) -> None:
+        self.delimiter_width = None
+        self.delimiter_is_fence = False
+        self.inline_crossed_newline = False
+        self.pending_inline_close_backticks = 0
+        self.fence_close_tail_candidate = False
+
+    def _commit_pending_backticks(self, next_character: str | None = None) -> None:
         width = self.pending_backticks
         if width == 0:
             return
@@ -529,56 +605,112 @@ class _MarkdownCodeContext:
         if self.delimiter_width is None:
             self.delimiter_width = width
             self.delimiter_is_fence = opened_at_line_start and width >= 3
+            self.inline_crossed_newline = False
+            self.pending_inline_close_backticks = 0
+            self.fence_close_tail_candidate = False
             return
         if self.delimiter_is_fence:
             if opened_at_line_start and width >= self.delimiter_width:
-                self.delimiter_width = None
-                self.delimiter_is_fence = False
+                if next_character is None or next_character == "\n":
+                    self._clear_delimiter()
+                elif next_character in {" ", "\t"}:
+                    self.fence_close_tail_candidate = True
             return
         if width == self.delimiter_width:
-            self.delimiter_width = None
+            self._clear_delimiter()
 
     def classify_marker(self, text: str, marker: str, *, final: bool = False) -> tuple[bool, bool]:
-        self._commit_pending_backticks()
+        if self.fence_close_tail_candidate:
+            self.fence_close_tail_candidate = False
+            self.indent_spaces = None
+        self._commit_pending_backticks("<")
         if self.delimiter_width is None:
             return False, False
 
-        delimiter = "`" * self.delimiter_width
-        close_at = text.find(delimiter, len(marker))
-        if close_at >= 0:
-            if self.delimiter_is_fence:
+        if self.delimiter_is_fence:
+            delimiter = "`" * self.delimiter_width
+            if text.find(delimiter, len(marker)) >= 0:
                 return True, False
-            newline_at = text.find("\n", len(marker), close_at)
-            if newline_at < 0:
-                return True, False
-
-        if not self.delimiter_is_fence and text.find("\n", len(marker)) >= 0:
-            self.delimiter_width = None
+        elif self._contains_exact_inline_delimiter(
+            text[len(marker) :],
+            self.delimiter_width,
+            final=final,
+        ):
+            return True, False
+        if final:
+            if not self.delimiter_is_fence:
+                self.delimiter_width = None
+                self.inline_crossed_newline = False
+                self.pending_inline_close_backticks = 0
             return False, False
-        return (False, False) if final else (False, True)
+        return False, True
 
-    def marker_is_literal_now(self) -> bool:
-        """Return whether a marker at the current cursor is inside active code context."""
+    def classify_native_marker(self, marker: str, following_text: str) -> tuple[bool, bool]:
+        del marker
         self._commit_pending_backticks()
-        return self.delimiter_width is not None
+        if self.delimiter_width is None:
+            return False, False
+        if self.delimiter_is_fence or not self.inline_crossed_newline:
+            return True, False
+
+        self.pending_inline_close_backticks = 0
+        if self._scan_pending_inline_close(following_text, final=False):
+            return True, False
+        return False, True
+
+    def resolve_pending_inline_marker(
+        self,
+        following_text: str,
+        *,
+        final: bool,
+    ) -> tuple[bool, bool]:
+        if self.delimiter_width is None or self.delimiter_is_fence:
+            self.pending_inline_close_backticks = 0
+            return self.delimiter_width is not None, False
+        if self._scan_pending_inline_close(following_text, final=final):
+            return True, False
+        return False, True
+
+    def abandon_provisional_inline(self) -> None:
+        if self.delimiter_width is not None and not self.delimiter_is_fence:
+            self.delimiter_width = None
+            self.inline_crossed_newline = False
+            self.pending_inline_close_backticks = 0
 
     def observe(self, text: str) -> None:
         for character in text:
+            if self.fence_close_tail_candidate:
+                if character in {" ", "\t"}:
+                    continue
+                if character == "\n":
+                    self._clear_delimiter()
+                    self.indent_spaces = 0
+                    continue
+                self.fence_close_tail_candidate = False
+                self.indent_spaces = None
+
             if character == "`":
                 if self.pending_backticks == 0:
                     self.pending_at_line_start = self.indent_spaces is not None and self.indent_spaces <= 3
                 self.pending_backticks += 1
                 self.indent_spaces = None
                 continue
-            self._commit_pending_backticks()
+            self._commit_pending_backticks(character)
             if character == "\n":
                 if self.delimiter_width is not None and not self.delimiter_is_fence:
-                    self.delimiter_width = None
+                    self.inline_crossed_newline = True
                 self.indent_spaces = 0
             elif character == " " and self.indent_spaces is not None:
                 self.indent_spaces += 1
             else:
                 self.indent_spaces = None
+
+    def active_for_native_marker(self) -> bool:
+        if self.fence_close_tail_candidate:
+            self.fence_close_tail_candidate = False
+            self.indent_spaces = None
+        self._commit_pending_backticks("<")
+        return self.delimiter_width is not None
 
 
 def _marker_is_directly_quoted(
@@ -598,11 +730,24 @@ def _marker_is_directly_quoted(
 class _QwenMarkerBoundaryTracker:
     """Track Qwen literal/provenance boundaries without owning semantic channel state."""
 
+    _HOLD_LIMIT_BYTES = 64 * 1024
+
     def __init__(self) -> None:
         self._literal_context = _MarkdownCodeContext()
         self._last_content_character: str | None = None
         self._pending_native_marker: tuple[str, str, bool] | None = None
+        self._pending_inline_native_marker: tuple[str, bool] | None = None
         self._unverified_marker_prefix = ""
+        self._held_bytes = 0
+        self._peak_held_bytes = 0
+        self._pending_close_width: int | None = None
+        self._pending_close_is_fence = False
+        self._pending_close_run = 0
+        self._pending_close_run_at_line_start = False
+        self._pending_close_indent: int | None = None
+        self._pending_close_tail_candidate = False
+        self._last_scan_consumed_characters = 0
+        self._terminal_issue: ParserTerminalIssue | None = None
 
     @property
     def last_content_character(self) -> str | None:
@@ -611,6 +756,22 @@ class _QwenMarkerBoundaryTracker:
     @property
     def unverified_marker_prefix(self) -> str:
         return self._unverified_marker_prefix
+
+    @property
+    def has_pending_inline_native_marker(self) -> bool:
+        return self._pending_inline_native_marker is not None
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return self._terminal_issue
+
+    @property
+    def peak_held_bytes(self) -> int:
+        return self._peak_held_bytes
+
+    @property
+    def last_scan_consumed_characters(self) -> int:
+        return self._last_scan_consumed_characters
 
     def set_unverified_marker_prefix(self, value: str) -> None:
         self._unverified_marker_prefix = value
@@ -652,6 +813,125 @@ class _QwenMarkerBoundaryTracker:
             return _QwenMarkerDisposition.LITERAL
         return _QwenMarkerDisposition.STRUCTURAL
 
+    def _reset_pending_close_scan(self) -> None:
+        self._pending_close_run = 0
+        self._pending_close_run_at_line_start = False
+        self._pending_close_tail_candidate = False
+        # The ambiguous native marker is non-whitespace, so a fenced close cannot
+        # start until a later newline resets indentation.
+        self._pending_close_indent = None
+        self._last_scan_consumed_characters = 0
+
+    def _start_unresolved(self, marker: str, *, verified: bool) -> None:
+        width = self._literal_context.delimiter_width
+        if width is None:
+            raise RuntimeError("Qwen unresolved literal barrier requires an active delimiter")
+        self._pending_inline_native_marker = (marker, verified)
+        self._pending_close_width = width
+        self._pending_close_is_fence = self._literal_context.delimiter_is_fence
+        self._held_bytes = len(marker.encode("utf-8"))
+        self._peak_held_bytes = max(self._peak_held_bytes, self._held_bytes)
+        self._terminal_issue = None
+        self._reset_pending_close_scan()
+        if self._held_bytes > self._HOLD_LIMIT_BYTES:
+            self._terminal_issue = ParserTerminalIssue(
+                ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+                ParserAmbiguityDetail.HOLD_LIMIT,
+            )
+
+    def _clear_unresolved(self) -> None:
+        self._pending_inline_native_marker = None
+        self._pending_close_width = None
+        self._pending_close_is_fence = False
+        self._held_bytes = 0
+        self._reset_pending_close_scan()
+
+    def _accept_held_character(self, character: str) -> bool:
+        width = len(character.encode("utf-8"))
+        if self._held_bytes + width > self._HOLD_LIMIT_BYTES:
+            self._terminal_issue = ParserTerminalIssue(
+                ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+                ParserAmbiguityDetail.HOLD_LIMIT,
+            )
+            return False
+        self._held_bytes += width
+        self._peak_held_bytes = max(self._peak_held_bytes, self._held_bytes)
+        return True
+
+    def _pending_run_is_fence_close(self) -> bool:
+        width = self._pending_close_width
+        return (
+            width is not None
+            and self._pending_close_run_at_line_start
+            and self._pending_close_run >= width
+        )
+
+    def _scan_pending_close(self, text: str, *, final: bool) -> bool:
+        self._last_scan_consumed_characters = 0
+        width = self._pending_close_width
+        if width is None:
+            return False
+
+        for index, character in enumerate(text):
+            # The first non-backtick after an exact inline run proves the close,
+            # but belongs to replay remainder rather than the literal hold.
+            if (
+                not self._pending_close_is_fence
+                and character != "`"
+                and self._pending_close_run == width
+            ):
+                self._pending_close_run = 0
+                self._pending_close_run_at_line_start = False
+                self._last_scan_consumed_characters = index
+                return True
+
+            if not self._accept_held_character(character):
+                self._last_scan_consumed_characters = index
+                return False
+            self._last_scan_consumed_characters = index + 1
+
+            if self._pending_close_tail_candidate:
+                if character in {" ", "	"}:
+                    continue
+                if character == "\n":
+                    return True
+                self._pending_close_tail_candidate = False
+                self._pending_close_indent = None
+
+            if character == "`":
+                if self._pending_close_run == 0:
+                    indent = self._pending_close_indent
+                    self._pending_close_run_at_line_start = indent is not None and indent <= 3
+                self._pending_close_run += 1
+                self._pending_close_indent = None
+                continue
+
+            if self._pending_close_run:
+                if self._pending_close_is_fence and self._pending_run_is_fence_close():
+                    self._pending_close_run = 0
+                    self._pending_close_run_at_line_start = False
+                    if character == "\n":
+                        return True
+                    if character in {" ", "	"}:
+                        self._pending_close_tail_candidate = True
+                        continue
+                else:
+                    self._pending_close_run = 0
+                    self._pending_close_run_at_line_start = False
+
+            if character == "\n":
+                self._pending_close_indent = 0
+            elif character == " " and self._pending_close_indent is not None:
+                self._pending_close_indent += 1
+            else:
+                self._pending_close_indent = None
+
+        if not final or self._terminal_issue is not None:
+            return False
+        if self._pending_close_is_fence:
+            return self._pending_close_tail_candidate or self._pending_run_is_fence_close()
+        return self._pending_close_run == width
+
     def classify_native_marker(
         self,
         marker: str,
@@ -659,8 +939,16 @@ class _QwenMarkerBoundaryTracker:
         *,
         verified: bool,
     ) -> _QwenMarkerDisposition:
-        if self._literal_context.marker_is_literal_now():
-            return _QwenMarkerDisposition.LITERAL
+        if self._literal_context.active_for_native_marker():
+            if not verified:
+                return _QwenMarkerDisposition.LITERAL
+            self._start_unresolved(marker, verified=verified)
+            if self._terminal_issue is not None:
+                return _QwenMarkerDisposition.PENDING
+            if self._scan_pending_close(following_text, final=False):
+                self._clear_unresolved()
+                return _QwenMarkerDisposition.LITERAL
+            return _QwenMarkerDisposition.PENDING
 
         quote = self._last_content_character
         if quote in {"'", '"'}:
@@ -674,6 +962,34 @@ class _QwenMarkerBoundaryTracker:
         if not verified:
             return _QwenMarkerDisposition.FAIL_CLOSED
         return _QwenMarkerDisposition.STRUCTURAL
+
+    def resolve_pending_inline_native_marker(
+        self,
+        following_text: str,
+        *,
+        final: bool = False,
+    ) -> tuple[str, _QwenMarkerDisposition] | None:
+        pending = self._pending_inline_native_marker
+        if pending is None:
+            return None
+        marker, verified = pending
+        if self._terminal_issue is not None:
+            return marker, _QwenMarkerDisposition.PENDING
+        if self._scan_pending_close(following_text, final=final):
+            self._clear_unresolved()
+            return marker, _QwenMarkerDisposition.LITERAL
+        if self._terminal_issue is not None:
+            return marker, _QwenMarkerDisposition.PENDING
+        if final:
+            self._clear_unresolved()
+            if verified:
+                self._terminal_issue = ParserTerminalIssue(
+                    ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+                    ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+                )
+                return marker, _QwenMarkerDisposition.PENDING
+            return marker, _QwenMarkerDisposition.FAIL_CLOSED
+        return marker, _QwenMarkerDisposition.PENDING
 
     def resolve_pending_native_marker(
         self,
@@ -698,7 +1014,6 @@ class _QwenMarkerBoundaryTracker:
             if any(marker.startswith(suffix) for marker in _PLAIN_MARKERS):
                 return text[:-width], suffix
         return text, ""
-
 
 def _is_pending_tool_candidate(text: str) -> bool:
     if "<tool_call>".startswith(text):
@@ -740,54 +1055,467 @@ def _parameter_value_json(value_text: str, *, string_parameter: bool = False) ->
     return canonical_json_dumps(value)
 
 
-def _find_parameter_close(text: str, value_start: int) -> int:
-    """Find an envelope close outside a double-quoted JSON/string literal."""
+class _QwenParameterCloseKind(Enum):
+    NONE = auto()
+    STRUCTURAL = auto()
+    TENTATIVE = auto()
+    AMBIGUOUS = auto()
+    MALFORMED = auto()
 
-    in_string = False
-    escaped = False
-    position = value_start
+
+@dataclass(frozen=True, slots=True)
+class _QwenParameterCloseDecision:
+    kind: _QwenParameterCloseKind
+    close_at: int = -1
+
+
+class _QwenParameterCandidateStage(Enum):
+    AFTER_PARAMETER = auto()
+    AFTER_FUNCTION = auto()
+    AFTER_TOOL = auto()
+    AFTER_NEXT_TOOL = auto()
+
+
+@dataclass(slots=True)
+class _QwenParameterScanState:
+    value_start: int
+    cursor: int
+    in_string: bool = False
+    escaped: bool = False
+    first_full_close: int | None = None
+    multiple_full_closes: bool = False
+    pending_close_at: int | None = None
+    pending_probe_cursor: int | None = None
+    pending_stage: _QwenParameterCandidateStage | None = None
+    pending_full_close_end: int | None = None
+
+
+def _record_qwen_full_close(state: _QwenParameterScanState, close_at: int) -> None:
+    if state.first_full_close is None:
+        state.first_full_close = close_at
+    elif state.first_full_close != close_at:
+        state.multiple_full_closes = True
+
+
+def _clear_qwen_parameter_candidate(state: _QwenParameterScanState) -> None:
+    state.pending_close_at = None
+    state.pending_probe_cursor = None
+    state.pending_stage = None
+    state.pending_full_close_end = None
+
+
+def _skip_pending_qwen_whitespace(text: str, state: _QwenParameterScanState) -> int:
+    assert state.pending_probe_cursor is not None
+    position = state.pending_probe_cursor
+    while position < len(text) and text[position].isspace():
+        position += 1
+    state.pending_probe_cursor = position
+    return position
+
+
+def _qwen_candidate_becomes_raw(
+    state: _QwenParameterScanState,
+    *,
+    resume_at: int,
+) -> None:
+    _clear_qwen_parameter_candidate(state)
+    state.cursor = resume_at
+
+
+def _qwen_candidate_becomes_full_close(
+    state: _QwenParameterScanState,
+    *,
+    resume_at: int,
+) -> None:
+    assert state.pending_close_at is not None
+    _record_qwen_full_close(state, state.pending_close_at)
+    _clear_qwen_parameter_candidate(state)
+    state.cursor = resume_at
+
+
+def _qwen_suffix_after_full_close(text: str, close_at: int) -> str | None:
+    position = close_at + len(_PARAMETER_CLOSE)
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if not text.startswith(_FUNCTION_CLOSE, position):
+        return None
+    position += len(_FUNCTION_CLOSE)
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if not text.startswith(_TOOL_CLOSE, position):
+        return None
+    return text[position + len(_TOOL_CLOSE) :]
+
+
+def _qwen_full_close_chain_end(text: str, close_at: int) -> int | None:
+    position = close_at + len(_PARAMETER_CLOSE)
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if not text.startswith(_FUNCTION_CLOSE, position):
+        return None
+    position += len(_FUNCTION_CLOSE)
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if not text.startswith(_TOOL_CLOSE, position):
+        return None
+    return position + len(_TOOL_CLOSE)
+
+
+def _qwen_first_complete_tool_end(
+    text: str,
+    *,
+    work_remaining: int,
+) -> tuple[int | None, int]:
+    search_at = 0
+    while True:
+        close_at = text.find(_TOOL_CLOSE, search_at)
+        if close_at < 0:
+            return None, work_remaining
+        candidate_end = close_at + len(_TOOL_CLOSE)
+        candidate = text[:candidate_end]
+        work_remaining -= len(candidate)
+        if work_remaining < 0:
+            return None, work_remaining
+
+        probe = _QwenToolCallParser(
+            "qwen-suffix-tool-probe",
+            0,
+            {},
+            allow_suffix_adjudication=False,
+        )
+        result = probe.feed(candidate)
+        if not result.closed:
+            result = probe.finish()
+        if (
+            result.closed
+            and result.completed_call
+            and not result.incomplete
+            and not result.remainder
+        ):
+            return candidate_end, work_remaining
+        search_at = candidate_end
+
+
+def _qwen_suffix_is_clean_top_level_continuation(text: str, close_at: int) -> bool:
+    suffix = _qwen_suffix_after_full_close(text, close_at)
+    if suffix is None:
+        return False
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if suffix_bytes > _QWEN_AMBIGUOUS_SUFFIX_MAX_BYTES:
+        return False
+
+    work_remaining = max(1, len(suffix)) * _QWEN_AMBIGUOUS_SUFFIX_WORK_FACTOR
+    boundary = _QwenMarkerBoundaryTracker()
+    cursor = 0
+    while cursor < len(suffix):
+        marker_at = suffix.find("<", cursor)
+        if marker_at < 0:
+            boundary.observe_content(suffix[cursor:])
+            return True
+
+        work_remaining -= marker_at - cursor + 1
+        if work_remaining < 0:
+            return False
+        boundary.observe_content(suffix[cursor:marker_at])
+
+        if suffix.startswith(_PARAMETER_CLOSE, marker_at):
+            disposition = boundary.classify_plain_marker(
+                suffix[marker_at:],
+                _PARAMETER_CLOSE,
+                final=True,
+            )
+            if disposition in {_QwenMarkerDisposition.PENDING, _QwenMarkerDisposition.FAIL_CLOSED}:
+                return False
+            if (
+                disposition is _QwenMarkerDisposition.STRUCTURAL
+                and _qwen_full_close_chain_end(suffix, marker_at) is not None
+            ):
+                return False
+            boundary.observe_content(_PARAMETER_CLOSE)
+            cursor = marker_at + len(_PARAMETER_CLOSE)
+            continue
+
+        if suffix.startswith(_TOOL_OPEN, marker_at):
+            disposition = boundary.classify_plain_marker(
+                suffix[marker_at:],
+                _TOOL_OPEN,
+                final=True,
+            )
+            if disposition in {_QwenMarkerDisposition.PENDING, _QwenMarkerDisposition.FAIL_CLOSED}:
+                return False
+            if disposition is _QwenMarkerDisposition.LITERAL:
+                boundary.observe_content(_TOOL_OPEN)
+                cursor = marker_at + len(_TOOL_OPEN)
+                continue
+
+            after_marker = suffix[marker_at + len(_TOOL_OPEN) :]
+            candidate = after_marker.lstrip()
+            if not candidate or (
+                _FUNCTION_OPEN.startswith(candidate) and not candidate.startswith(_FUNCTION_OPEN)
+            ):
+                return False
+            if not candidate.startswith(_FUNCTION_OPEN):
+                boundary.observe_content(_TOOL_OPEN)
+                cursor = marker_at + len(_TOOL_OPEN)
+                continue
+
+            tool_end, work_remaining = _qwen_first_complete_tool_end(
+                after_marker,
+                work_remaining=work_remaining,
+            )
+            if tool_end is None:
+                return False
+            cursor = marker_at + len(_TOOL_OPEN) + tool_end
+            continue
+
+        boundary.observe_content("<")
+        cursor = marker_at + 1
+
+    return True
+
+
+def _resume_qwen_parameter_candidate(
+    text: str,
+    state: _QwenParameterScanState,
+    *,
+    current_parameter_name: str,
+    seen_parameter_names: frozenset[str],
+    declared_parameter_names: frozenset[str],
+    declared_names_exhaustive: bool,
+    final: bool,
+) -> _QwenParameterCloseDecision | None:
+    """Advance one pending close candidate without rescanning earlier whitespace."""
+
+    assert state.pending_close_at is not None
+    assert state.pending_stage is not None
+    while True:
+        position = _skip_pending_qwen_whitespace(text, state)
+        remainder = text[position:]
+
+        if state.pending_stage is _QwenParameterCandidateStage.AFTER_PARAMETER:
+            if not remainder:
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            if remainder.startswith(_PARAMETER_OPEN):
+                name_start = position + len(_PARAMETER_OPEN)
+                header_end = text.find(">", name_start)
+                if header_end < 0:
+                    return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+                next_name = text[name_start:header_end]
+                if _valid_tag_name(next_name):
+                    if next_name == current_parameter_name or next_name in seen_parameter_names:
+                        return _QwenParameterCloseDecision(_QwenParameterCloseKind.MALFORMED)
+                    if declared_names_exhaustive and next_name not in declared_parameter_names:
+                        resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
+                        _qwen_candidate_becomes_raw(state, resume_at=resume_at)
+                        return None
+                    return _QwenParameterCloseDecision(
+                        _QwenParameterCloseKind.STRUCTURAL,
+                        state.pending_close_at,
+                    )
+                resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
+                _qwen_candidate_becomes_raw(state, resume_at=resume_at)
+                return None
+            if _PARAMETER_OPEN.startswith(remainder):
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            if remainder.startswith(_FUNCTION_CLOSE):
+                state.pending_probe_cursor = position + len(_FUNCTION_CLOSE)
+                state.pending_stage = _QwenParameterCandidateStage.AFTER_FUNCTION
+                continue
+            if _FUNCTION_CLOSE.startswith(remainder):
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
+            _qwen_candidate_becomes_raw(state, resume_at=resume_at)
+            return None
+
+        if state.pending_stage is _QwenParameterCandidateStage.AFTER_FUNCTION:
+            if not remainder:
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            if remainder.startswith(_TOOL_CLOSE):
+                state.pending_full_close_end = position + len(_TOOL_CLOSE)
+                state.pending_probe_cursor = state.pending_full_close_end
+                state.pending_stage = _QwenParameterCandidateStage.AFTER_TOOL
+                continue
+            if _TOOL_CLOSE.startswith(remainder):
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
+            _qwen_candidate_becomes_raw(state, resume_at=resume_at)
+            return None
+
+        if state.pending_stage is _QwenParameterCandidateStage.AFTER_TOOL:
+            if not remainder:
+                if final:
+                    _qwen_candidate_becomes_full_close(state, resume_at=len(text))
+                    return None
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            if remainder.startswith(_TOOL_OPEN):
+                state.pending_probe_cursor = position + len(_TOOL_OPEN)
+                state.pending_stage = _QwenParameterCandidateStage.AFTER_NEXT_TOOL
+                continue
+            if _TOOL_OPEN.startswith(remainder):
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+            _qwen_candidate_becomes_full_close(state, resume_at=position)
+            return None
+
+        if not remainder:
+            if final:
+                assert state.pending_full_close_end is not None
+                _qwen_candidate_becomes_full_close(
+                    state,
+                    resume_at=state.pending_full_close_end,
+                )
+                return None
+            return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+        if remainder.startswith(_FUNCTION_OPEN):
+            name_start = position + len(_FUNCTION_OPEN)
+            header_end = text.find(">", name_start)
+            if header_end < 0 and not final:
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+        elif _FUNCTION_OPEN.startswith(remainder):
+            return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+        assert state.pending_full_close_end is not None
+        _qwen_candidate_becomes_full_close(
+            state,
+            resume_at=state.pending_full_close_end,
+        )
+        return None
+
+
+def _scan_qwen_parameter_close(
+    text: str,
+    state: _QwenParameterScanState,
+    *,
+    current_parameter_name: str,
+    seen_parameter_names: frozenset[str],
+    declared_parameter_names: frozenset[str],
+    declared_names_exhaustive: bool,
+    allow_suffix_adjudication: bool,
+    final: bool,
+) -> _QwenParameterCloseDecision:
+    """Incrementally resolve Qwen raw-parameter close precedence."""
+
+    if state.pending_close_at is not None:
+        decision = _resume_qwen_parameter_candidate(
+            text,
+            state,
+            current_parameter_name=current_parameter_name,
+            seen_parameter_names=seen_parameter_names,
+            declared_parameter_names=declared_parameter_names,
+            declared_names_exhaustive=declared_names_exhaustive,
+            final=final,
+        )
+        if decision is not None:
+            return decision
+
+    position = state.cursor
     while position < len(text):
         character = text[position]
-        if in_string:
-            if escaped:
-                escaped = False
+        if state.in_string:
+            if state.escaped:
+                state.escaped = False
             elif character == "\\":
-                escaped = True
+                state.escaped = True
             elif character == '"':
-                in_string = False
+                state.in_string = False
             position += 1
+            state.cursor = position
             continue
         if character == '"':
-            in_string = True
+            state.in_string = True
             position += 1
+            state.cursor = position
             continue
-        if text.startswith(_PARAMETER_CLOSE, position):
-            return position
-        position += 1
-    return -1
+
+        remainder = text[position:]
+        if _PARAMETER_CLOSE.startswith(remainder) and len(remainder) < len(_PARAMETER_CLOSE):
+            if final:
+                state.cursor = len(text)
+                break
+            state.cursor = position
+            return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+        if not text.startswith(_PARAMETER_CLOSE, position):
+            position += 1
+            state.cursor = position
+            continue
+
+        state.pending_close_at = position
+        state.pending_probe_cursor = position + len(_PARAMETER_CLOSE)
+        state.pending_stage = _QwenParameterCandidateStage.AFTER_PARAMETER
+        decision = _resume_qwen_parameter_candidate(
+            text,
+            state,
+            current_parameter_name=current_parameter_name,
+            seen_parameter_names=seen_parameter_names,
+            declared_parameter_names=declared_parameter_names,
+            declared_names_exhaustive=declared_names_exhaustive,
+            final=final,
+        )
+        if decision is not None:
+            return decision
+        position = state.cursor
+
+    if state.first_full_close is not None:
+        if final:
+            if state.multiple_full_closes:
+                if allow_suffix_adjudication and _qwen_suffix_is_clean_top_level_continuation(
+                    text,
+                    state.first_full_close,
+                ):
+                    return _QwenParameterCloseDecision(
+                        _QwenParameterCloseKind.STRUCTURAL,
+                        state.first_full_close,
+                    )
+                return _QwenParameterCloseDecision(_QwenParameterCloseKind.AMBIGUOUS)
+            return _QwenParameterCloseDecision(
+                _QwenParameterCloseKind.STRUCTURAL,
+                state.first_full_close,
+            )
+        return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
+    return _QwenParameterCloseDecision(_QwenParameterCloseKind.NONE)
 
 
-def _qwen_string_parameters(tool_policy: ToolPolicy | None) -> dict[str, frozenset[str]]:
+@dataclass(frozen=True, slots=True)
+class _QwenParameterTyping:
+    declared_names: frozenset[str]
+    string_names: frozenset[str]
+    dynamic_string: bool
+    declared_names_exhaustive: bool
+
+
+def _qwen_parameter_typing(tool_policy: ToolPolicy | None) -> dict[str, _QwenParameterTyping]:
     if tool_policy is None:
         return {}
 
-    result: dict[str, frozenset[str]] = {}
+    result: dict[str, _QwenParameterTyping] = {}
     for tool in tool_policy.tools:
         schema = parse_json_strict(tool.parameters.canonical_json)
         if not isinstance(schema, dict):
             continue
         properties = schema.get("properties")
-        if not isinstance(properties, dict):
-            continue
-        names = frozenset(
+        declared_names = frozenset(
+            name for name in properties if isinstance(name, str)
+        ) if isinstance(properties, dict) else frozenset()
+        string_names = frozenset(
             name
             for name, property_schema in properties.items()
-            if isinstance(name, str)
+            if isinstance(properties, dict)
+            and isinstance(name, str)
             and isinstance(property_schema, dict)
             and property_schema.get("type") == "string"
+        ) if isinstance(properties, dict) else frozenset()
+        additional = schema.get("additionalProperties")
+        dynamic_string = isinstance(additional, dict) and additional.get("type") == "string"
+        pattern_properties = schema.get("patternProperties")
+        declared_names_exhaustive = additional is False and (
+            pattern_properties is None
+            or (isinstance(pattern_properties, dict) and not pattern_properties)
         )
-        if names:
-            result[tool.name] = names
+        if declared_names or dynamic_string or declared_names_exhaustive:
+            result[tool.name] = _QwenParameterTyping(
+                declared_names=declared_names,
+                string_names=string_names,
+                dynamic_string=dynamic_string,
+                declared_names_exhaustive=declared_names_exhaustive,
+            )
     return result
 
 
@@ -800,6 +1528,13 @@ class _QwenToolFeedResult:
     incomplete: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _QwenNativeReplaySegment:
+    text: str
+    verified_marker: str | None = None
+    native_id: int | None = None
+
+
 class _QwenToolCallParser:
     """Parse exactly one Qwen native Tool Call envelope."""
 
@@ -807,16 +1542,21 @@ class _QwenToolCallParser:
         self,
         request_id: str,
         index: int,
-        string_parameters: dict[str, frozenset[str]],
+        parameter_typing: dict[str, _QwenParameterTyping],
+        *,
+        allow_suffix_adjudication: bool = True,
     ) -> None:
         self._request_id = request_id
         self._index = index
-        self._string_parameters = dict(string_parameters)
+        self._parameter_typing = dict(parameter_typing)
+        self._allow_suffix_adjudication = allow_suffix_adjudication
         self._buffer = ""
         self._state = _QwenToolState.FUNCTION
         self._name: str | None = None
         self._call_id: str | None = None
         self._started = False
+        self._seen_parameter_names: set[str] = set()
+        self._parameter_scan: _QwenParameterScanState | None = None
         self._argument_parts: list[str] = []
         self._arguments_json: str | None = None
         self._closed = False
@@ -895,7 +1635,7 @@ class _QwenToolCallParser:
         self._state = _QwenToolState.PARAMETERS
         return True
 
-    def _process_parameters(self, events: list[GenerationEvent]) -> bool:
+    def _process_parameters(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
         if self._consume_whitespace():
             return True
         if not self._buffer:
@@ -913,18 +1653,47 @@ class _QwenToolCallParser:
             if header_end < 0:
                 return False
             parameter_name = self._buffer[len(_PARAMETER_OPEN) : header_end]
-            if not _valid_tag_name(parameter_name):
+            if not _valid_tag_name(parameter_name) or parameter_name in self._seen_parameter_names:
                 self._mark_malformed()
                 return True
 
             value_start = header_end + 1
-            close_at = _find_parameter_close(self._buffer, value_start)
-            if close_at < 0:
-                return False
             assert self._name is not None
-            string_parameter = parameter_name in self._string_parameters.get(
-                self._name, frozenset()
+            if self._parameter_scan is None:
+                self._parameter_scan = _QwenParameterScanState(value_start, value_start)
+            elif self._parameter_scan.value_start != value_start:
+                raise RuntimeError("Qwen parameter scan state does not match the active parameter")
+            typing = self._parameter_typing.get(self._name)
+            decision = _scan_qwen_parameter_close(
+                self._buffer,
+                self._parameter_scan,
+                current_parameter_name=parameter_name,
+                seen_parameter_names=frozenset(self._seen_parameter_names),
+                declared_parameter_names=(
+                    frozenset() if typing is None else typing.declared_names
+                ),
+                declared_names_exhaustive=(
+                    False if typing is None else typing.declared_names_exhaustive
+                ),
+                allow_suffix_adjudication=self._allow_suffix_adjudication,
+                final=final,
             )
+            if decision.kind in {_QwenParameterCloseKind.NONE, _QwenParameterCloseKind.TENTATIVE}:
+                return False
+            if decision.kind is _QwenParameterCloseKind.AMBIGUOUS:
+                self.finish_incomplete()
+                return True
+            if decision.kind is _QwenParameterCloseKind.MALFORMED:
+                self._mark_malformed()
+                return True
+
+            close_at = decision.close_at
+            if typing is None:
+                string_parameter = False
+            elif parameter_name in typing.declared_names:
+                string_parameter = parameter_name in typing.string_names
+            else:
+                string_parameter = typing.dynamic_string
             value_json = _parameter_value_json(
                 self._buffer[value_start:close_at],
                 string_parameter=string_parameter,
@@ -932,9 +1701,11 @@ class _QwenToolCallParser:
             prefix = "{" if not self._argument_parts else ","
             fragment = f"{prefix}{canonical_json_dumps(parameter_name)}:{value_json}"
             self._ensure_started(events)
+            self._seen_parameter_names.add(parameter_name)
             self._argument_parts.append(fragment)
             self._emit_delta(fragment, events)
             self._buffer = self._buffer[close_at + len(_PARAMETER_CLOSE) :]
+            self._parameter_scan = None
             return True
         if _PARAMETER_OPEN.startswith(self._buffer):
             return False
@@ -979,23 +1750,20 @@ class _QwenToolCallParser:
         self._closed = True
         return True
 
-    def _process(self, events: list[GenerationEvent]) -> bool:
+    def _process(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
         if self._state is _QwenToolState.FUNCTION:
             return self._process_function()
         if self._state is _QwenToolState.PARAMETERS:
-            return self._process_parameters(events)
+            return self._process_parameters(events, final=final)
         if self._state is _QwenToolState.OUTER:
             return self._process_outer(events)
         return self._process_malformed()
 
-    def feed(self, text: str) -> _QwenToolFeedResult:
-        if self._closed:
-            raise RuntimeError("cannot feed a closed Qwen Tool Call parser")
-        self._buffer += text
-        events: list[GenerationEvent] = []
-        while not self._closed and self._process(events):
-            pass
+    @property
+    def buffered_text_length(self) -> int:
+        return len(self._buffer)
 
+    def _result(self, events: list[GenerationEvent]) -> _QwenToolFeedResult:
         remainder = ""
         if self._closed:
             remainder = self._buffer
@@ -1007,6 +1775,25 @@ class _QwenToolCallParser:
             self._completed_call,
             self._incomplete,
         )
+
+    def feed(self, text: str) -> _QwenToolFeedResult:
+        if self._closed:
+            raise RuntimeError("cannot feed a closed Qwen Tool Call parser")
+        self._buffer += text
+        events: list[GenerationEvent] = []
+        while not self._closed and self._process(events):
+            pass
+        return self._result(events)
+
+    def finish(self) -> _QwenToolFeedResult:
+        if self._closed:
+            return self._result([])
+        events: list[GenerationEvent] = []
+        while not self._closed and self._process(events, final=True):
+            pass
+        if not self._closed:
+            self.finish_incomplete()
+        return self._result(events)
 
     def finish_incomplete(self) -> None:
         if self._closed:
@@ -1034,7 +1821,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             raise TypeError("start_in_reasoning must be a bool")
         if tool_policy is not None and not isinstance(tool_policy, ToolPolicy):
             raise TypeError("tool_policy must be a ToolPolicy or None")
-        self._string_parameters = _qwen_string_parameters(tool_policy)
+        self._parameter_typing = _qwen_parameter_typing(tool_policy)
         self._request_id = request_id
         self._buffer = ""
         self._mode = _QwenMode.REASONING if start_in_reasoning else _QwenMode.TEXT
@@ -1045,9 +1832,22 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._call_index = 0
         self._tool_return_mode = _QwenMode.TEXT
         self._tool_parser: _QwenToolCallParser | None = None
+        self._tool_native_segments: list[_QwenNativeReplaySegment] = []
+        self._pending_native_replay: tuple[_QwenNativeReplaySegment, ...] = ()
+        self._pending_inline_native_chunks: list[
+            tuple[str, tuple[NativeTokenSpan, ...] | None]
+        ] = []
         self._had_incomplete_tool = False
         self._marker_boundaries = _QwenMarkerBoundaryTracker()
         self._finished = False
+
+    @property
+    def early_terminal_issue(self) -> ParserTerminalIssue | None:
+        return self._marker_boundaries.terminal_issue
+
+    @property
+    def peak_semantic_hold_bytes(self) -> int:
+        return self._marker_boundaries.peak_held_bytes
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
@@ -1086,8 +1886,9 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._tool_parser = _QwenToolCallParser(
             self._request_id,
             self._call_index,
-            self._string_parameters,
+            self._parameter_typing,
         )
+        self._tool_native_segments = []
 
     def _restore_after_tool(self) -> None:
         self._mode = self._tool_return_mode
@@ -1099,7 +1900,63 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             parser.finish_incomplete()
         self._had_incomplete_tool = True
         self._buffer = ""
+        self._tool_native_segments = []
+        self._pending_native_replay = ()
         self._restore_after_tool()
+
+    def _record_tool_native_segment(
+        self,
+        text: str,
+        verified_marker: str | None,
+        native_id: int | None,
+    ) -> None:
+        if not text:
+            return
+        segment = _QwenNativeReplaySegment(text, verified_marker, native_id)
+        if (
+            verified_marker is None
+            and self._tool_native_segments
+            and self._tool_native_segments[-1].verified_marker is None
+        ):
+            previous = self._tool_native_segments[-1]
+            self._tool_native_segments[-1] = _QwenNativeReplaySegment(previous.text + text)
+            return
+        self._tool_native_segments.append(segment)
+
+    def _trim_tool_native_segments(self, keep_suffix: int) -> None:
+        if keep_suffix <= 0:
+            self._tool_native_segments = []
+            return
+        total = sum(len(segment.text) for segment in self._tool_native_segments)
+        if keep_suffix >= total:
+            return
+        remove = total - keep_suffix
+        trimmed: list[_QwenNativeReplaySegment] = []
+        for segment in self._tool_native_segments:
+            if remove >= len(segment.text):
+                remove -= len(segment.text)
+                continue
+            if remove:
+                trimmed.append(_QwenNativeReplaySegment(segment.text[remove:]))
+                remove = 0
+            else:
+                trimmed.append(segment)
+        self._tool_native_segments = trimmed
+
+    def _capture_native_remainder(self, remainder: str) -> bool:
+        self._trim_tool_native_segments(len(remainder))
+        if not remainder or not self._tool_native_segments:
+            self._tool_native_segments = []
+            return False
+        if "".join(segment.text for segment in self._tool_native_segments) != remainder:
+            self._tool_native_segments = []
+            return False
+        if not any(segment.verified_marker is not None for segment in self._tool_native_segments):
+            self._tool_native_segments = []
+            return False
+        self._pending_native_replay = tuple(self._tool_native_segments)
+        self._tool_native_segments = []
+        return True
 
     def _process_plain(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
         match: tuple[int, str] | None = None
@@ -1167,14 +2024,31 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         result = parser.feed(text)
         events.extend(result.events)
         if not result.closed:
+            self._trim_tool_native_segments(parser.buffered_text_length)
             return False
         if result.incomplete:
             self._had_incomplete_tool = True
         if result.completed_call:
             self._call_index += 1
+        native_remainder = self._capture_native_remainder(result.remainder)
         self._restore_after_tool()
-        self._buffer = result.remainder
+        self._buffer = "" if native_remainder else result.remainder
         return True
+
+    def _finish_tool(self, events: list[GenerationEvent]) -> bool:
+        parser = self._tool_parser
+        if parser is None:
+            raise RuntimeError("Qwen Tool Call mode requires an active Tool Call parser")
+        result = parser.finish()
+        events.extend(result.events)
+        if result.incomplete:
+            self._had_incomplete_tool = True
+        if result.completed_call:
+            self._call_index += 1
+        native_remainder = self._capture_native_remainder(result.remainder)
+        self._restore_after_tool()
+        self._buffer = "" if native_remainder else result.remainder
+        return result.incomplete
 
     def _apply_native_marker(self, marker: str, events: list[GenerationEvent]) -> None:
         if marker == "<tool_call>":
@@ -1211,12 +2085,83 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             )
         self._apply_native_marker(marker, events)
 
-    def _feed_native_text_segment(self, text: str, events: list[GenerationEvent]) -> None:
+    @staticmethod
+    def _native_replay_chunk(
+        segments: tuple[_QwenNativeReplaySegment, ...],
+    ) -> tuple[str, tuple[NativeTokenSpan, ...]]:
+        parts: list[str] = []
+        spans: list[NativeTokenSpan] = []
+        cursor = 0
+        for segment in segments:
+            parts.append(segment.text)
+            marker = segment.verified_marker
+            if marker is not None:
+                native_id = segment.native_id
+                if native_id is None or segment.text != marker:
+                    raise RuntimeError("Qwen replay marker lost native provenance")
+                spans.append(
+                    NativeTokenSpan(
+                        cursor,
+                        cursor + len(segment.text),
+                        native_id,
+                        segment.text,
+                    )
+                )
+            cursor += len(segment.text)
+        return "".join(parts), tuple(spans)
+
+    def _drain_pending_native_replay(self, events: list[GenerationEvent]) -> None:
+        while self._pending_native_replay:
+            segments = self._pending_native_replay
+            self._pending_native_replay = ()
+            for index, segment in enumerate(segments):
+                marker = segment.verified_marker
+                if marker is None:
+                    self._feed_native_text_segment(segment.text, events, _drain_replay=False)
+                elif self._mode is _QwenMode.TOOL:
+                    self._feed_native_text_segment(
+                        segment.text,
+                        events,
+                        verified_marker=marker,
+                        native_id=segment.native_id,
+                        _drain_replay=False,
+                    )
+                else:
+                    following_text = "".join(item.text for item in segments[index + 1 :])
+                    disposition = self._handle_marker_candidate(
+                        marker,
+                        following_text,
+                        events,
+                        verified=True,
+                    )
+                    if (
+                        disposition is _QwenMarkerDisposition.PENDING
+                        and self._marker_boundaries.has_pending_inline_native_marker
+                    ):
+                        remainder_segments = segments[index + 1 :]
+                        self._pending_native_replay = ()
+                        if self._marker_boundaries.terminal_issue is None and remainder_segments:
+                            held_text, held_spans = self._native_replay_chunk(remainder_segments)
+                            self._buffer_pending_inline_native_chunk(held_text, held_spans)
+                        return
+                if self._pending_native_replay:
+                    self._drain_pending_native_replay(events)
+
+    def _feed_native_text_segment(
+        self,
+        text: str,
+        events: list[GenerationEvent],
+        *,
+        verified_marker: str | None = None,
+        native_id: int | None = None,
+        _drain_replay: bool = True,
+    ) -> None:
         if not text:
             return
         if self._mode is not _QwenMode.TOOL:
             self._emit_content(text, events)
             return
+        self._record_tool_native_segment(text, verified_marker, native_id)
         self._buffer += text
         while self._mode is _QwenMode.TOOL and self._process_tool(events):
             pass
@@ -1224,6 +2169,106 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             remainder = self._buffer
             self._buffer = ""
             self._emit_content(remainder, events)
+        if _drain_replay and self._pending_native_replay:
+            self._drain_pending_native_replay(events)
+
+    @staticmethod
+    def _validate_native_spans(
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+    ) -> None:
+        if native_token_spans is None:
+            return
+        cursor = 0
+        for span in native_token_spans:
+            if not isinstance(span, NativeTokenSpan):
+                raise TypeError("native_token_spans must contain NativeTokenSpan values")
+            if span.start < cursor or span.end > len(chunk) or chunk[span.start : span.end] != span.text:
+                raise ValueError("native token spans do not match the supplied chunk")
+            cursor = span.end
+
+    @staticmethod
+    def _slice_native_suffix(
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+        start: int,
+    ) -> tuple[str, tuple[NativeTokenSpan, ...] | None]:
+        suffix = chunk[start:]
+        if native_token_spans is None:
+            return suffix, None
+        spans: list[NativeTokenSpan] = []
+        for span in native_token_spans:
+            if span.end <= start:
+                continue
+            if span.start < start:
+                raise ValueError("native token span crosses a deferred Qwen marker boundary")
+            spans.append(
+                NativeTokenSpan(
+                    span.start - start,
+                    span.end - start,
+                    span.token_id,
+                    span.text,
+                )
+            )
+        return suffix, tuple(spans)
+
+    def _buffer_pending_inline_native_chunk(
+        self,
+        chunk: str,
+        native_token_spans: tuple[NativeTokenSpan, ...] | None,
+    ) -> None:
+        self._validate_native_spans(chunk, native_token_spans)
+        if chunk:
+            self._pending_inline_native_chunks.append((chunk, native_token_spans))
+
+    def _resolve_pending_inline_native_marker(
+        self,
+        events: list[GenerationEvent],
+        following_text: str = "",
+        native_token_spans: tuple[NativeTokenSpan, ...] | None = None,
+        *,
+        final: bool = False,
+    ) -> bool:
+        self._validate_native_spans(following_text, native_token_spans)
+        resolved = self._marker_boundaries.resolve_pending_inline_native_marker(
+            following_text,
+            final=final,
+        )
+        if resolved is None:
+            return False
+        marker, disposition = resolved
+        if disposition is _QwenMarkerDisposition.PENDING:
+            if self._marker_boundaries.terminal_issue is not None:
+                self._pending_inline_native_chunks = []
+                self._pending_native_replay = ()
+                return False
+            if following_text and not final:
+                self._buffer_pending_inline_native_chunk(following_text, native_token_spans)
+            return False
+
+        if disposition is not _QwenMarkerDisposition.LITERAL:
+            raise RuntimeError("Qwen semantic barrier may only resolve as literal")
+
+        consumed = self._marker_boundaries.last_scan_consumed_characters
+        if consumed < 0 or consumed > len(following_text):
+            raise RuntimeError("Qwen semantic barrier returned an invalid replay boundary")
+        held_prefix = following_text[:consumed]
+        held_text = "".join(chunk for chunk, _ in self._pending_inline_native_chunks) + held_prefix
+        self._pending_inline_native_chunks = []
+        self._pending_native_replay = ()
+
+        # The entire disputed region is now proven literal. Commit it atomically to the
+        # current semantic channel; no verified marker inside this region may execute.
+        self._emit_content(marker + held_text, events)
+
+        remainder, remainder_spans = self._slice_native_suffix(
+            following_text,
+            native_token_spans,
+            consumed,
+        )
+        if remainder:
+            events.extend(self.feed_with_native_tokens(remainder, remainder_spans))
+        return True
 
     def _resolve_pending_native_marker(
         self,
@@ -1243,13 +2288,14 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         events: list[GenerationEvent],
         *,
         verified: bool,
-    ) -> None:
+    ) -> _QwenMarkerDisposition:
         disposition = self._marker_boundaries.classify_native_marker(
             marker,
             following_text,
             verified=verified,
         )
         self._apply_marker_disposition(marker, disposition, events)
+        return disposition
 
     def _resolve_unverified_marker_prefix(
         self,
@@ -1312,7 +2358,18 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 cursor = position + len(marker)
                 continue
             following_text = chunk[position + len(marker) :]
-            self._handle_marker_candidate(marker, following_text, events, verified=False)
+            disposition = self._handle_marker_candidate(
+                marker,
+                following_text,
+                events,
+                verified=False,
+            )
+            if (
+                disposition is _QwenMarkerDisposition.PENDING
+                and self._marker_boundaries.has_pending_inline_native_marker
+            ):
+                self._buffer_pending_inline_native_chunk(following_text, None)
+                return
             cursor = position + len(marker)
 
     def feed_with_native_tokens(
@@ -1328,6 +2385,10 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             raise TypeError("native_token_spans must be a tuple or None")
 
         events: list[GenerationEvent] = []
+        if self._marker_boundaries.has_pending_inline_native_marker:
+            self._resolve_pending_inline_native_marker(events, chunk, native_token_spans)
+            return tuple(events)
+
         self._resolve_pending_native_marker(chunk, events)
         prefix_consumed = self._resolve_unverified_marker_prefix(chunk, events)
         if prefix_consumed == len(chunk):
@@ -1344,14 +2405,33 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 raise ValueError("native token spans do not match the supplied chunk")
             self._feed_native_text_segment(chunk[cursor : span.start], events)
             if self._mode is _QwenMode.TOOL or span.text not in _PLAIN_MARKERS:
-                self._feed_native_text_segment(span.text, events)
+                self._feed_native_text_segment(
+                    span.text,
+                    events,
+                    verified_marker=span.text if span.text in _PLAIN_MARKERS else None,
+                    native_id=span.token_id if span.text in _PLAIN_MARKERS else None,
+                )
             else:
-                self._handle_marker_candidate(
+                disposition = self._handle_marker_candidate(
                     span.text,
                     chunk[span.end :],
                     events,
                     verified=True,
                 )
+                if (
+                    disposition is _QwenMarkerDisposition.PENDING
+                    and self._marker_boundaries.has_pending_inline_native_marker
+                ):
+                    if self._marker_boundaries.terminal_issue is not None:
+                        self._pending_inline_native_chunks = []
+                        return tuple(events)
+                    suffix, suffix_spans = self._slice_native_suffix(
+                        chunk,
+                        native_token_spans,
+                        span.end,
+                    )
+                    self._buffer_pending_inline_native_chunk(suffix, suffix_spans)
+                    return tuple(events)
             cursor = span.end
         self._feed_native_text_segment(chunk[cursor:], events)
         return tuple(events)
@@ -1374,7 +2454,12 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
 
     def finish(self) -> QwenParserFinish:
         if self._finished:
-            return QwenParserFinish((), self._had_incomplete_tool)
+            terminal_issue = self._marker_boundaries.terminal_issue
+            return QwenParserFinish(
+                (),
+                False if terminal_issue is not None else self._had_incomplete_tool,
+                terminal_issue,
+            )
 
         events: list[GenerationEvent] = []
         pending_prefix = self._marker_boundaries.unverified_marker_prefix
@@ -1382,34 +2467,49 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             self._feed_native_text_segment(pending_prefix, events)
             self._marker_boundaries.clear_unverified_marker_prefix()
         self._resolve_pending_native_marker("", events)
-        if self._mode is _QwenMode.TOOL:
-            self._discard_incomplete_tool()
-        else:
-            while self._buffer:
-                progressed = (
-                    self._process_tool(events)
-                    if self._in_tool_mode()
-                    else self._process_plain(events, final=True)
-                )
-                if not progressed:
-                    break
+
+        while True:
+            if self._marker_boundaries.has_pending_inline_native_marker:
+                if self._resolve_pending_inline_native_marker(events, final=True):
+                    continue
+                terminal_issue = self._marker_boundaries.terminal_issue
+                if terminal_issue is None:
+                    raise RuntimeError("Qwen semantic barrier did not resolve at end of stream")
+                self._pending_inline_native_chunks = []
+                self._pending_native_replay = ()
+                self._close_current_channel(events)
+                self._finished = True
+                return QwenParserFinish(tuple(events), False, terminal_issue)
+            if self._pending_native_replay:
+                self._drain_pending_native_replay(events)
+                continue
             if self._in_tool_mode():
-                self._discard_incomplete_tool()
-            elif self._buffer:
-                quoted_partial_marker = (
-                    self._marker_boundaries.last_content_character in {"'", '"', "`"}
-                    and any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS)
-                )
-                if quoted_partial_marker:
-                    self._emit_content(self._buffer, events)
-                elif _TOOL_CLOSE.startswith(self._buffer) or _is_pending_tool_candidate(self._buffer):
-                    self._had_incomplete_tool = True
-                elif any(marker.startswith(self._buffer) for marker in ("<think>", "</think>")):
-                    pass
-                else:
-                    self._emit_content(self._buffer, events)
-                self._buffer = ""
-            self._close_current_channel(events)
+                if self._buffer and self._process_tool(events):
+                    continue
+                if self._in_tool_mode() and self._finish_tool(events):
+                    self._buffer = ""
+                    break
+                continue
+            if not self._buffer:
+                break
+            if not self._process_plain(events, final=True):
+                break
+
+        if not self._in_tool_mode() and self._buffer:
+            quoted_partial_marker = (
+                self._marker_boundaries.last_content_character in {"'", '"', "`"}
+                and any(marker.startswith(self._buffer) for marker in _PLAIN_MARKERS)
+            )
+            if quoted_partial_marker:
+                self._emit_content(self._buffer, events)
+            elif _TOOL_CLOSE.startswith(self._buffer) or _is_pending_tool_candidate(self._buffer):
+                self._had_incomplete_tool = True
+            elif any(marker.startswith(self._buffer) for marker in ("<think>", "</think>")):
+                pass
+            else:
+                self._emit_content(self._buffer, events)
+            self._buffer = ""
+        self._close_current_channel(events)
 
         self._finished = True
         return QwenParserFinish(tuple(events), self._had_incomplete_tool)

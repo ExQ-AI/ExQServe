@@ -101,3 +101,18 @@ def test_concurrent_admission_never_exceeds_capacity_and_never_queues() -> None:
         assert controller.in_flight == 0
 
     asyncio.run(scenario())
+
+
+def test_controller_close_can_claim_model_switch_origin() -> None:
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        session = await controller.submit(_request(1))
+
+        await controller.close(RequestTerminalReason.MODEL_SWITCH)
+
+        assert runtime.sessions[0].cancel_calls == 1
+        assert session.terminal_reason is RequestTerminalReason.MODEL_SWITCH
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())

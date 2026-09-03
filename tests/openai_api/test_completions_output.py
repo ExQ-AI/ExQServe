@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -122,6 +122,42 @@ def test_completions_failure_and_cancel_map_to_openai_errors() -> None:
     assert cancelled[0]["error"]["code"] == "generation_cancelled"  # type: ignore[index]
 
 
+def test_completions_stream_failure_keeps_standard_code_and_optional_cause() -> None:
+    error = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "tool_call_incomplete",
+        "Model output ended with an incomplete tool call.",
+        False,
+        FailureCause.OUTPUT_LENGTH,
+    )
+    payload = CompletionsStreamSerializer("m", response_id="cmpl_fact", created=1).feed(
+        GenerationFailed("r", error)
+    )[0]["error"]
+    assert payload["code"] == "tool_call_incomplete"  # type: ignore[index]
+    assert payload["exqserve_cause"] == "output_length"  # type: ignore[index]
+    assert payload["message"] == (  # type: ignore[index]
+        "Model output ended with an incomplete tool call."
+    )
+
+
+def test_completions_model_tool_output_invalid_keeps_standard_code_and_optional_cause() -> None:
+    error = CanonicalError(
+        ErrorCategory.MODEL_FAILURE,
+        "tool_call_invalid",
+        "Model produced an invalid tool call.",
+        False,
+        FailureCause.MODEL_TOOL_OUTPUT_INVALID,
+    )
+    payload = CompletionsStreamSerializer("m", response_id="cmpl_tool_invalid", created=1).feed(
+        GenerationFailed("r", error)
+    )[0]["error"]
+    assert payload["code"] == "tool_call_invalid"  # type: ignore[index]
+    assert payload["exqserve_cause"] == "model_tool_output_invalid"  # type: ignore[index]
+    assert payload["message"] == (  # type: ignore[index]
+        "Model produced an invalid tool call."
+    )
+
+
 def test_completions_accumulator_failure_raises_protocol_error() -> None:
     accumulator = CompletionsAccumulator("m", response_id="cmpl_f", created=1)
     accumulator.consume(
@@ -136,3 +172,15 @@ def test_completions_accumulator_failure_raises_protocol_error() -> None:
         assert getattr(exc, "code", None) == "bad_output"
     else:  # pragma: no cover - terminal invariant
         raise AssertionError("failed completion must raise")
+
+
+def test_completions_filter_keeps_existing_public_stop_mapping() -> None:
+    usage = TokenUsage(input_tokens=1, output_tokens=1)
+
+    stream = CompletionsStreamSerializer("m", response_id="cmpl_filter", created=1)
+    terminal = stream.feed(GenerationCompleted("r", CompletionReason.FILTER, usage))
+    assert terminal[0]["choices"][0]["finish_reason"] == "stop"
+
+    accumulator = CompletionsAccumulator("m", response_id="cmpl_filter", created=1)
+    accumulator.consume(GenerationCompleted("r", CompletionReason.FILTER, usage))
+    assert accumulator.result()["choices"][0]["finish_reason"] == "stop"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 
 from exqserve.agent.reasoning import (
     ReasoningBudgetMode,
@@ -31,10 +30,10 @@ from exqserve.core.items import (
 from exqserve.core.request import CanonicalRequest
 from exqserve.protocol.anthropic.common import ParsedAnthropicRequest, invalid_request
 from exqserve.runtime.contracts import RuntimeSamplingConfig
-from exqserve.serving.contracts import ServingRequest
+from exqserve.serving.contracts import MidSystemPolicy, ServingRequest
 
+CLAUDE_CODE_COMPATIBILITY_PROFILE = "claude-code"
 CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE = "claude-code-2.1.251"
-_CLAUDE_CODE_TOTAL_TOKENS = re.compile(r"^<total_tokens>[0-9]+ tokens left</total_tokens>$")
 
 
 def _object(value: object, message: str) -> dict[str, object]:
@@ -56,19 +55,6 @@ def _text_blocks(value: object, *, field: str) -> str:
             raise invalid_request(f"{field} supports text blocks only.")
         parts.append(text)
     return "".join(parts)
-
-
-def _claude_code_total_tokens_marker(value: object) -> bool:
-    text: str | None = None
-    if isinstance(value, str):
-        text = value
-    elif isinstance(value, list) and len(value) == 1:
-        block = value[0]
-        if isinstance(block, dict) and block.get("type") == "text":
-            candidate = block.get("text")
-            if isinstance(candidate, str):
-                text = candidate
-    return text is not None and _CLAUDE_CODE_TOTAL_TOKENS.fullmatch(text) is not None
 
 
 def _image_part(block: dict[str, object]) -> ImageContentPart:
@@ -206,14 +192,38 @@ def _parse_assistant_content(value: object, items: list[CanonicalItem]) -> None:
             raise invalid_request("Unsupported assistant content block type.")
 
 
+def _validate_mid_system_placement(messages: list[object]) -> None:
+    index = 0
+    while index < len(messages):
+        message = _object(messages[index], "messages must contain objects.")
+        if message.get("role") != "system":
+            index += 1
+            continue
+        if index == 0:
+            raise invalid_request("messages-level system sections cannot be the first message.")
+        previous = _object(messages[index - 1], "messages must contain objects.")
+        if previous.get("role") != "user":
+            raise invalid_request("messages-level system sections must immediately follow a user turn.")
+        end = index + 1
+        while end < len(messages):
+            candidate = _object(messages[end], "messages must contain objects.")
+            if candidate.get("role") != "system":
+                break
+            end += 1
+        if end < len(messages):
+            following = _object(messages[end], "messages must contain objects.")
+            if following.get("role") != "assistant":
+                raise invalid_request("messages-level system sections must be final or followed by an assistant turn.")
+        index = end
+
+
 def _parse_messages(
     value: object,
     system: object,
-    *,
-    compatibility_profile: str | None = None,
 ) -> tuple[CanonicalItem, ...]:
     if not isinstance(value, list) or not value:
         raise invalid_request("messages must be a non-empty array.")
+    _validate_mid_system_placement(value)
     items: list[CanonicalItem] = []
     if system is not None:
         items.append(MessageItem(MessageRole.SYSTEM, _text_blocks(system, field="system")))
@@ -224,17 +234,15 @@ def _parse_messages(
             _parse_user_content(message.get("content"), items)
         elif role == "assistant":
             _parse_assistant_content(message.get("content"), items)
-        elif (
-            role == "system"
-            and compatibility_profile == CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE
-        ):
-            if not _claude_code_total_tokens_marker(message.get("content")):
-                raise invalid_request(
-                    "Claude Code compatibility accepts only <total_tokens> bookkeeping system messages."
+        elif role == "system":
+            items.append(
+                MessageItem(
+                    MessageRole.SYSTEM,
+                    _text_blocks(message.get("content"), field="messages[].system.content"),
                 )
-            continue
+            )
         else:
-            raise invalid_request("Messages API roles must be user or assistant.")
+            raise invalid_request("Messages API roles must be user, assistant, or system.")
     return tuple(items)
 
 
@@ -398,9 +406,17 @@ def _parse_stop_sequences(value: object) -> tuple[str, ...]:
 
 class AnthropicMessagesRequestAdapter:
     def __init__(self, compatibility_profile: str | None = None) -> None:
-        if compatibility_profile not in {None, CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE}:
+        if compatibility_profile not in {
+            None,
+            CLAUDE_CODE_COMPATIBILITY_PROFILE,
+            CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE,
+        }:
             raise ValueError("unsupported Anthropic compatibility profile")
-        self._compatibility_profile = compatibility_profile
+        self._mid_system_policy = (
+            MidSystemPolicy.STRICT
+            if compatibility_profile is None
+            else MidSystemPolicy.BEST_EFFORT
+        )
 
     def _identity_and_items(
         self,
@@ -416,7 +432,6 @@ class AnthropicMessagesRequestAdapter:
         return model, _parse_messages(
             body.get("messages"),
             body.get("system"),
-            compatibility_profile=self._compatibility_profile,
         )
 
     def parse(self, body: dict[str, object], *, request_id: str) -> ParsedAnthropicRequest:
@@ -440,6 +455,7 @@ class AnthropicMessagesRequestAdapter:
             sampling=_parse_sampling(body),
             stop_conditions=_parse_stop_sequences(body.get("stop_sequences")),
             reasoning_budget=reasoning_budget,
+            mid_system_policy=self._mid_system_policy,
         )
         return ParsedAnthropicRequest(serving, model, stream, omit_thinking)
 
@@ -454,5 +470,6 @@ class AnthropicMessagesRequestAdapter:
             1,
             structured_output=structured_output,
             reasoning_budget=reasoning_budget,
+            mid_system_policy=self._mid_system_policy,
         )
         return ParsedAnthropicRequest(serving, model, False, omit_thinking)

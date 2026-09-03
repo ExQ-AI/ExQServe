@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 
 from exqserve.core.events import (
+    CompletionReason,
     GenerationCancelled,
     GenerationCompleted,
     GenerationEvent,
@@ -24,10 +25,17 @@ from exqserve.protocol.openai.common import (
     chat_usage,
     invalid_request,
     map_canonical_error,
+    map_stream_canonical_error,
     parse_sampling,
     parse_stop,
 )
 from exqserve.serving.contracts import RawServingRequest
+
+
+def _finish_reason(reason: CompletionReason) -> str:
+    if reason is CompletionReason.FILTER:
+        return CompletionReason.STOP.value
+    return str(reason.value)
 
 
 def _parse_prompt(value: object) -> RawPromptItem:
@@ -214,7 +222,7 @@ class CompletionsStreamSerializer:
         if isinstance(event, GenerationCompleted):
             self._terminal = True
             usage = event.usage or self._usage
-            chunks: list[dict[str, object]] = [self._chunk("", event.reason.value)]
+            chunks: list[dict[str, object]] = [self._chunk("", _finish_reason(event.reason))]
             if self._include_usage and usage is not None:
                 chunks.append(
                     {
@@ -229,7 +237,7 @@ class CompletionsStreamSerializer:
             return tuple(chunks)
         if isinstance(event, GenerationFailed):
             self._terminal = True
-            return (map_canonical_error(event.error).to_body(),)
+            return (map_stream_canonical_error(event.error).to_body(),)
         if isinstance(event, GenerationCancelled):
             self._terminal = True
             return (_cancel_error().to_body(),)
@@ -265,7 +273,7 @@ class CompletionsAccumulator:
             self._usage = event.usage
         elif isinstance(event, GenerationCompleted):
             self._usage = event.usage or self._usage
-            self._reason = event.reason.value
+            self._reason = _finish_reason(event.reason)
         elif isinstance(event, GenerationFailed):
             self._error = map_canonical_error(event.error)
         elif isinstance(event, GenerationCancelled):

@@ -14,15 +14,27 @@ from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolP
 from exqserve.control.request import RequestRejected, RequestTerminalReason
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import GenerationEvent
-from exqserve.core.items import MessageItem, MessageRole, ToolResultItem
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
+from exqserve.core.items import (
+    ImageContentPart,
+    MessageItem,
+    MessageRole,
+    MultimodalMessageItem,
+    MultimodalToolResultItem,
+    TextContentPart,
+    ToolCallItem,
+    ToolResultItem,
+)
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
     CompiledPrompt,
+    ParserTerminalIssue,
     TemplateRequest,
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
+    incomplete_tool_terminal_issue,
 )
 from exqserve.runtime.contracts import (
     RuntimeConstraintUnsupported,
@@ -33,7 +45,13 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
     RuntimeTiming,
 )
-from exqserve.serving.contracts import ServingRejected, ServingRequest
+from exqserve.serving.contracts import (
+    BestEffortMidSystemLowering,
+    MidSystemCapability,
+    MidSystemPolicy,
+    ServingRejected,
+    ServingRequest,
+)
 from exqserve.serving.engine import ServingEngine
 
 
@@ -41,6 +59,10 @@ from exqserve.serving.engine import ServingEngine
 class _Finish:
     events: tuple[GenerationEvent, ...] = ()
     incomplete_tool_call: bool = False
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class _Parser:
@@ -117,6 +139,13 @@ class _Controller:
         self.requests: list[RuntimeGenerationRequest] = []
         self.reject: CanonicalError | None = None
 
+    async def acquire(self, request_id: str):  # type: ignore[no-untyped-def]
+        del request_id
+        return self
+
+    async def release(self) -> None:
+        return None
+
     async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
         self.requests.append(request)
         if self.reject is not None:
@@ -128,7 +157,11 @@ def _tools() -> ToolPolicy:
     return ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
 
 
-def _request(items: tuple[object, ...] | None = None) -> ServingRequest:
+def _request(
+    items: tuple[object, ...] | None = None,
+    *,
+    mid_system_policy: MidSystemPolicy = MidSystemPolicy.LEGACY_UNSPECIFIED,
+) -> ServingRequest:
     canonical = CanonicalRequest(
         "req-1",
         "model",
@@ -141,6 +174,7 @@ def _request(items: tuple[object, ...] | None = None) -> ServingRequest:
         _tools(),
         max_output_tokens=77,
         seed=5,
+        mid_system_policy=mid_system_policy,
     )
 
 
@@ -163,6 +197,262 @@ def test_submit_compiles_and_builds_runtime_request_exactly_once() -> None:
                 stop_conditions=("<stop>",),
             )
         ]
+
+    asyncio.run(scenario())
+
+
+def test_best_effort_mid_system_merge_is_pure_stable_and_shared_by_count_and_submit() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
+        original_items = (
+            MessageItem(MessageRole.SYSTEM, "durable"),
+            MessageItem(MessageRole.USER, "first"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-1"),
+            MessageItem(MessageRole.ASSISTANT, "ack"),
+            MessageItem(MessageRole.USER, "second"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-2"),
+        )
+        request = _request(original_items, mid_system_policy=MidSystemPolicy.BEST_EFFORT)
+
+        assert await engine.count_input_tokens(request) == 3
+        await engine.submit(request)
+
+        expected = (
+            MessageItem(MessageRole.SYSTEM, "durable"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-1"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-2"),
+            MessageItem(MessageRole.USER, "first"),
+            MessageItem(MessageRole.ASSISTANT, "ack"),
+            MessageItem(MessageRole.USER, "second"),
+        )
+        compiled_inputs = [call[0] for call in compiler.calls]
+        assert len(compiled_inputs) == 2
+        assert all(isinstance(value, CanonicalRequest) for value in compiled_inputs)
+        assert [value.items for value in compiled_inputs if isinstance(value, CanonicalRequest)] == [
+            expected,
+            expected,
+        ]
+        assert request.input.items == original_items
+
+    asyncio.run(scenario())
+
+
+def test_in_place_mid_system_lowering_preserves_prefix_order_and_count_submit_identity() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            best_effort_mid_system_lowering=BestEffortMidSystemLowering.IN_PLACE_USER_META,
+        )
+        original_items = (
+            MessageItem(MessageRole.SYSTEM, "durable"),
+            MessageItem(MessageRole.USER, "first"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-1"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-2"),
+            MessageItem(MessageRole.ASSISTANT, "ack"),
+            MessageItem(MessageRole.USER, "second"),
+            MessageItem(MessageRole.SYSTEM, "dynamic-3"),
+        )
+        request = _request(original_items, mid_system_policy=MidSystemPolicy.BEST_EFFORT)
+
+        assert await engine.count_input_tokens(request) == 3
+        await engine.submit(request)
+
+        expected = (
+            MessageItem(MessageRole.SYSTEM, "durable"),
+            MessageItem(
+                MessageRole.USER,
+                "first\n\n<system-reminder>\ndynamic-1\n</system-reminder>"
+                "\n\n<system-reminder>\ndynamic-2\n</system-reminder>",
+            ),
+            MessageItem(MessageRole.ASSISTANT, "ack"),
+            MessageItem(
+                MessageRole.USER,
+                "second\n\n<system-reminder>\ndynamic-3\n</system-reminder>",
+            ),
+        )
+        compiled_inputs = [call[0] for call in compiler.calls]
+        assert [value.items for value in compiled_inputs if isinstance(value, CanonicalRequest)] == [
+            expected,
+            expected,
+        ]
+        assert request.input.items == original_items
+
+        already_effective = _request(expected, mid_system_policy=MidSystemPolicy.BEST_EFFORT)
+        assert await engine.count_input_tokens(already_effective) == 3
+        assert compiler.calls[-1][0] is already_effective.input
+
+    asyncio.run(scenario())
+
+
+def test_in_place_mid_system_lowering_handles_multimodal_and_tool_result_tails() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            best_effort_mid_system_lowering=BestEffortMidSystemLowering.IN_PLACE_USER_META,
+        )
+        multimodal_user = MultimodalMessageItem(
+            MessageRole.USER,
+            (
+                TextContentPart("inspect"),
+                ImageContentPart("data:image/png;base64,AA=="),
+            ),
+        )
+        text_result = ToolResultItem("call-1", "text-result", False)
+        multimodal_result = MultimodalToolResultItem(
+            "call-2",
+            (
+                TextContentPart("image-result"),
+                ImageContentPart("data:image/png;base64,BB=="),
+            ),
+            False,
+        )
+        original_items = (
+            multimodal_user,
+            MessageItem(MessageRole.SYSTEM, "vision-meta"),
+            ToolCallItem("call-1", "read", "{}", 0),
+            text_result,
+            MessageItem(MessageRole.SYSTEM, "text-result-meta"),
+            ToolCallItem("call-2", "read_image", "{}", 0),
+            multimodal_result,
+            MessageItem(MessageRole.SYSTEM, "image-result-meta"),
+        )
+        request = _request(original_items, mid_system_policy=MidSystemPolicy.BEST_EFFORT)
+
+        await engine.submit(request)
+
+        compiled = compiler.calls[0][0]
+        assert isinstance(compiled, CanonicalRequest)
+        assert compiled.items == (
+            MultimodalMessageItem(
+                MessageRole.USER,
+                multimodal_user.parts
+                + (
+                    TextContentPart(
+                        "\n\n<system-reminder>\nvision-meta\n</system-reminder>"
+                    ),
+                ),
+            ),
+            original_items[2],
+            text_result,
+            MessageItem(
+                MessageRole.USER,
+                "<system-reminder>\ntext-result-meta\n</system-reminder>",
+            ),
+            original_items[5],
+            multimodal_result,
+            MessageItem(
+                MessageRole.USER,
+                "<system-reminder>\nimage-result-meta\n</system-reminder>",
+            ),
+        )
+        assert compiled.items[2] is text_result
+        assert compiled.items[5] is multimodal_result
+        assert request.input.items == original_items
+
+    asyncio.run(scenario())
+
+
+def test_in_place_mid_system_lowering_fails_closed_for_invalid_predecessor() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            best_effort_mid_system_lowering=BestEffortMidSystemLowering.IN_PLACE_USER_META,
+        )
+        request = _request(
+            (
+                MessageItem(MessageRole.USER, "hello"),
+                MessageItem(MessageRole.ASSISTANT, "answer"),
+                MessageItem(MessageRole.SYSTEM, "invalid late system"),
+            ),
+            mid_system_policy=MidSystemPolicy.BEST_EFFORT,
+        )
+
+        with pytest.raises(ServingRejected) as rejected:
+            await engine.count_input_tokens(request)
+        assert rejected.value.error.code == "mid_conversation_system_invalid_placement"
+        assert compiler.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_strict_mid_system_rejects_generation_and_count_before_compilation() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
+        request = _request(
+            (
+                MessageItem(MessageRole.USER, "hello"),
+                MessageItem(MessageRole.SYSTEM, "dynamic"),
+            ),
+            mid_system_policy=MidSystemPolicy.STRICT,
+        )
+
+        for operation in (engine.count_input_tokens(request), engine.submit(request)):
+            with pytest.raises(ServingRejected) as rejected:
+                await operation
+            assert rejected.value.error.code == "mid_conversation_system_unsupported"
+            assert rejected.value.error.category is ErrorCategory.UNSUPPORTED_CAPABILITY
+        assert compiler.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_inline_mid_system_capability_preserves_chronology() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            mid_system_capability=MidSystemCapability.INLINE,
+        )
+        original_items = (
+            MessageItem(MessageRole.USER, "first"),
+            MessageItem(MessageRole.SYSTEM, "dynamic"),
+        )
+        request = _request(original_items, mid_system_policy=MidSystemPolicy.STRICT)
+
+        assert await engine.count_input_tokens(request) == 3
+        compiled = compiler.calls[0][0]
+        assert isinstance(compiled, CanonicalRequest)
+        assert compiled is request.input
+        assert compiled.items == original_items
+
+    asyncio.run(scenario())
+
+
+def test_legacy_mid_system_policy_bypasses_normalization() -> None:
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = _Controller()
+        engine = ServingEngine(compiler, lambda request_id, reasoning, tool_policy: _Parser(), controller)
+        original_items = (
+            MessageItem(MessageRole.USER, "first"),
+            MessageItem(MessageRole.SYSTEM, "legacy-late-system"),
+        )
+        request = _request(original_items)
+
+        assert await engine.count_input_tokens(request) == 3
+        compiled = compiler.calls[0][0]
+        assert isinstance(compiled, CanonicalRequest)
+        assert compiled is request.input
+        assert compiled.items == original_items
 
     asyncio.run(scenario())
 
@@ -293,6 +583,11 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         await plain_engine.submit(constrained)
         assert plain_controller.requests[0].output_json_schema == structured.schema.canonical_json
         assert plain_controller.requests[0].output_json_trigger is None
+        assert plain_controller.requests[0].generation_guarantee is GenerationGuarantee.SCHEMA
+        assert (
+            plain_controller.requests[0].constraint_fallback_policy
+            is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+        )
 
         triggered_controller = _Controller()
         triggered_engine = ServingEngine(
@@ -303,6 +598,11 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         await triggered_engine.submit(constrained)
         assert triggered_controller.requests[0].output_json_schema == structured.schema.canonical_json
         assert triggered_controller.requests[0].output_json_trigger == "</think>"
+        assert triggered_controller.requests[0].generation_guarantee is GenerationGuarantee.SCHEMA
+        assert (
+            triggered_controller.requests[0].constraint_fallback_policy
+            is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+        )
 
         framed_controller = _Controller()
         framed_engine = ServingEngine(
@@ -313,6 +613,113 @@ def test_structured_output_schema_is_forwarded_only_for_plain_raw_text() -> None
         await framed_engine.submit(constrained)
         assert framed_controller.requests[0].output_json_schema is None
         assert framed_controller.requests[0].output_json_trigger is None
+        assert framed_controller.requests[0].generation_guarantee is GenerationGuarantee.NONE
+
+    asyncio.run(scenario())
+
+
+
+def test_strong_structured_output_forwards_fail_closed_guarantee_plan() -> None:
+    async def scenario() -> None:
+        controller = _Controller()
+        structured = StructuredOutputSpec(
+            JsonSchema('{"type":"object"}'),
+            GenerationGuarantee.FORMAT,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            structured_output=structured,
+            seed=base.seed,
+        )
+        engine = ServingEngine(
+            _Compiler(raw_output_is_text_only=True),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+        )
+
+        await engine.submit(request)
+
+        runtime_request = controller.requests[0]
+        assert runtime_request.output_json_schema == structured.schema.canonical_json
+        assert runtime_request.generation_guarantee is GenerationGuarantee.FORMAT
+        assert runtime_request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
+
+    asyncio.run(scenario())
+
+
+def test_strong_structured_output_rejects_unrepresentable_compiled_prompt_before_runtime() -> None:
+    async def scenario() -> None:
+        controller = _Controller()
+        structured = StructuredOutputSpec(
+            JsonSchema('{"type":"object"}'),
+            GenerationGuarantee.SCHEMA,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            structured_output=structured,
+            seed=base.seed,
+        )
+        engine = ServingEngine(
+            _Compiler(raw_output_is_text_only=False, structured_output_trigger=None),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(request)
+
+        assert exc_info.value.error.category is ErrorCategory.INVALID_REQUEST
+        assert exc_info.value.error.code == "structured_output_constraint_unsupported"
+        assert controller.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_runtime_structured_constraint_rejection_uses_structured_specific_code() -> None:
+    async def scenario() -> None:
+        class RuntimeRejectingController(_Controller):
+            async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+                self.requests.append(request)
+                raise RuntimeConstraintUnsupported("backend structured filter unsupported")
+
+        controller = RuntimeRejectingController()
+        structured = StructuredOutputSpec(
+            JsonSchema('{"type":"object"}'),
+            GenerationGuarantee.SCHEMA,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            structured_output=structured,
+            seed=base.seed,
+        )
+        engine = ServingEngine(
+            _Compiler(raw_output_is_text_only=True),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(request)
+
+        assert exc_info.value.error.category is ErrorCategory.INVALID_REQUEST
+        assert exc_info.value.error.code == "structured_output_constraint_unsupported"
+        assert "backend structured" not in exc_info.value.error.message
+        assert len(controller.requests) == 1
 
     asyncio.run(scenario())
 
@@ -346,6 +753,52 @@ def test_tool_constraint_descriptor_is_forwarded_to_runtime_request() -> None:
             constraint.lark_grammar,
             constraint.eos_after_completed,
         )
+        assert controller.requests[0].generation_guarantee is GenerationGuarantee.UNKNOWN
+
+    asyncio.run(scenario())
+
+
+
+def test_mixed_tool_constraint_reports_runtime_unknown_and_preserves_strict_fail_closed() -> None:
+    async def scenario() -> None:
+        controller = _Controller()
+        policy = ToolPolicy(
+            (
+                FunctionTool("strict", None, JsonSchema('{"type":"object"}'), True),
+                FunctionTool("loose", None, JsonSchema('{"type":"object"}'), False),
+            ),
+            ToolChoice(ToolChoiceMode.AUTO),
+            allow_parallel=True,
+        )
+        constraint = ToolGenerationConstraint(
+            trigger="<tool_call>",
+            lark_grammar='%llguidance {}\nstart: "ok"',
+            eos_after_completed=False,
+            branch_guarantees=(
+                ("strict", GenerationGuarantee.SCHEMA),
+                ("loose", GenerationGuarantee.FORMAT),
+            ),
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            policy,
+            base.max_output_tokens,
+            seed=base.seed,
+        )
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            lambda tool_policy: constraint,
+        )
+
+        await engine.submit(request)
+
+        runtime_request = controller.requests[0]
+        assert runtime_request.generation_guarantee is GenerationGuarantee.UNKNOWN
+        assert runtime_request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
 
     asyncio.run(scenario())
 

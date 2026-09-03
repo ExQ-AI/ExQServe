@@ -17,10 +17,12 @@ from exqserve.core.items import (
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
     ModelCapabilities,
+    ParserTerminalIssue,
     TemplateImagePart,
     TemplateMessage,
     TemplateRequest,
     TemplateTextPart,
+    incomplete_tool_terminal_issue,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
 
@@ -126,6 +128,10 @@ class GenericHFPromptCompiler(HFTemplatePromptCompiler):
 class GenericHFParserFinish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool = False
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class GenericHFIncrementalParser:

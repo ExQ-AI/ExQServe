@@ -96,7 +96,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
 def test_server_config_snapshots_custom_chat_template_at_startup(tmp_path: Path) -> None:
     template = tmp_path / "custom.jinja"
     template.write_text("{{ messages }}", encoding="utf-8")
-    config = ServerConfig(tmp_path / "model", chat_template=template)
+    config = ServerConfig(model_directory=tmp_path / "model", chat_template=template)
 
     assert config.chat_template == template
     assert config.runtime_load_config().chat_template == "{{ messages }}"
@@ -105,38 +105,38 @@ def test_server_config_snapshots_custom_chat_template_at_startup(tmp_path: Path)
     assert config.runtime_load_config().chat_template == "{{ messages }}"
 
     with pytest.raises(ValueError, match="could not be read"):
-        ServerConfig(tmp_path / "model", chat_template=tmp_path / "missing.jinja")
+        ServerConfig(model_directory=tmp_path / "model", chat_template=tmp_path / "missing.jinja")
 
     empty = tmp_path / "empty.jinja"
     empty.write_text("  \n", encoding="utf-8")
     with pytest.raises(ValueError, match="must not be empty"):
-        ServerConfig(tmp_path / "model", chat_template=empty)
+        ServerConfig(model_directory=tmp_path / "model", chat_template=empty)
 
 
 def test_server_config_validates_dedicated_injection_body_limit(tmp_path: Path) -> None:
-    config = ServerConfig(tmp_path / "model", max_injection_body_bytes=8192)
+    config = ServerConfig(model_directory=tmp_path / "model", max_injection_body_bytes=8192)
     assert config.max_injection_body_bytes == 8192
 
     with pytest.raises(TypeError, match="max_injection_body_bytes"):
-        ServerConfig(tmp_path / "model", max_injection_body_bytes=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path / "model", max_injection_body_bytes=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="max_injection_body_bytes"):
-        ServerConfig(tmp_path / "model", max_injection_body_bytes=0)
+        ServerConfig(model_directory=tmp_path / "model", max_injection_body_bytes=0)
 
 
 def test_server_config_validates_vision_cache_budget(tmp_path: Path) -> None:
-    config = ServerConfig(tmp_path / "model", vision_cache_mb=0)
+    config = ServerConfig(model_directory=tmp_path / "model", vision_cache_mb=0)
     assert config.vision_cache_mb == 0
     assert config.runtime_load_config().vision_cache_mb == 0
 
     with pytest.raises(TypeError, match="vision_cache_mb"):
-        ServerConfig(tmp_path / "model", vision_cache_mb=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path / "model", vision_cache_mb=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="vision_cache_mb"):
-        ServerConfig(tmp_path / "model", vision_cache_mb=-1)
+        ServerConfig(model_directory=tmp_path / "model", vision_cache_mb=-1)
 
 
 def test_server_config_round_trips_sysmem_cache_budgets(tmp_path: Path) -> None:
     config = ServerConfig(
-        tmp_path / "model",
+        model_directory=tmp_path / "model",
         sysmem_kv_cache_mb=8192,
         sysmem_recurrent_cache_mb=2048,
     )
@@ -145,18 +145,18 @@ def test_server_config_round_trips_sysmem_cache_budgets(tmp_path: Path) -> None:
     assert runtime.sysmem_recurrent_cache_mb == 2048
 
     with pytest.raises(TypeError, match="sysmem_kv_cache_mb"):
-        ServerConfig(tmp_path / "model", sysmem_kv_cache_mb=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path / "model", sysmem_kv_cache_mb=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="sysmem_kv_cache_mb"):
-        ServerConfig(tmp_path / "model", sysmem_kv_cache_mb=-1)
+        ServerConfig(model_directory=tmp_path / "model", sysmem_kv_cache_mb=-1)
     with pytest.raises(TypeError, match="sysmem_recurrent_cache_mb"):
-        ServerConfig(tmp_path / "model", sysmem_recurrent_cache_mb=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path / "model", sysmem_recurrent_cache_mb=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="sysmem_recurrent_cache_mb"):
-        ServerConfig(tmp_path / "model", sysmem_recurrent_cache_mb=0)
+        ServerConfig(model_directory=tmp_path / "model", sysmem_recurrent_cache_mb=0)
 
 
 def test_server_config_round_trips_ngram_and_moe_cpu_settings(tmp_path: Path) -> None:
     config = ServerConfig(
-        tmp_path / "model",
+        model_directory=tmp_path / "model",
         ngram_match_min=3,
         ngram_draft_size=7,
         moe_cpu_offload_layers=12,
@@ -169,18 +169,18 @@ def test_server_config_round_trips_ngram_and_moe_cpu_settings(tmp_path: Path) ->
     assert runtime.moe_cpu_threads == 6
 
     with pytest.raises(ValueError, match="cannot be combined"):
-        ServerConfig(tmp_path / "model", ngram_match_min=2, mtp_enabled=True)
+        ServerConfig(model_directory=tmp_path / "model", ngram_match_min=2, mtp_enabled=True)
     with pytest.raises(ValueError, match="not supported with n-gram"):
-        ServerConfig(tmp_path / "model", ngram_match_min=2, dynamic_draft_tokens=True)
+        ServerConfig(model_directory=tmp_path / "model", ngram_match_min=2, dynamic_draft_tokens=True)
     with pytest.raises(ValueError, match="layer-split"):
-        ServerConfig(tmp_path / "model", moe_cpu_offload_layers=2, tensor_parallel=True)
+        ServerConfig(model_directory=tmp_path / "model", moe_cpu_offload_layers=2, tensor_parallel=True)
     with pytest.raises(ValueError, match="moe_cpu_threads"):
-        ServerConfig(tmp_path / "model", moe_cpu_threads=0)
+        ServerConfig(model_directory=tmp_path / "model", moe_cpu_threads=0)
 
 
 def test_server_config_round_trips_thin_runtime_parity_settings(tmp_path: Path) -> None:
     vision = ServerConfig(
-        tmp_path / "vision",
+        model_directory=tmp_path / "vision",
         vision_enabled=True,
         vision_offload=True,
         moe_cpu_split_experts=3,
@@ -190,7 +190,7 @@ def test_server_config_round_trips_thin_runtime_parity_settings(tmp_path: Path) 
     assert vision_runtime.moe_cpu_split_experts == 3
 
     draft = ServerConfig(
-        tmp_path / "model",
+        model_directory=tmp_path / "model",
         mtp_enabled=True,
         moe_cpu_offload_layers=4,
         draft_moe_cpu_offload_layers=5,
@@ -202,16 +202,16 @@ def test_server_config_round_trips_thin_runtime_parity_settings(tmp_path: Path) 
     assert draft_runtime.moe_cpu_threads == 6
 
     with pytest.raises(ValueError, match="vision_offload requires vision_enabled"):
-        ServerConfig(tmp_path / "model", vision_offload=True)
+        ServerConfig(model_directory=tmp_path / "model", vision_offload=True)
     with pytest.raises(ValueError, match="cannot be combined"):
-        ServerConfig(tmp_path / "model", moe_cpu_offload_layers=2, moe_cpu_split_experts=1)
+        ServerConfig(model_directory=tmp_path / "model", moe_cpu_offload_layers=2, moe_cpu_split_experts=1)
     with pytest.raises(ValueError, match="requires MTP or an external draft model"):
-        ServerConfig(tmp_path / "model", draft_moe_cpu_offload_layers=1)
+        ServerConfig(model_directory=tmp_path / "model", draft_moe_cpu_offload_layers=1)
 
 
 def test_server_config_model_identity_override_and_context_ceiling(tmp_path: Path) -> None:
     config = ServerConfig(
-        tmp_path,
+        model_directory=tmp_path,
         cache_tokens=65536,
         max_total_tokens=49152,
         served_model_id="  local-qwen  ",
@@ -224,12 +224,23 @@ def test_server_config_model_identity_override_and_context_ceiling(tmp_path: Pat
     assert config.request_control_config(32768).max_total_tokens == 32768
 
     with pytest.raises(ValueError, match="served_model_id"):
-        ServerConfig(tmp_path, served_model_id="   ")
+        ServerConfig(model_directory=tmp_path, served_model_id="   ")
+
+
+def test_operator_total_limit_does_not_reapply_runtime_headroom(tmp_path: Path) -> None:
+    config = ServerConfig(
+        model_directory=tmp_path,
+        cache_tokens=229376,
+        max_total_tokens=100000,
+    )
+
+    assert config.effective_context_length(229371) == 100000
+    assert config.request_control_config(229371).max_total_tokens == 100000
 
 
 def test_server_config_round_trips_static_mtp_settings(tmp_path: Path) -> None:
     config = ServerConfig(
-        tmp_path,
+        model_directory=tmp_path,
         mtp_enabled=True,
         mtp_draft_tokens=6,
         mtp_cache_bits=None,
@@ -255,7 +266,7 @@ def test_server_config_round_trips_static_mtp_settings(tmp_path: Path) -> None:
 
 def test_server_config_round_trips_tensor_parallel_settings(tmp_path: Path) -> None:
     config = ServerConfig(
-        tmp_path,
+        model_directory=tmp_path,
         tensor_parallel=True,
         tp_backend="nccl",
         tp_output_device=1,
@@ -269,16 +280,16 @@ def test_server_config_round_trips_tensor_parallel_settings(tmp_path: Path) -> N
     assert runtime.device_ids == (0, 1)
 
     with pytest.raises(ValueError, match="tp_backend"):
-        ServerConfig(tmp_path, tensor_parallel=True, tp_backend="invalid")
+        ServerConfig(model_directory=tmp_path, tensor_parallel=True, tp_backend="invalid")
     with pytest.raises(ValueError, match="tp_output_device"):
-        ServerConfig(tmp_path, tensor_parallel=True, tp_output_device=-1)
+        ServerConfig(model_directory=tmp_path, tensor_parallel=True, tp_output_device=-1)
 
 
 def test_server_config_round_trips_external_draft_across_target_override(tmp_path: Path) -> None:
     draft = tmp_path / "draft"
     switched_target = tmp_path / "switched-target"
     config = ServerConfig(
-        tmp_path,
+        model_directory=tmp_path,
         draft_model=draft,
         draft_tokens=5,
         draft_cache_bits=6,
@@ -296,7 +307,7 @@ def test_server_config_round_trips_loras_across_target_override(tmp_path: Path) 
     lora_b = tmp_path / "lora-b"
     switched_target = tmp_path / "switched-target"
     config = ServerConfig(
-        tmp_path,
+        model_directory=tmp_path,
         loras=(lora_a, lora_b),
         lora_scalings=(1.0, 0.8),
     )
@@ -309,15 +320,15 @@ def test_server_config_round_trips_loras_across_target_override(tmp_path: Path) 
     ]
 
     with pytest.raises(ValueError, match="number of loras"):
-        ServerConfig(tmp_path, loras=(lora_a, lora_b), lora_scalings=(1.0,))
+        ServerConfig(model_directory=tmp_path, loras=(lora_a, lora_b), lora_scalings=(1.0,))
     with pytest.raises(ValueError, match="non-negative"):
-        ServerConfig(tmp_path, loras=(lora_a,), lora_scalings=(-0.1,))
+        ServerConfig(model_directory=tmp_path, loras=(lora_a,), lora_scalings=(-0.1,))
 
 
 def test_server_config_accepts_fp16_cache_and_capture(tmp_path: Path) -> None:
     capture = tmp_path / "captures" / "requests.jsonl"
     config = ServerConfig(
-        tmp_path,
+        model_directory=tmp_path,
         cache_key_bits=None,
         cache_value_bits=None,
         reserve_per_device_gb=(1.5, 2.0),
@@ -334,63 +345,67 @@ def test_server_config_accepts_fp16_cache_and_capture(tmp_path: Path) -> None:
 
 def test_server_config_rejects_incoherent_capture_settings(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="capture_path"):
-        ServerConfig(tmp_path, capture_mode=CaptureMode.FULL)
+        ServerConfig(model_directory=tmp_path, capture_mode=CaptureMode.FULL)
     with pytest.raises(ValueError, match="capture_path"):
-        ServerConfig(tmp_path, capture_path=tmp_path / "capture.jsonl")
+        ServerConfig(model_directory=tmp_path, capture_path=tmp_path / "capture.jsonl")
 
 
 def test_server_config_delegates_runtime_and_control_invariants(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="multiple of 256"):
-        ServerConfig(tmp_path, cache_tokens=1000)
+        ServerConfig(model_directory=tmp_path, cache_tokens=1000)
     with pytest.raises(ValueError, match="max_in_flight"):
-        ServerConfig(tmp_path, max_in_flight=0)
+        ServerConfig(model_directory=tmp_path, max_in_flight=0)
     with pytest.raises(ValueError, match="port"):
-        ServerConfig(tmp_path, port=0)
+        ServerConfig(model_directory=tmp_path, port=0)
     with pytest.raises(ValueError, match="default_api_output_tokens"):
-        ServerConfig(tmp_path, default_api_output_tokens=0)
+        ServerConfig(model_directory=tmp_path, default_api_output_tokens=0)
     with pytest.raises(ValueError, match="tool_call_fanout_limit"):
-        ServerConfig(tmp_path, tool_call_fanout_limit=0)
+        ServerConfig(model_directory=tmp_path, tool_call_fanout_limit=0)
     with pytest.raises(TypeError, match="tool_call_fanout_limit"):
-        ServerConfig(tmp_path, tool_call_fanout_limit=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path, tool_call_fanout_limit=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="constrained_parallel_tool_call_limit"):
-        ServerConfig(tmp_path, constrained_parallel_tool_call_limit=0)
+        ServerConfig(model_directory=tmp_path, constrained_parallel_tool_call_limit=0)
     with pytest.raises(TypeError, match="constrained_parallel_tool_call_limit"):
-        ServerConfig(tmp_path, constrained_parallel_tool_call_limit=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path, constrained_parallel_tool_call_limit=True)  # type: ignore[arg-type]
 
 
 def test_server_config_accepts_only_tool_constraint_enum_values(tmp_path: Path) -> None:
     assert (
-        ServerConfig(tmp_path, tool_constraint_mode=ToolConstraintMode.SCHEMA).tool_constraint_mode
+        ServerConfig(model_directory=tmp_path, tool_constraint_mode=ToolConstraintMode.SCHEMA).tool_constraint_mode
         is ToolConstraintMode.SCHEMA
     )
     with pytest.raises(TypeError, match="tool_constraint_mode"):
-        ServerConfig(tmp_path, tool_constraint_mode="schema")  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path, tool_constraint_mode="schema")  # type: ignore[arg-type]
 
 
 def test_server_config_reasoning_budget_default_normalizes_disable_and_validates(tmp_path: Path) -> None:
     configured = ServerConfig(
-        tmp_path, reasoning_budget_tokens=128, reasoning_budget_message="answer now "
+        model_directory=tmp_path, reasoning_budget_tokens=128, reasoning_budget_message="answer now "
     )
     budget = configured.reasoning_budget_default()
     assert budget.max_tokens == 128
     assert budget.message == "answer now "
 
-    disabled = ServerConfig(tmp_path, reasoning_budget_tokens=-1)
+    disabled = ServerConfig(model_directory=tmp_path, reasoning_budget_tokens=-1)
     assert disabled.reasoning_budget_tokens is None
     assert disabled.reasoning_budget_default().max_tokens is None
 
     with pytest.raises(ValueError, match="reasoning_budget_tokens"):
-        ServerConfig(tmp_path, reasoning_budget_tokens=-2)
+        ServerConfig(model_directory=tmp_path, reasoning_budget_tokens=-2)
     with pytest.raises(TypeError, match="reasoning_budget_tokens"):
-        ServerConfig(tmp_path, reasoning_budget_tokens=True)  # type: ignore[arg-type]
+        ServerConfig(model_directory=tmp_path, reasoning_budget_tokens=True)  # type: ignore[arg-type]
 
 
 def test_anthropic_compatibility_profile_validation(tmp_path: Path) -> None:
     assert (
+        ServerConfig(model_directory=tmp_path, anthropic_compatibility_profile="claude-code").anthropic_compatibility_profile
+        == "claude-code"
+    )
+    assert (
         ServerConfig(
-            tmp_path, anthropic_compatibility_profile="claude-code-2.1.251"
+            model_directory=tmp_path, anthropic_compatibility_profile="claude-code-2.1.251"
         ).anthropic_compatibility_profile
         == "claude-code-2.1.251"
     )
     with pytest.raises(ValueError, match="anthropic_compatibility_profile"):
-        ServerConfig(tmp_path, anthropic_compatibility_profile="claude-code-latest")
+        ServerConfig(model_directory=tmp_path, anthropic_compatibility_profile="claude-code-latest")

@@ -37,10 +37,12 @@ from exqserve.core.items import (
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
     ModelCapabilities,
+    ParserTerminalIssue,
     TemplateMessage,
     TemplateRequest,
     TemplateTool,
     TemplateToolCall,
+    incomplete_tool_terminal_issue,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
 
@@ -231,6 +233,10 @@ class Glm5PromptCompiler(HFTemplatePromptCompiler):
 class Glm5ParserFinish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 def _deterministic_call_id(request_id: str, index: int) -> str:

@@ -7,16 +7,23 @@ import pytest
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec, validate_structured_output
 from exqserve.agent.validation import ValidationCode
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 
 
 def _spec(schema: str) -> StructuredOutputSpec:
     return StructuredOutputSpec(JsonSchema(schema))
 
 
-def test_structured_output_spec_contains_only_schema_and_is_immutable() -> None:
+def test_structured_output_spec_preserves_validation_only_defaults_and_is_immutable() -> None:
     spec = _spec('{"type":"object"}')
 
-    assert [field.name for field in fields(spec)] == ["schema"]
+    assert [field.name for field in fields(spec)] == [
+        "schema",
+        "requested_guarantee",
+        "fallback_policy",
+    ]
+    assert spec.requested_guarantee is GenerationGuarantee.NONE
+    assert spec.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
 
     with pytest.raises(FrozenInstanceError):
         spec.schema = JsonSchema('{}')  # type: ignore[misc]
@@ -25,6 +32,36 @@ def test_structured_output_spec_contains_only_schema_and_is_immutable() -> None:
 def test_structured_output_spec_requires_json_schema() -> None:
     with pytest.raises(TypeError, match="schema"):
         StructuredOutputSpec(object())  # type: ignore[arg-type]
+
+
+def test_structured_output_spec_enforces_requested_guarantee_fallback_pairs() -> None:
+    schema = JsonSchema('{"type":"object"}')
+
+    strict = StructuredOutputSpec(
+        schema,
+        GenerationGuarantee.SCHEMA,
+        ConstraintFallbackPolicy.FAIL_CLOSED,
+    )
+    assert strict.requested_guarantee is GenerationGuarantee.SCHEMA
+
+    with pytest.raises(ValueError, match="UNKNOWN"):
+        StructuredOutputSpec(
+            schema,
+            GenerationGuarantee.UNKNOWN,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
+    with pytest.raises(ValueError, match="validation-only"):
+        StructuredOutputSpec(
+            schema,
+            GenerationGuarantee.NONE,
+            ConstraintFallbackPolicy.FAIL_CLOSED,
+        )
+    with pytest.raises(ValueError, match="fail-closed"):
+        StructuredOutputSpec(
+            schema,
+            GenerationGuarantee.FORMAT,
+            ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY,
+        )
 
 
 @pytest.mark.parametrize(

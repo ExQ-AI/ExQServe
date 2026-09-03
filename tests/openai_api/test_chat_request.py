@@ -4,6 +4,7 @@ import pytest
 
 from exqserve.agent.reasoning import ReasoningBudgetMode, ReasoningEffort, ReasoningMode
 from exqserve.agent.tools import ToolChoiceMode
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     ImageContentPart,
     MessageItem,
@@ -122,6 +123,8 @@ def test_chat_full_agent_request_maps_directly_to_serving_semantics() -> None:
     assert parsed.serving.stop_conditions == ("END", "STOP")
     assert parsed.serving.structured_output is not None
     assert '"ok"' in parsed.serving.structured_output.schema.canonical_json
+    assert parsed.serving.structured_output.requested_guarantee is GenerationGuarantee.SCHEMA
+    assert parsed.serving.structured_output.fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
 
 
 def test_chat_max_tokens_alias_and_default_output_limit() -> None:
@@ -324,3 +327,58 @@ def test_chat_invalid_reasoning_budget_extensions_fail_explicitly(
     with pytest.raises(OpenAIProtocolError) as exc_info:
         ChatRequestAdapter().parse(body, request_id="rb-invalid")
     assert exc_info.value.code == code
+
+
+def test_chat_structured_output_guarantee_matrix() -> None:
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    json_object = ChatRequestAdapter().parse(
+        {**base, "response_format": {"type": "json_object"}},
+        request_id="json-object",
+    ).serving.structured_output
+    assert json_object is not None
+    assert json_object.requested_guarantee is GenerationGuarantee.FORMAT
+    assert json_object.fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
+
+    non_strict = ChatRequestAdapter().parse(
+        {
+            **base,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": False},
+            },
+        },
+        request_id="non-strict",
+    ).serving.structured_output
+    assert non_strict is not None
+    assert non_strict.requested_guarantee is GenerationGuarantee.NONE
+    assert non_strict.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+
+    omitted = ChatRequestAdapter().parse(
+        {
+            **base,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "x", "schema": {"type": "object"}},
+            },
+        },
+        request_id="omitted",
+    ).serving.structured_output
+    assert omitted is not None
+    assert omitted.requested_guarantee is GenerationGuarantee.NONE
+    assert omitted.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+
+
+def test_chat_rejects_non_boolean_structured_output_strict() -> None:
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": "true"},
+        },
+    }
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        ChatRequestAdapter().parse(body, request_id="bad-strict")
+    assert exc_info.value.code == "invalid_response_format"
+    assert exc_info.value.param == "response_format.json_schema.strict"

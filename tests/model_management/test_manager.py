@@ -8,6 +8,7 @@ import pytest
 
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.control.request import RequestTerminalReason
 from exqserve.core.events import GenerationEvent
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.model import ServedModelInfo
@@ -76,8 +77,13 @@ class _Controller:
         self.name = name
         self.log = log
         self.in_flight = 0
+        self.close_reasons: list[RequestTerminalReason] = []
 
-    async def close(self) -> None:
+    async def close(
+        self,
+        reason: RequestTerminalReason = RequestTerminalReason.SERVER_SHUTDOWN,
+    ) -> None:
+        self.close_reasons.append(reason)
         self.log.append(f"controller:{self.name}")
 
 
@@ -86,14 +92,20 @@ class _CloseAwareController(_Controller):
         super().__init__(name, log)
         self.close_event = close_event
 
-    async def close(self) -> None:
-        await super().close()
+    async def close(
+        self,
+        reason: RequestTerminalReason = RequestTerminalReason.SERVER_SHUTDOWN,
+    ) -> None:
+        await super().close(reason)
         self.close_event.set()
 
 
 class _FailingController(_Controller):
-    async def close(self) -> None:
-        await super().close()
+    async def close(
+        self,
+        reason: RequestTerminalReason = RequestTerminalReason.SERVER_SHUTDOWN,
+    ) -> None:
+        await super().close(reason)
         raise RuntimeError("controller close failed")
 
 
@@ -172,13 +184,17 @@ def test_switch_closes_old_controller_before_runtime_and_publishes_new_model(tmp
             built.append(model_id)
             return _bundle(model_id, log)
 
+        initial = _bundle("first", log)
+        controller = initial.controller
+        assert isinstance(controller, _Controller)
         manager = ModelManager(
             {"first": tmp_path / "first", "second": tmp_path / "second"},
-            _bundle("first", log),
+            initial,
             build,
         )
         result = await manager.switch("second")
 
+        assert controller.close_reasons == [RequestTerminalReason.MODEL_SWITCH]
         assert result.state is ModelManagerState.READY
         assert result.current_model == "second"
         assert manager.current_model() is not None

@@ -18,6 +18,7 @@ from exqserve.serving.engine import RuntimeTemplateAdapter
 class _Renderer:
     def __init__(self) -> None:
         self.calls: list[tuple[object, object, object, bool]] = []
+        self.protection_calls: list[tuple[bool, tuple[str, ...]]] = []
         self.encoded_prompts: list[str] = []
 
     def tokenize_encoded_prompt(self, text: str) -> RuntimeRenderedPrompt:
@@ -31,8 +32,11 @@ class _Renderer:
         template_kwargs: dict[str, object],
         *,
         add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
+        structural_marker_texts: tuple[str, ...] = (),
     ) -> RuntimeRenderedPrompt:
         self.calls.append((messages, tools, template_kwargs, add_generation_prompt))
+        self.protection_calls.append((protect_literal_tokens, structural_marker_texts))
         return RuntimeRenderedPrompt("rendered", (1, 2, 3))
 
 
@@ -102,6 +106,23 @@ def test_runtime_template_bridge_converts_model_contracts_without_reordering() -
     ]
     assert kwargs == {"enable_thinking": True, "reasoning_effort": "high"}
     assert add_prompt is True
+    assert renderer.protection_calls == [(False, ())]
+
+
+def test_runtime_template_bridge_internal_markers_activate_literal_protection() -> None:
+    renderer = _Renderer()
+    markers = ("<|message|>", "<|eot|>")
+    adapter = RuntimeTemplateAdapter(renderer, markers)
+
+    adapter.render_and_tokenize(
+        TemplateRequest(
+            messages=(TemplateMessage("user", "literal <|message|>"),),
+            tools=(),
+            template_kwargs=(),
+        )
+    )
+
+    assert renderer.protection_calls == [(True, markers)]
 
 
 def test_runtime_template_bridge_tokenizes_model_native_prompt_without_template_rendering() -> None:

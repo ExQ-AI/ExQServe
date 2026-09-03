@@ -66,7 +66,7 @@ def test_real_composed_gpu_multiclient_continuation_cancel_recovery_soak() -> No
     model_directory = _model_directory()
     soak_turns = _soak_turns()
     config = ServerConfig(
-        model_directory,
+        model_directory=model_directory,
         cache_tokens=8192,
         max_batch_size=4,
         max_chunk_size=512,

@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Mapping
 from types import SimpleNamespace
 
-from exqserve.core.errors import ErrorCategory
+from exqserve.core.errors import ErrorCategory, FailureCause
 from exqserve.runtime.contracts import (
     RuntimeCancelled,
     RuntimeFailed,
@@ -219,6 +219,23 @@ def test_backend_exception_becomes_safe_runtime_failure_and_marks_backend_unheal
 
     asyncio.run(scenario())
 
+
+
+def test_backend_failure_callback_projects_transient_recovery_cause() -> None:
+    async def scenario() -> None:
+        job = _FakeJob([RuntimeError("backend exploded")])
+        events = await _collect(
+            RuntimeSession(_request(), job, lambda: FailureCause.RUNTIME_RECOVERING)
+        )
+
+        assert len(events) == 1
+        failure = events[0]
+        assert isinstance(failure, RuntimeFailed)
+        assert failure.error.code == "generation_failed"
+        assert failure.error.retryable is True
+        assert failure.error.cause is FailureCause.RUNTIME_RECOVERING
+
+    asyncio.run(scenario())
 
 def test_unexpected_backend_exhaustion_is_failure_not_silent_success() -> None:
     async def scenario() -> None:

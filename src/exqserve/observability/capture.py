@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast
 
-from exqserve.core.errors import CanonicalError, ErrorCategory
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -207,11 +207,14 @@ def _decode_timing(value: object) -> GenerationTiming:
 def _encode_error_metadata(error: CanonicalError | None) -> dict[str, object] | None:
     if error is None:
         return None
-    return {
+    result: dict[str, object] = {
         "category": error.category.value,
         "code": error.code,
         "retryable": error.retryable,
     }
+    if error.cause is not None:
+        result["cause"] = error.cause.value
+    return result
 
 
 def _encode_error_full(error: CanonicalError) -> dict[str, object]:
@@ -228,11 +231,20 @@ def _decode_error(value: object) -> CanonicalError:
     code = value.get("code")
     message = value.get("message")
     retryable = value.get("retryable")
+    cause = value.get("cause")
     if not isinstance(category, str) or not isinstance(code, str) or not isinstance(message, str):
         raise TypeError("captured error is malformed")
     if not isinstance(retryable, bool):
         raise TypeError("captured error retryable flag is malformed")
-    return CanonicalError(ErrorCategory(category), code, message, retryable)
+    if cause is not None and not isinstance(cause, str):
+        raise TypeError("captured error cause is malformed")
+    return CanonicalError(
+        ErrorCategory(category),
+        code,
+        message,
+        retryable,
+        None if cause is None else FailureCause(cause),
+    )
 
 
 def _encode_usage(usage: TokenUsage) -> dict[str, object]:

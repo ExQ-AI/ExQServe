@@ -12,7 +12,12 @@ from exqserve.core.events import GenerationCompleted, GenerationEvent, ToolCallS
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.usage import TokenUsage
-from exqserve.model.contracts import CompiledPrompt, TemplateRequest
+from exqserve.model.contracts import (
+    CompiledPrompt,
+    ParserTerminalIssue,
+    TemplateRequest,
+    incomplete_tool_terminal_issue,
+)
 from exqserve.runtime.contracts import (
     RuntimeEvent,
     RuntimeFinished,
@@ -30,6 +35,10 @@ from exqserve.serving.engine import ServingEngine
 class _Finish:
     events: tuple[GenerationEvent, ...] = ()
     incomplete_tool_call: bool = False
+
+    @property
+    def terminal_issue(self) -> ParserTerminalIssue | None:
+        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class _Parser:

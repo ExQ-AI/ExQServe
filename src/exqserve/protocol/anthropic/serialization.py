@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import deque
 
 from exqserve.core.events import (
     CompletionReason,
@@ -50,6 +51,7 @@ def _stop_reason(reason: CompletionReason, stop_sequence: str | None) -> str:
         CompletionReason.STOP: "end_turn",
         CompletionReason.LENGTH: "max_tokens",
         CompletionReason.TOOL_CALLS: "tool_use",
+        CompletionReason.FILTER: "end_turn",
     }
     return mapping[reason]
 
@@ -204,6 +206,8 @@ class AnthropicMessageStreamSerializer:
         self._reasoning_block: int | None = None
         self._text_block: int | None = None
         self._tool_blocks: dict[int, int] = {}
+        self._pending_tool_index: int | None = None
+        self._deferred_content_events: deque[GenerationEvent] = deque()
         self._usage: TokenUsage | None = None
         self._terminal = False
 
@@ -215,7 +219,64 @@ class AnthropicMessageStreamSerializer:
             {"type": "content_block_start", "index": index, "content_block": content_block},
         )
 
+    def _can_project_while_tool_pending(self, event: GenerationEvent) -> bool:
+        pending_tool_index = self._pending_tool_index
+        if pending_tool_index is None:
+            return True
+        if isinstance(event, ToolCallArgumentsDelta):
+            return event.index == pending_tool_index
+        if isinstance(event, ToolCallCompleted):
+            return event.call.index == pending_tool_index
+        return False
+
+    @staticmethod
+    def _is_content_or_success_terminal(event: GenerationEvent) -> bool:
+        return isinstance(
+            event,
+            ReasoningStarted
+            | ReasoningDelta
+            | ReasoningCompleted
+            | TextStarted
+            | TextDelta
+            | TextCompleted
+            | ToolCallStarted
+            | ToolCallArgumentsDelta
+            | ToolCallCompleted
+            | GenerationCompleted,
+        )
+
+    def _drain_deferred_content(self) -> tuple[tuple[str, dict[str, object]], ...]:
+        emitted: list[tuple[str, dict[str, object]]] = []
+        while self._deferred_content_events and not self._terminal:
+            event = self._deferred_content_events[0]
+            if not self._can_project_while_tool_pending(event):
+                break
+            self._deferred_content_events.popleft()
+            emitted.extend(self._project(event))
+        return tuple(emitted)
+
     def feed(self, event: GenerationEvent) -> tuple[tuple[str, dict[str, object]], ...]:
+        if self._terminal:
+            return ()
+        if isinstance(event, UsageUpdated):
+            self._usage = event.usage
+            return ()
+        if isinstance(event, GenerationFailed | GenerationCancelled):
+            self._deferred_content_events.clear()
+            return self._project(event)
+        if (
+            self._pending_tool_index is not None
+            and self._is_content_or_success_terminal(event)
+            and not self._can_project_while_tool_pending(event)
+        ):
+            self._deferred_content_events.append(event)
+            return ()
+
+        emitted = list(self._project(event))
+        emitted.extend(self._drain_deferred_content())
+        return tuple(emitted)
+
+    def _project(self, event: GenerationEvent) -> tuple[tuple[str, dict[str, object]], ...]:
         if self._terminal:
             return ()
         if isinstance(event, GenerationStarted):
@@ -330,6 +391,7 @@ class AnthropicMessageStreamSerializer:
         if isinstance(event, ToolCallStarted):
             new_tool_block_index = self._next_block_index
             self._tool_blocks[event.index] = new_tool_block_index
+            self._pending_tool_index = event.index
             return (
                 self._start_block(
                     {"type": "tool_use", "id": event.call_id, "name": event.name, "input": {}}
@@ -350,18 +412,17 @@ class AnthropicMessageStreamSerializer:
                 ),
             )
         if isinstance(event, ToolCallCompleted):
-            completed_block_index = self._tool_blocks.get(event.call.index)
+            completed_block_index = self._tool_blocks.pop(event.call.index, None)
             if completed_block_index is None:  # pragma: no cover - canonical parser emits start first
                 return ()
+            if self._pending_tool_index == event.call.index:
+                self._pending_tool_index = None
             return (
                 (
                     "content_block_stop",
                     {"type": "content_block_stop", "index": completed_block_index},
                 ),
             )
-        if isinstance(event, UsageUpdated):
-            self._usage = event.usage
-            return ()
         if isinstance(event, GenerationCompleted):
             self._terminal = True
             usage = event.usage or self._usage

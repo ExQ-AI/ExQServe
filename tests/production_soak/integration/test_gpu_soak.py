@@ -69,7 +69,7 @@ def test_real_gpu_mixed_soak_with_model_switch_and_recovery() -> None:
     duration_seconds = _duration_seconds()
 
     config = ServerConfig(
-        primary,
+        model_directory=primary,
         model_root=primary.parent,
         cache_tokens=8192,
         max_batch_size=max(2, clients),

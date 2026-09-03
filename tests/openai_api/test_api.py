@@ -306,6 +306,26 @@ def test_protocol_and_serving_rejections_map_to_openai_error_statuses() -> None:
         assert overloaded.status_code == 429
         assert overloaded.json()["error"]["code"] == "server_overloaded"
 
+        engine.reject = CanonicalError(
+            ErrorCategory.CONTEXT_LENGTH,
+            "total_context_limit_exceeded",
+            "Total requested context limit exceeded.",
+            retryable=False,
+        )
+        context_overflow = await _request(
+            app,
+            "POST",
+            "/v1/responses",
+            json={"model": "qwen", "input": "hi"},
+        )
+        assert context_overflow.status_code == 400
+        assert context_overflow.json()["error"] == {
+            "message": "Request exceeds the model context window.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "context_length_exceeded",
+        }
+
     asyncio.run(scenario())
 
 

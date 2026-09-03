@@ -31,7 +31,7 @@ from exqserve.core.usage import TokenUsage
 
 
 def test_completion_reasons_are_exact_v1_set() -> None:
-    assert {reason.value for reason in CompletionReason} == {"stop", "length", "tool_calls"}
+    assert {reason.value for reason in CompletionReason} == {"stop", "length", "tool_calls", "filter"}
 
 
 def test_generation_event_union_is_exact_v1_set() -> None:
