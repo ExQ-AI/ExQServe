@@ -91,6 +91,12 @@ class _CloseAwareController(_Controller):
         self.close_event.set()
 
 
+class _FailingController(_Controller):
+    async def close(self) -> None:
+        await super().close()
+        raise RuntimeError("controller close failed")
+
+
 class _Runtime:
     def __init__(self, name: str, log: list[str]) -> None:
         self.name = name
@@ -103,11 +109,30 @@ class _Runtime:
         self.is_ready = False
 
 
+class _UnresolvedCloseRuntime(_Runtime):
+    async def close(self) -> None:
+        self.log.append(f"runtime:{self.name}")
+        self.is_ready = False
+        self.is_healthy = False
+        raise RuntimeError("restart the server process")
+
+
 def _bundle(name: str, log: list[str]) -> ActiveModelBundle:
     return ActiveModelBundle(
         management_id=name,
         served_model=ServedModelInfo(name, created=1, context_length=4096),
         runtime=_Runtime(name, log),
+        controller=_Controller(name, log),
+        engine=_Engine(),
+        raw_engine=_RawEngine(),
+    )
+
+
+def _unresolved_bundle(name: str, log: list[str]) -> ActiveModelBundle:
+    return ActiveModelBundle(
+        management_id=name,
+        served_model=ServedModelInfo(name, created=1, context_length=4096),
+        runtime=_UnresolvedCloseRuntime(name, log),
         controller=_Controller(name, log),
         engine=_Engine(),
         raw_engine=_RawEngine(),
@@ -174,6 +199,135 @@ def test_unload_keeps_manager_alive_and_load_recovers(tmp_path: Path) -> None:
         assert loaded.state is ModelManagerState.READY
         assert loaded.current_model == "second"
         assert manager.is_ready is True
+
+    asyncio.run(scenario())
+
+
+def test_unload_close_failure_preserves_bundle_and_blocks_reload(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        log: list[str] = []
+        built: list[str] = []
+        initial = _unresolved_bundle("first", log)
+
+        async def build(model_id: str, _path: Path) -> ActiveModelBundle:
+            built.append(model_id)
+            return _bundle(model_id, log)
+
+        manager = ModelManager(
+            {"first": tmp_path / "first", "second": tmp_path / "second"},
+            initial,
+            build,
+        )
+
+        with pytest.raises(RuntimeError, match="restart the server process"):
+            await manager.unload()
+
+        assert manager.state is ModelManagerState.ERROR
+        assert manager.current_runtime is initial.runtime
+        assert manager.current_model() == initial.served_model
+        assert manager.is_ready is False
+        with pytest.raises(RuntimeError, match="prior runtime ownership is unresolved"):
+            await manager.load("second")
+        assert built == []
+
+    asyncio.run(scenario())
+
+
+def test_switch_close_failure_preserves_bundle_and_blocks_replacement(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        log: list[str] = []
+        built: list[str] = []
+        initial = _unresolved_bundle("first", log)
+
+        async def build(model_id: str, _path: Path) -> ActiveModelBundle:
+            built.append(model_id)
+            return _bundle(model_id, log)
+
+        manager = ModelManager(
+            {"first": tmp_path / "first", "second": tmp_path / "second"},
+            initial,
+            build,
+        )
+
+        with pytest.raises(RuntimeError, match="restart the server process"):
+            await manager.switch("second")
+
+        assert manager.state is ModelManagerState.ERROR
+        assert manager.current_runtime is initial.runtime
+        assert manager.current_model() == initial.served_model
+        assert manager.is_ready is False
+        with pytest.raises(RuntimeError, match="prior runtime ownership is unresolved"):
+            await manager.load("second")
+        assert built == []
+
+    asyncio.run(scenario())
+
+
+def test_controller_close_failure_does_not_poison_released_runtime_ownership(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        log: list[str] = []
+        built: list[str] = []
+        initial = ActiveModelBundle(
+            management_id="first",
+            served_model=ServedModelInfo("first", created=1, context_length=4096),
+            runtime=_Runtime("first", log),
+            controller=_FailingController("first", log),
+            engine=_Engine(),
+            raw_engine=_RawEngine(),
+        )
+
+        async def build(model_id: str, _path: Path) -> ActiveModelBundle:
+            built.append(model_id)
+            return _bundle(model_id, log)
+
+        manager = ModelManager(
+            {"first": tmp_path / "first", "second": tmp_path / "second"},
+            initial,
+            build,
+        )
+
+        with pytest.raises(RuntimeError, match="controller close failed"):
+            await manager.unload()
+
+        assert manager.state is ModelManagerState.ERROR
+        assert manager.current_runtime is None
+        assert manager.current_model() is None
+        loaded = await manager.load("second")
+        assert loaded.state is ModelManagerState.READY
+        assert built == ["second"]
+        assert log[:2] == ["controller:first", "runtime:first"]
+
+    asyncio.run(scenario())
+
+
+def test_switch_builder_failure_remains_reloadable_after_successful_close(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        log: list[str] = []
+        attempts = 0
+
+        async def build(model_id: str, _path: Path) -> ActiveModelBundle:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("build failed")
+            return _bundle(model_id, log)
+
+        manager = ModelManager(
+            {"first": tmp_path / "first", "second": tmp_path / "second"},
+            _bundle("first", log),
+            build,
+        )
+
+        with pytest.raises(RuntimeError, match="build failed"):
+            await manager.switch("second")
+
+        assert manager.state is ModelManagerState.ERROR
+        assert manager.current_runtime is None
+        assert manager.current_model() is None
+        loaded = await manager.load("second")
+        assert loaded.state is ModelManagerState.READY
+        assert loaded.current_model == "second"
+        assert attempts == 2
 
     asyncio.run(scenario())
 

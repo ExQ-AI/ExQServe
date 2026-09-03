@@ -221,17 +221,19 @@ class ControlledSession:
 
         next_task = asyncio.create_task(self._next_runtime_event())
         deadline_task = asyncio.create_task(asyncio.sleep(remaining))
-        done, _ = await asyncio.wait(
-            {next_task, deadline_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            done, _ = await asyncio.wait(
+                {next_task, deadline_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            deadline_task.cancel()
+            await asyncio.gather(deadline_task, return_exceptions=True)
+            raise
 
         if next_task in done:
             deadline_task.cancel()
-            try:
-                await deadline_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(deadline_task, return_exceptions=True)
             return await next_task
 
         if self._terminal_reason is None:

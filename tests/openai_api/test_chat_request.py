@@ -181,6 +181,7 @@ def test_chat_image_url_maps_to_ordered_multimodal_user_item() -> None:
     [
         ({"messages": []}, "invalid_messages"),
         ({"n": 2}, "unsupported_n"),
+        ({"n": True}, "unsupported_n"),
         ({"logprobs": True}, "unsupported_logprobs"),
         (
             {"tools": [{"type": "custom", "custom": {"name": "x"}}]},

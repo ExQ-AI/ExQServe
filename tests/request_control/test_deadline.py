@@ -90,6 +90,39 @@ def test_deadline_cancels_backend_without_cancelling_runtime_iterator_task() -> 
     asyncio.run(scenario())
 
 
+def test_external_consumer_cancellation_cleans_deadline_sleep_without_cancelling_runtime_next() -> None:
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(
+            runtime,
+            RequestControlConfig(max_in_flight=1, timeout_seconds=3600.0),
+        )
+        session = await controller.submit(_request())
+        raw = runtime.sessions[0]
+        consumer = asyncio.create_task(anext(session))
+        await asyncio.sleep(0)
+
+        consumer.cancel()
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        assert pending == []
+        assert raw.cancel_calls == 1
+        assert raw.next_was_cancelled is False
+        assert session.terminal_reason is RequestTerminalReason.CLIENT_CANCELLED
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
 def test_completion_before_deadline_wins_without_cancellation() -> None:
     async def scenario() -> None:
         runtime = _Runtime()

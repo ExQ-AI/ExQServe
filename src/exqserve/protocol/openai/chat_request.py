@@ -371,7 +371,8 @@ class ChatRequestAdapter:
         model = body.get("model")
         if not isinstance(model, str) or not model.strip():
             raise invalid_request("invalid_model", "model must be a non-empty string.", "model")
-        if body.get("n", 1) != 1:
+        n = body.get("n", 1)
+        if isinstance(n, bool) or n != 1:
             raise invalid_request("unsupported_n", "Only n=1 is supported in V1.", "n")
         if body.get("logprobs") not in {None, False}:
             raise invalid_request("unsupported_logprobs", "logprobs are not supported in V1.", "logprobs")

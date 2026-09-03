@@ -93,6 +93,12 @@ class ModelManagerSnapshot:
 type ModelBundleBuilder = Callable[[str, Path], Awaitable[ActiveModelBundle]]
 
 
+class _RuntimeOwnershipUnresolved(Exception):
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 def _not_ready() -> ServingRejected:
     return ServingRejected(
         CanonicalError(
@@ -217,12 +223,23 @@ class ModelManager:
             await self._release_submission_bundle()
 
     async def _close_bundle(self, bundle: ActiveModelBundle) -> None:
+        controller_error: BaseException | None = None
         try:
             await bundle.controller.close()
-        finally:
+        except asyncio.CancelledError as exc:
+            controller_error = exc
+        except Exception as exc:  # noqa: BLE001 - runtime teardown must still be attempted.
+            controller_error = exc
+        try:
             # Stop admission first, then let leased submissions release the runtime safely.
             await self._submissions_quiesced.wait()
             await bundle.runtime.close()
+        except asyncio.CancelledError as exc:
+            raise _RuntimeOwnershipUnresolved(exc) from exc
+        except Exception as exc:
+            raise _RuntimeOwnershipUnresolved(exc) from exc
+        if controller_error is not None:
+            raise controller_error
 
     async def _publish(self, bundle: ActiveModelBundle) -> ModelManagerSnapshot:
         async with self._lock:
@@ -236,6 +253,8 @@ class ModelManager:
         path = self._candidate(model_id)
         async with self._transition_lock:
             async with self._lock:
+                if self._state is ModelManagerState.ERROR and self._bundle is not None:
+                    raise RuntimeError("model load is blocked while prior runtime ownership is unresolved")
                 if self._state not in {ModelManagerState.UNLOADED, ModelManagerState.ERROR}:
                     raise RuntimeError("model load requires an unloaded manager")
                 self._state = ModelManagerState.LOADING
@@ -264,6 +283,10 @@ class ModelManager:
                 async with self._lock:
                     self._bundle = None
                 new_bundle = await self._builder(model_id, path)
+            except _RuntimeOwnershipUnresolved as exc:
+                async with self._lock:
+                    self._state = ModelManagerState.ERROR
+                raise exc.cause
             except BaseException:
                 async with self._lock:
                     self._bundle = None
@@ -282,6 +305,10 @@ class ModelManager:
                 self._state = ModelManagerState.UNLOADING
             try:
                 await self._close_bundle(old_bundle)
+            except _RuntimeOwnershipUnresolved as exc:
+                async with self._lock:
+                    self._state = ModelManagerState.ERROR
+                raise exc.cause
             except BaseException:
                 async with self._lock:
                     self._bundle = None
@@ -301,7 +328,12 @@ class ModelManager:
                 self._state = ModelManagerState.CLOSED
                 self._bundle = None
             if bundle is not None:
-                await self._close_bundle(bundle)
+                try:
+                    await self._close_bundle(bundle)
+                except _RuntimeOwnershipUnresolved as exc:
+                    async with self._lock:
+                        self._bundle = bundle
+                    raise exc.cause
 
 
 class ManagedRawServingEngine:

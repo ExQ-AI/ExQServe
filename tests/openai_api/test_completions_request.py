@@ -90,7 +90,9 @@ def test_completions_stream_options_and_echo_are_parsed_explicitly() -> None:
     ("field", "value", "code"),
     [
         ("n", 2, "unsupported_n"),
+        ("n", True, "unsupported_n"),
         ("best_of", 2, "unsupported_best_of"),
+        ("best_of", True, "unsupported_best_of"),
         ("logprobs", 1, "unsupported_logprobs"),
         ("suffix", "tail", "unsupported_suffix"),
     ],

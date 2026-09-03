@@ -2123,48 +2123,6 @@ def test_runtime_session_keeps_ready_results_separate_when_provenance_is_enabled
     asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
 
 
-def test_runtime_health_turns_false_after_backend_failure_marker_and_rejects_new_submit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from exqserve.runtime import exllamav3 as module
-
-    _reset_factories()
-    backend = _backend()
-    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
-    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
-    runtime = ExLlamaV3Runtime()
-    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
-    assert runtime.is_healthy is True
-
-    runtime._mark_backend_failed()
-
-    assert runtime.is_ready is True
-    assert runtime.is_healthy is False
-    with pytest.raises(RuntimeError, match="unhealthy"):
-        runtime.submit(RuntimeGenerationRequest("req", (1,), 1))
-
-
-def test_runtime_health_recovers_after_close_and_reload(monkeypatch: pytest.MonkeyPatch) -> None:
-    from exqserve.runtime import exllamav3 as module
-
-    _reset_factories()
-    backend = _backend()
-    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
-    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
-    runtime = ExLlamaV3Runtime()
-    config = ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024)
-    runtime.load(config)
-    runtime._mark_backend_failed()
-    assert runtime.is_healthy is False
-
-    asyncio.run(runtime.close())
-    runtime.load(config)
-
-    assert runtime.is_ready is True
-    assert runtime.is_healthy is True
-    asyncio.run(runtime.close())
-
-
 def test_close_is_idempotent_and_unloads_after_generator_close(monkeypatch: pytest.MonkeyPatch) -> None:
     from exqserve.runtime import exllamav3 as module
 

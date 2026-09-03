@@ -21,6 +21,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Protocol
 
 from exqserve.core.errors import CanonicalError, ErrorCategory
@@ -1357,6 +1358,12 @@ class _ExLlamaV3PromptRenderer:
         return RuntimeRenderedPrompt(visible_text, input_ids, attachments)
 
 
+class _GeneratorLifecycleState(Enum):
+    READY = auto()
+    RECOVERING = auto()
+    FAILED = auto()
+
+
 class ExLlamaV3Runtime:
     capabilities = RuntimeCapabilities(
         cancellation=True,
@@ -1371,7 +1378,12 @@ class ExLlamaV3Runtime:
     def __init__(self) -> None:
         self._resources: _ExLlamaV3Resources | None = None
         self._generator: Any | None = None
-        self._backend_failed = False
+        self._generator_state = _GeneratorLifecycleState.READY
+        self._quarantined_generator: Any | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
+        self._generator_lifecycle_lock = asyncio.Lock()
+        self._observed_generator: Any | None = None
+        self._closing = False
 
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
@@ -1391,10 +1403,44 @@ class ExLlamaV3Runtime:
 
     @property
     def is_healthy(self) -> bool:
-        return self.is_ready and not self._backend_failed
+        if (
+            not self.is_ready or self._closing or self._generator_state is not _GeneratorLifecycleState.READY
+        ):
+            return False
+        generator = self._generator
+        return generator is None or not self._generator_is_known_dead(generator)
 
-    def _mark_backend_failed(self) -> None:
-        self._backend_failed = True
+    def _generator_is_known_dead(self, generator: Any) -> bool:
+        if getattr(generator, "error", None) is not None:
+            return True
+        iteration_task = getattr(generator, "iteration_task", None)
+        done = getattr(iteration_task, "done", None)
+        return bool(callable(done) and done())
+
+    def _register_generator_observer(self, generator: Any) -> None:
+        if self._observed_generator is generator:
+            return
+        iteration_task = getattr(generator, "iteration_task", None)
+        add_done_callback = getattr(iteration_task, "add_done_callback", None)
+        if not callable(add_done_callback):
+            return
+        self._observed_generator = generator
+
+        def on_done(_task: object, observed: Any = generator) -> None:
+            self._on_generator_iteration_done(observed)
+
+        add_done_callback(on_done)
+
+    def _on_generator_iteration_done(self, generator: Any) -> None:
+        if self._closing or self._resources is None or self._generator is not generator:
+            return
+        error = getattr(generator, "error", None)
+        if error is None:
+            logger.error("ExLlamaV3 generator iteration task ended unexpectedly; starting recovery.")
+            self._begin_generator_recovery(generator, allow_unstored_error=True)
+            return
+        logger.warning("ExLlamaV3 shared generator failed; starting recovery.")
+        self._begin_generator_recovery(generator)
 
     def _require_resources(self) -> _ExLlamaV3Resources:
         resources = self._resources
@@ -1406,9 +1452,120 @@ class ExLlamaV3Runtime:
         resources = self._require_resources()
         return resources.backend, resources.tokenizer
 
+    async def _quiesce_and_clear_generator(self, generator: Any) -> None:
+        await generator.close()
+        backend_generator = getattr(generator, "generator", None)
+        clear_queue = getattr(backend_generator, "clear_queue", None)
+        if not callable(clear_queue):
+            raise RuntimeError("ExLlamaV3 generator does not expose a safe queue cleanup primitive")  # noqa: TRY004
+        clear_queue()
+
+    def _begin_generator_recovery(
+        self,
+        failed_generator: Any,
+        *,
+        allow_unstored_error: bool = False,
+    ) -> None:
+        resources = self._resources
+        if resources is None or self._closing:
+            return
+        if self._generator is not failed_generator:
+            return
+        if self._generator_state is not _GeneratorLifecycleState.READY:
+            return
+        if not allow_unstored_error and getattr(failed_generator, "error", None) is None:
+            return
+
+        self._generator_state = _GeneratorLifecycleState.RECOVERING
+        self._generator = None
+        self._quarantined_generator = failed_generator
+        logger.warning("ExLlamaV3 generator quarantined; recovery starting.")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._generator_state = _GeneratorLifecycleState.FAILED
+            logger.exception("ExLlamaV3 generator recovery requires a running event loop.")
+            return
+        task = loop.create_task(self._recover_generator(failed_generator, resources))
+        self._recovery_task = task
+
+    async def _recover_generator(
+        self,
+        failed_generator: Any,
+        resources: _ExLlamaV3Resources,
+    ) -> None:
+        current_task = asyncio.current_task()
+        try:
+            async with self._generator_lifecycle_lock:
+                if self._quarantined_generator is not failed_generator:
+                    return
+                try:
+                    await self._quiesce_and_clear_generator(failed_generator)
+                except Exception:
+                    self._generator_state = _GeneratorLifecycleState.FAILED
+                    logger.exception("ExLlamaV3 failed generator cleanup did not complete safely.")
+                    return
+
+                if resources.config.sysmem_kv_cache_mb > 0:
+                    self._generator_state = _GeneratorLifecycleState.FAILED
+                    logger.error(
+                        "ExLlamaV3 generator recovery disabled while sysmem KV cache is enabled; "
+                        "process restart is required."
+                    )
+                    return
+
+                self._quarantined_generator = None
+                if self._closing or self._resources is not resources:
+                    return
+
+                try:
+                    replacement = self._ensure_generator()
+                    self._register_generator_observer(replacement)
+                except Exception:
+                    self._generator_state = _GeneratorLifecycleState.FAILED
+                    logger.exception("ExLlamaV3 replacement generator construction failed.")
+                    return
+
+                if self._generator_is_known_dead(replacement):
+                    self._generator = None
+                    self._quarantined_generator = replacement
+                    try:
+                        await self._quiesce_and_clear_generator(replacement)
+                    except Exception:
+                        logger.exception("ExLlamaV3 dead replacement cleanup failed.")
+                    else:
+                        self._quarantined_generator = None
+                    self._generator_state = _GeneratorLifecycleState.FAILED
+                    return
+
+                if self._closing or self._resources is not resources:
+                    self._generator = None
+                    self._quarantined_generator = replacement
+                    try:
+                        await self._quiesce_and_clear_generator(replacement)
+                    except Exception:
+                        logger.exception("ExLlamaV3 replacement cleanup during teardown failed.")
+                    else:
+                        self._quarantined_generator = None
+                    return
+
+                self._generator_state = _GeneratorLifecycleState.READY
+                logger.info("ExLlamaV3 generator recovery succeeded.")
+        except Exception:
+            logger.exception("Unexpected ExLlamaV3 generator recovery failure.")
+            if self._resources is resources and not self._closing:
+                self._generator_state = _GeneratorLifecycleState.FAILED
+        finally:
+            if self._recovery_task is current_task:
+                self._recovery_task = None
+
     def _ensure_generator(self) -> Any:
         if self._generator is not None:
-            return self._generator
+            generator = self._generator
+            if getattr(generator, "error", None) is not None:
+                self._begin_generator_recovery(generator)
+                raise RuntimeError("ExLlamaV3 runtime is recovering after a backend generation failure")
+            return generator
         resources = self._require_resources()
         try:
             asyncio.get_running_loop()
@@ -1442,7 +1599,12 @@ class ExLlamaV3Runtime:
         resources = self._build_resources(config)
         self._resources = resources
         self._generator = None
-        self._backend_failed = False
+        self._generator_state = _GeneratorLifecycleState.READY
+        self._quarantined_generator = None
+        self._recovery_task = None
+        self._generator_lifecycle_lock = asyncio.Lock()
+        self._observed_generator = None
+        self._closing = False
 
     @staticmethod
     def _build_resources(config: ExLlamaV3LoadConfig) -> _ExLlamaV3Resources:
@@ -1658,12 +1820,19 @@ class ExLlamaV3Runtime:
         resources = self._require_resources()
         backend = resources.backend
         text_codec = resources.tokenizer
-        if self._backend_failed:
+        if self._closing or self._generator_state is not _GeneratorLifecycleState.READY:
             raise RuntimeError("ExLlamaV3 runtime is unhealthy after a backend generation failure")
         config = resources.config
         if not isinstance(request, RuntimeGenerationRequest):
             raise TypeError("request must be a RuntimeGenerationRequest")
         generator = self._ensure_generator()
+        self._register_generator_observer(generator)
+        if self._generator_is_known_dead(generator):
+            self._begin_generator_recovery(
+                generator,
+                allow_unstored_error=getattr(generator, "error", None) is None,
+            )
+            raise RuntimeError("ExLlamaV3 runtime is recovering after a backend generation failure")
         embeddings: list[object] = []
         for attachment in request.prompt_attachments:
             if not isinstance(attachment, _VisionAttachment):
@@ -1686,7 +1855,7 @@ class ExLlamaV3Runtime:
                 output_filters,
                 resources.native_eos_token_ids,
             ),
-            self._mark_backend_failed,
+            lambda: self._begin_generator_recovery(generator),
             id_to_piece=resources.output_id_to_piece,
             native_piece_ids=resources.output_native_piece_ids,
         )
@@ -1696,6 +1865,29 @@ class ExLlamaV3Runtime:
         if resources is None:
             return
 
+        self._closing = True
+        recovery_task = self._recovery_task
+        if recovery_task is not None and recovery_task is not asyncio.current_task():
+            with suppress(asyncio.CancelledError, Exception):
+                await recovery_task
+
+        resources = self._resources
+        if resources is None:
+            return
+        quarantined = self._quarantined_generator
+        if quarantined is not None:
+            try:
+                await self._quiesce_and_clear_generator(quarantined)
+            except Exception as exc:
+                self._generator_state = _GeneratorLifecycleState.FAILED
+                raise RuntimeError("Failed to clean quarantined ExLlamaV3 generator safely.") from exc
+            if resources.config.sysmem_kv_cache_mb > 0:
+                raise RuntimeError(
+                    "ExLlamaV3 sysmem-KV generator ownership cannot be reset safely in-process; "
+                    "restart the server process."
+                )
+            self._quarantined_generator = None
+
         generator = self._generator
         model = resources.model
         vision_model = resources.vision_model
@@ -1703,10 +1895,19 @@ class ExLlamaV3Runtime:
         loras = list(resources.loras)
         close_error: BaseException | None = None
         if generator is not None:
-            try:
-                await generator.close()
-            except Exception as exc:  # noqa: BLE001 - cleanup continues after backend close failure
-                close_error = exc
+            if getattr(generator, "error", None) is not None:
+                try:
+                    await self._quiesce_and_clear_generator(generator)
+                except Exception as exc:
+                    self._generator = None
+                    self._quarantined_generator = generator
+                    self._generator_state = _GeneratorLifecycleState.FAILED
+                    raise RuntimeError("Failed to clean poisoned ExLlamaV3 generator safely.") from exc
+            else:
+                try:
+                    await generator.close()
+                except Exception as exc:  # noqa: BLE001 - cleanup continues after backend close failure
+                    close_error = exc
         for lora in reversed(loras):
             try:
                 lora.unload()
@@ -1736,6 +1937,10 @@ class ExLlamaV3Runtime:
             resources.vision_cache.clear()
         self._resources = None
         self._generator = None
+        self._quarantined_generator = None
+        self._recovery_task = None
+        self._observed_generator = None
+        self._generator_state = _GeneratorLifecycleState.READY
 
         if close_error is not None:
             raise RuntimeError("Failed to close ExLlamaV3 runtime cleanly.") from close_error
