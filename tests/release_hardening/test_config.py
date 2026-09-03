@@ -30,6 +30,9 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.ngram_match_min == 0
     assert config.ngram_draft_size == 4
     assert config.moe_cpu_offload_layers == 0
+    assert config.moe_cpu_split_experts == 0
+    assert config.draft_moe_cpu_offload_layers == 0
+    assert config.vision_offload is False
     assert config.moe_cpu_threads is None
     assert config.tool_constraint_mode is ToolConstraintMode.OFF
     assert config.api_keys == ()
@@ -67,6 +70,9 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert runtime.ngram_match_min == 0
     assert runtime.ngram_draft_size == 4
     assert runtime.moe_cpu_offload_layers == 0
+    assert runtime.moe_cpu_split_experts == 0
+    assert runtime.draft_moe_cpu_offload_layers == 0
+    assert runtime.vision_offload is False
     assert runtime.moe_cpu_threads is None
 
     control = config.request_control_config()
@@ -170,6 +176,37 @@ def test_server_config_round_trips_ngram_and_moe_cpu_settings(tmp_path: Path) ->
         ServerConfig(tmp_path / "model", moe_cpu_offload_layers=2, tensor_parallel=True)
     with pytest.raises(ValueError, match="moe_cpu_threads"):
         ServerConfig(tmp_path / "model", moe_cpu_threads=0)
+
+
+def test_server_config_round_trips_thin_runtime_parity_settings(tmp_path: Path) -> None:
+    vision = ServerConfig(
+        tmp_path / "vision",
+        vision_enabled=True,
+        vision_offload=True,
+        moe_cpu_split_experts=3,
+    )
+    vision_runtime = vision.runtime_load_config()
+    assert vision_runtime.vision_offload is True
+    assert vision_runtime.moe_cpu_split_experts == 3
+
+    draft = ServerConfig(
+        tmp_path / "model",
+        mtp_enabled=True,
+        moe_cpu_offload_layers=4,
+        draft_moe_cpu_offload_layers=5,
+        moe_cpu_threads=6,
+    )
+    draft_runtime = draft.runtime_load_config()
+    assert draft_runtime.moe_cpu_offload_layers == 4
+    assert draft_runtime.draft_moe_cpu_offload_layers == 5
+    assert draft_runtime.moe_cpu_threads == 6
+
+    with pytest.raises(ValueError, match="vision_offload requires vision_enabled"):
+        ServerConfig(tmp_path / "model", vision_offload=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ServerConfig(tmp_path / "model", moe_cpu_offload_layers=2, moe_cpu_split_experts=1)
+    with pytest.raises(ValueError, match="requires MTP or an external draft model"):
+        ServerConfig(tmp_path / "model", draft_moe_cpu_offload_layers=1)
 
 
 def test_server_config_model_identity_override_and_context_ceiling(tmp_path: Path) -> None:

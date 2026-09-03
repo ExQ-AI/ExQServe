@@ -43,6 +43,7 @@ class ServerConfig:
     qc_staging: int | None = None
     max_requeue_tokens: int | None = None
     vision_enabled: bool = False
+    vision_offload: bool = False
     allow_remote_images: bool = False
     max_image_bytes: int = 20 * 1024 * 1024
     api_keys: tuple[str, ...] = field(default_factory=tuple, repr=False)
@@ -73,12 +74,15 @@ class ServerConfig:
     ngram_match_min: int = 0
     ngram_draft_size: int = 4
     moe_cpu_offload_layers: int = 0
+    moe_cpu_split_experts: int = 0
+    draft_moe_cpu_offload_layers: int = 0
     moe_cpu_threads: int | None = None
     tool_call_fanout_limit: int = 32
     constrained_parallel_tool_call_limit: int = 8
     reasoning_budget_tokens: int | None = None
     reasoning_budget_message: str = ""
     anthropic_compatibility_profile: str | None = None
+    renderer_workers: int = 1
     _chat_template_text: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -197,8 +201,11 @@ class ServerConfig:
             "ngram_match_min",
             "ngram_draft_size",
             "moe_cpu_offload_layers",
+            "moe_cpu_split_experts",
+            "draft_moe_cpu_offload_layers",
             "tool_call_fanout_limit",
             "constrained_parallel_tool_call_limit",
+            "renderer_workers",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
@@ -208,6 +215,8 @@ class ServerConfig:
                 "sysmem_kv_cache_mb",
                 "ngram_match_min",
                 "moe_cpu_offload_layers",
+                "moe_cpu_split_experts",
+                "draft_moe_cpu_offload_layers",
             }:
                 if value < 0:
                     raise ValueError(f"{name} must be non-negative")
@@ -272,6 +281,7 @@ class ServerConfig:
             qc_staging=self.qc_staging,
             max_requeue_tokens=self.max_requeue_tokens,
             vision_enabled=self.vision_enabled,
+            vision_offload=self.vision_offload,
             allow_remote_images=self.allow_remote_images,
             max_image_bytes=self.max_image_bytes,
             dynamic_draft_tokens=self.dynamic_draft_tokens,
@@ -290,6 +300,8 @@ class ServerConfig:
             ngram_match_min=self.ngram_match_min,
             ngram_draft_size=self.ngram_draft_size,
             moe_cpu_offload_layers=self.moe_cpu_offload_layers,
+            moe_cpu_split_experts=self.moe_cpu_split_experts,
+            draft_moe_cpu_offload_layers=self.draft_moe_cpu_offload_layers,
             moe_cpu_threads=self.moe_cpu_threads,
             lora_adapters=tuple(
                 LoRAAdapterConfig(

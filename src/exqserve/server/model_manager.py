@@ -62,6 +62,11 @@ class ManagedRuntimeLike(Protocol):
         ...
 
 
+class ManagedPreprocessingLike(Protocol):
+    def close(self) -> None:
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class ActiveModelBundle:
     management_id: str
@@ -70,6 +75,7 @@ class ActiveModelBundle:
     controller: ManagedControllerLike
     engine: TokenCountingServingEngineLike
     raw_engine: RawServingEngineLike
+    preprocessing: ManagedPreprocessingLike | None = None
 
 
 class ModelManagerState(str, Enum):
@@ -231,8 +237,10 @@ class ModelManager:
         except Exception as exc:  # noqa: BLE001 - runtime teardown must still be attempted.
             controller_error = exc
         try:
-            # Stop admission first, then let leased submissions release the runtime safely.
+            # Stop admission first, then let leased submissions release preprocessing/runtime safely.
             await self._submissions_quiesced.wait()
+            if bundle.preprocessing is not None:
+                bundle.preprocessing.close()
             await bundle.runtime.close()
         except asyncio.CancelledError as exc:
             raise _RuntimeOwnershipUnresolved(exc) from exc

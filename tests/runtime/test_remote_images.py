@@ -139,7 +139,13 @@ def test_remote_image_fetch_revalidates_and_pins_every_redirect_hop(
 
     monkeypatch.setattr(runtime_module.socket, "getaddrinfo", getaddrinfo)
 
+    class _Socket:
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
     class _Connection:
+        sock = _Socket()
+
         def close(self) -> None:
             return None
 
@@ -153,8 +159,9 @@ def test_remote_image_fetch_revalidates_and_pins_every_redirect_hop(
         def getheader(self, name: str) -> str | None:
             return self._location if name.lower() == "location" else None
 
-        def read(self, _size: int) -> bytes:
-            return self._data
+        def read1(self, _size: int) -> bytes:
+            data, self._data = self._data, b""
+            return data
 
     opened: list[tuple[str, tuple[str, ...]]] = []
     responses = iter(
@@ -164,7 +171,7 @@ def test_remote_image_fetch_revalidates_and_pins_every_redirect_hop(
         ]
     )
 
-    def open_response(resolved):  # type: ignore[no-untyped-def]
+    def open_response(resolved, _deadline):  # type: ignore[no-untyped-def]
         opened.append((resolved.hostname, resolved.addresses))
         return _Connection(), next(responses)
 
@@ -175,6 +182,59 @@ def test_remote_image_fetch_revalidates_and_pins_every_redirect_hop(
         ("example.com", ("93.184.216.34",)),
         ("cdn.example.com", ("142.250.72.14",)),
     ]
+
+
+def test_remote_image_slow_drip_obeys_total_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(runtime_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(runtime_module, "_REMOTE_IMAGE_TOTAL_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(
+        runtime_module,
+        "_resolve_remote_image_url",
+        lambda _source: runtime_module._ResolvedRemoteImageUrl(
+            "https://example.com/image.png",
+            "https",
+            "example.com",
+            443,
+            ("93.184.216.34",),
+            "/image.png",
+        ),
+    )
+
+    timeouts: list[float] = []
+
+    class _Socket:
+        def settimeout(self, timeout: float) -> None:
+            timeouts.append(timeout)
+
+    class _Connection:
+        sock = _Socket()
+
+        def close(self) -> None:
+            return None
+
+    class _Response:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def read1(self, _size: int) -> bytes:
+            now[0] += 0.4
+            return b"x"
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_open_remote_image_response",
+        lambda _resolved, _deadline: (_Connection(), _Response()),
+    )
+
+    with pytest.raises(TimeoutError, match="total timeout"):
+        runtime_module._remote_image_bytes("https://example.com/image.png", 1024)
+
+    assert timeouts == pytest.approx([1.0, 0.6, 0.2])
 
 
 def test_remote_image_redirect_to_private_dns_is_rejected_before_second_connect(
@@ -206,7 +266,7 @@ def test_remote_image_redirect_to_private_dns_is_rejected_before_second_connect(
 
     opened: list[str] = []
 
-    def open_response(resolved):  # type: ignore[no-untyped-def]
+    def open_response(resolved, _deadline):  # type: ignore[no-untyped-def]
         opened.append(resolved.hostname)
         return _Connection(), _Response()
 

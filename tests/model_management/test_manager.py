@@ -117,6 +117,17 @@ class _UnresolvedCloseRuntime(_Runtime):
         raise RuntimeError("restart the server process")
 
 
+class _Preprocessing:
+    def __init__(self, name: str, log: list[str]) -> None:
+        self.name = name
+        self.log = log
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.log.append(f"preprocessing:{self.name}")
+
+
 def _bundle(name: str, log: list[str]) -> ActiveModelBundle:
     return ActiveModelBundle(
         management_id=name,
@@ -174,6 +185,51 @@ def test_switch_closes_old_controller_before_runtime_and_publishes_new_model(tmp
         assert manager.current_model().id == "second"  # type: ignore[union-attr]
         assert built == ["second"]
         assert log == ["controller:first", "runtime:first"]
+
+    asyncio.run(scenario())
+
+
+def test_switch_waits_for_submission_then_closes_preprocessing_before_runtime(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        log: list[str] = []
+        preprocessing = _Preprocessing("first", log)
+        engine = _BlockingEngine()
+        initial = ActiveModelBundle(
+            management_id="first",
+            served_model=ServedModelInfo("first", created=1, context_length=4096),
+            runtime=_Runtime("first", log),
+            controller=_Controller("first", log),
+            engine=engine,
+            raw_engine=_RawEngine(),
+            preprocessing=preprocessing,
+        )
+
+        async def build(model_id: str, _path: Path) -> ActiveModelBundle:
+            return _bundle(model_id, log)
+
+        manager = ModelManager(
+            {"first": tmp_path / "first", "second": tmp_path / "second"},
+            initial,
+            build,
+        )
+        first = asyncio.create_task(manager.submit(_request()))
+        second = asyncio.create_task(manager.submit(_request(request_id="req2")))
+        await engine.two_entered.wait()
+        switch = asyncio.create_task(manager.switch("second"))
+        await asyncio.sleep(0)
+
+        assert preprocessing.closed is False
+        assert log == ["controller:first"]
+        assert not switch.done()
+
+        engine.release.set()
+        await first
+        await second
+        result = await switch
+
+        assert result.state is ModelManagerState.READY
+        assert preprocessing.closed is True
+        assert log[:3] == ["controller:first", "preprocessing:first", "runtime:first"]
 
     asyncio.run(scenario())
 

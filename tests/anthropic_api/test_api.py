@@ -34,6 +34,7 @@ class _Session:
             ),
         ]
         self.cancel_calls = 0
+        self.input_token_count = 4
 
     def __aiter__(self) -> AsyncIterator[GenerationEvent]:
         return self
@@ -101,6 +102,7 @@ def test_messages_nonstream_and_stream_use_anthropic_wire_shape() -> None:
         assert streamed.status_code == 200
         assert streamed.headers["content-type"].startswith("text/event-stream")
         assert "event: message_start" in streamed.text
+        assert '"usage":{"input_tokens":4,"output_tokens":0}' in streamed.text
         assert '"type":"text_delta","text":"hello"' in streamed.text
         assert "event: message_stop" in streamed.text
         assert len(engine.requests) == 2

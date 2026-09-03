@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -16,6 +17,7 @@ from fastapi.responses import JSONResponse
 from exqserve.agent.reasoning import ReasoningPolicy
 from exqserve.agent.tools import ToolPolicy
 from exqserve.control.request import RequestController
+from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
 from exqserve.core.model import ServedModelInfo
 from exqserve.model.contracts import (
     ReasoningControlProvider,
@@ -27,7 +29,15 @@ from exqserve.model.contracts import (
     ToolGenerationConstraint,
     has_exposed_strict_tool,
 )
-from exqserve.model.registry import default_model_dialect_registry
+from exqserve.model.registry import (
+    DeepSeekV4Dialect,
+    Gemma4Dialect,
+    GenericHFDialect,
+    Glm5Dialect,
+    MuseGlimmerDialect,
+    QwenDialect,
+    default_model_dialect_registry,
+)
 from exqserve.observability.capture import CaptureManager, CaptureMode, JsonlCaptureSink
 from exqserve.observability.http import create_metrics_router
 from exqserve.observability.metrics import MetricsRegistry
@@ -51,11 +61,13 @@ from exqserve.server.model_manager import (
     ActiveModelBundle,
     ManagedRawServingEngine,
     ModelManager,
+    ModelManagerState,
     discover_model_directories,
 )
 from exqserve.server.security import BearerAuthMiddleware
 from exqserve.serving.contracts import IncrementalParserLike
 from exqserve.serving.engine import RequestControllerLike, RuntimeTemplateAdapter, ServingEngine
+from exqserve.serving.preprocessing import RendererLane, RendererLanePool, await_task_termination
 from exqserve.serving.raw import RawRequestController, RawServingEngine
 from exqserve.state.store import InMemoryResponseStore
 
@@ -167,6 +179,78 @@ def _dialect_parser(
     return dialect.create_parser(request_id, reasoning, tool_policy)
 
 
+def _is_builtin_dialect(dialect: ModelDialect) -> bool:
+    return type(dialect) in {
+        QwenDialect,
+        Gemma4Dialect,
+        Glm5Dialect,
+        DeepSeekV4Dialect,
+        MuseGlimmerDialect,
+        GenericHFDialect,
+    }
+
+
+async def _rollback_failed_bundle(
+    runtime: ServerRuntimeLike,
+    controller: RequestController | None,
+    preprocessing: RendererLanePool | None,
+) -> None:
+    errors: list[BaseException] = []
+    if controller is not None:
+        try:
+            await controller.close()
+        except BaseException as exc:  # noqa: BLE001 - rollback must continue after any cleanup failure.
+            errors.append(exc)
+    if preprocessing is not None:
+        try:
+            preprocessing.close()
+        except BaseException as exc:  # noqa: BLE001 - rollback must continue after any cleanup failure.
+            errors.append(exc)
+    try:
+        await runtime.close()
+    except BaseException as exc:  # noqa: BLE001 - rollback must report runtime cleanup failure.
+        errors.append(exc)
+    if errors:
+        raise BaseExceptionGroup("model bundle rollback failed", errors)
+
+
+def _run_cleanup_sync(cleanup_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(cleanup_factory())
+        return
+
+    errors: list[BaseException] = []
+
+    def runner() -> None:
+        try:
+            asyncio.run(cleanup_factory())
+        except BaseException as exc:  # noqa: BLE001 - rollback must continue after any cleanup failure.
+            errors.append(exc)
+
+    thread = threading.Thread(target=runner, name="exqserve-build-rollback")
+    thread.start()
+    thread.join()
+    if errors:
+        raise errors[0]
+
+
+def _rollback_failed_bundle_sync(
+    runtime: ServerRuntimeLike,
+    controller: RequestController | None,
+    preprocessing: RendererLanePool | None,
+    build_error: BaseException,
+) -> None:
+    try:
+        _run_cleanup_sync(lambda: _rollback_failed_bundle(runtime, controller, preprocessing))
+    except BaseException as cleanup_error:  # noqa: BLE001 - unresolved ownership must be explicit.
+        raise BaseExceptionGroup(
+            "model bundle construction failed and runtime ownership could not be resolved",
+            [build_error, cleanup_error],
+        ) from None
+
+
 def _build_model_bundle(
     config: ServerConfig,
     metrics: MetricsRegistry,
@@ -178,93 +262,120 @@ def _build_model_bundle(
     runtime_factory: RuntimeFactory | None,
 ) -> ActiveModelBundle:
     runtime_object = _load_runtime(config, model_directory, runtime, runtime_factory)
-    tool_options = config.tool_serving_options()
-    served_model = ServedModelInfo(
-        public_model_id,
-        int(time.time()),
-        config.effective_context_length(runtime_object.model_metadata.max_context_tokens),
-    )
-    request_control = config.request_control_config(runtime_object.model_metadata.max_context_tokens)
-    controller = RequestController(runtime_object, request_control)
-    template_adapter = RuntimeTemplateAdapter(runtime_object)
-    dialect = default_model_dialect_registry().resolve(
-        runtime_object.model_metadata.architecture,
-        config.model_dialect,
-    )
-    compiler = dialect.create_compiler(template_adapter)
-
-    tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
-    if isinstance(dialect, ToolConstraintProvider):
-        constraint_provider = dialect
-        strict_capable = (
-            isinstance(dialect, StrictToolConstraintProvider)
-            and dialect.supports_strict_tools
+    controller: RequestController | None = None
+    preprocessing_pool: RendererLanePool | None = None
+    try:
+        tool_options = config.tool_serving_options()
+        served_model = ServedModelInfo(
+            public_model_id,
+            int(time.time()),
+            config.effective_context_length(runtime_object.model_metadata.max_context_tokens),
         )
-
-        def create_tool_constraint(tool_policy: ToolPolicy) -> ToolGenerationConstraint | None:
-            if has_exposed_strict_tool(tool_policy) and not strict_capable:
-                raise ToolConstraintUnsupported(
-                    f"model dialect {dialect.dialect_id!r} does not support strict function tools"
-                )
-            return constraint_provider.create_tool_constraint(
-                tool_policy,
-                tool_options.constraint_mode,
+        request_control = config.request_control_config(runtime_object.model_metadata.max_context_tokens)
+        controller = RequestController(runtime_object, request_control)
+        dialect = default_model_dialect_registry().resolve(
+            runtime_object.model_metadata.architecture,
+            config.model_dialect,
+        )
+        if config.renderer_workers > 1 and not _is_builtin_dialect(dialect):
+            raise ValueError(
+                "renderer_workers > 1 is not supported for external Model Dialect Plugin API v1 dialects"
             )
 
-        tool_constraint_factory = create_tool_constraint
-    elif tool_options.constraint_mode is not ToolConstraintMode.OFF:
-        raise ValueError(
-            f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
+        lanes: list[RendererLane] = []
+        if config.renderer_workers == 1:
+            adapter = RuntimeTemplateAdapter(runtime_object)
+            lanes.append(RendererLane(runtime_object, dialect.create_compiler(adapter)))
+        else:
+            renderer_factory = getattr(runtime_object, "create_prompt_renderer", None)
+            if not callable(renderer_factory):
+                raise ValueError(
+                    "renderer_workers > 1 requires a runtime that can create independent prompt renderers"
+                )
+            for _ in range(config.renderer_workers):
+                renderer = renderer_factory()
+                adapter = RuntimeTemplateAdapter(renderer)
+                lanes.append(RendererLane(renderer, dialect.create_compiler(adapter)))
+        preprocessing_pool = RendererLanePool(tuple(lanes), metrics)
+
+        tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
+        if isinstance(dialect, ToolConstraintProvider):
+            constraint_provider = dialect
+            strict_capable = (
+                isinstance(dialect, StrictToolConstraintProvider)
+                and dialect.supports_strict_tools
+            )
+
+            def create_tool_constraint(tool_policy: ToolPolicy) -> ToolGenerationConstraint | None:
+                if has_exposed_strict_tool(tool_policy) and not strict_capable:
+                    raise ToolConstraintUnsupported(
+                        f"model dialect {dialect.dialect_id!r} does not support strict function tools"
+                    )
+                return constraint_provider.create_tool_constraint(
+                    tool_policy,
+                    tool_options.constraint_mode,
+                )
+
+            tool_constraint_factory = create_tool_constraint
+        elif tool_options.constraint_mode is not ToolConstraintMode.OFF:
+            raise ValueError(
+                f"model dialect {dialect.dialect_id!r} does not support constrained tool generation"
+            )
+
+        def parser_factory(
+            request_id: str,
+            reasoning: ReasoningPolicy,
+            tool_policy: ToolPolicy,
+        ) -> IncrementalParserLike:
+            return _dialect_parser(dialect, request_id, reasoning, tool_policy)
+
+        reasoning_control_factory: Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None] | None = None
+        if isinstance(dialect, ReasoningControlProvider):
+            reasoning_provider = dialect
+
+            def create_reasoning_control(
+                reasoning: ReasoningPolicy, tool_policy: ToolPolicy
+            ) -> ReasoningControlSpec | None:
+                return reasoning_provider.create_reasoning_control(reasoning, tool_policy)
+
+            reasoning_control_factory = create_reasoning_control
+
+        def tokenize_reasoning_control(text: str) -> tuple[int, ...]:
+            return runtime_object.tokenize_encoded_prompt(text).input_ids
+
+        engine = ServingEngine(
+            None,
+            parser_factory,
+            cast(RequestControllerLike, controller),
+            tool_constraint_factory,
+            tool_options.fanout_limit,
+            tool_options.constrained_parallel_limit,
+            request_control.resolve_output_limit,
+            reasoning_control_factory,
+            tokenize_reasoning_control,
+            config.reasoning_budget_default(),
+            preprocessing_pool=preprocessing_pool,
         )
-
-    def parser_factory(
-        request_id: str,
-        reasoning: ReasoningPolicy,
-        tool_policy: ToolPolicy,
-    ) -> IncrementalParserLike:
-        return _dialect_parser(dialect, request_id, reasoning, tool_policy)
-
-    reasoning_control_factory: Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None] | None = None
-    if isinstance(dialect, ReasoningControlProvider):
-        reasoning_provider = dialect
-
-        def create_reasoning_control(
-            reasoning: ReasoningPolicy, tool_policy: ToolPolicy
-        ) -> ReasoningControlSpec | None:
-            return reasoning_provider.create_reasoning_control(reasoning, tool_policy)
-
-        reasoning_control_factory = create_reasoning_control
-
-    def tokenize_reasoning_control(text: str) -> tuple[int, ...]:
-        return runtime_object.tokenize_encoded_prompt(text).input_ids
-
-    engine = ServingEngine(
-        compiler,
-        parser_factory,
-        cast(RequestControllerLike, controller),
-        tool_constraint_factory,
-        tool_options.fanout_limit,
-        tool_options.constrained_parallel_limit,
-        request_control.resolve_output_limit,
-        reasoning_control_factory,
-        tokenize_reasoning_control,
-        config.reasoning_budget_default(),
-    )
-    raw_engine = RawServingEngine(
-        runtime_object,
-        cast(RawRequestController, controller),
-        output_limit_resolver=request_control.resolve_output_limit,
-    )
-    observed = ObservedServingEngine(engine, metrics, capture=capture)
-    observed_raw = ObservedRawServingEngine(raw_engine, metrics, capture=capture)
-    return ActiveModelBundle(
-        management_id,
-        served_model,
-        runtime_object,
-        controller,
-        observed,
-        observed_raw,
-    )
+        raw_engine = RawServingEngine(
+            None,
+            cast(RawRequestController, controller),
+            output_limit_resolver=request_control.resolve_output_limit,
+            preprocessing_pool=preprocessing_pool,
+        )
+        observed = ObservedServingEngine(engine, metrics, capture=capture)
+        observed_raw = ObservedRawServingEngine(raw_engine, metrics, capture=capture)
+        return ActiveModelBundle(
+            management_id,
+            served_model,
+            runtime_object,
+            controller,
+            observed,
+            observed_raw,
+            preprocessing_pool,
+        )
+    except BaseException as build_error:
+        _rollback_failed_bundle_sync(runtime_object, controller, preprocessing_pool, build_error)
+        raise
 
 
 def compose_server(
@@ -294,19 +405,57 @@ def compose_server(
     )
 
     async def build_bundle(model_id: str, model_directory: Path) -> ActiveModelBundle:
-        return await asyncio.to_thread(
-            _build_model_bundle,
-            config,
-            metrics,
-            capture,
-            model_id,
-            model_directory,
-            model_id,
-            None,
-            runtime_factory,
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                _build_model_bundle,
+                config,
+                metrics,
+                capture,
+                model_id,
+                model_directory,
+                model_id,
+                None,
+                runtime_factory,
+            )
         )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            await await_task_termination(task)
+            try:
+                orphaned_bundle = task.result()
+            except Exception:  # noqa: BLE001 - failed worker build already performed rollback.
+                raise cancelled
+
+            cleanup_task = asyncio.create_task(
+                _rollback_failed_bundle(
+                    cast(ServerRuntimeLike, orphaned_bundle.runtime),
+                    cast(RequestController, orphaned_bundle.controller),
+                    cast(RendererLanePool | None, orphaned_bundle.preprocessing),
+                )
+            )
+            await await_task_termination(cleanup_task)
+            try:
+                cleanup_task.result()
+            except BaseException as cleanup_error:  # noqa: BLE001 - unresolved ownership is fatal.
+                raise BaseExceptionGroup(
+                    "cancelled model build left runtime ownership unresolved",
+                    [cancelled, cleanup_error],
+                ) from None
+            raise
 
     model_manager = ModelManager(candidates, initial_bundle, build_bundle)
+
+    def current_engine_stats() -> RuntimeEngineStats:
+        if model_manager.state is not ModelManagerState.READY:
+            return RuntimeEngineStats(RuntimeEngineState.UNAVAILABLE)
+        current_runtime = model_manager.current_runtime
+        if current_runtime is None:
+            return RuntimeEngineStats(RuntimeEngineState.UNAVAILABLE)
+        stats = getattr(current_runtime, "engine_stats", None)
+        return stats if isinstance(stats, RuntimeEngineStats) else RuntimeEngineStats(RuntimeEngineState.UNAVAILABLE)
+
+    metrics.bind_engine_stats_provider(current_engine_stats)
     raw_manager = ManagedRawServingEngine(model_manager)
     store_options = config.response_store_options()
     response_store = InMemoryResponseStore(
@@ -327,7 +476,12 @@ def compose_server(
         finally:
             await model_manager.close()
 
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(
+        lifespan=lifespan,
+        docs_url=None if config.api_keys else "/docs",
+        redoc_url=None if config.api_keys else "/redoc",
+        openapi_url=None if config.api_keys else "/openapi.json",
+    )
     app.include_router(
         create_openai_router(
             model_manager,

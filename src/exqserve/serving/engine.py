@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -79,6 +78,7 @@ from exqserve.serving.contracts import (
     ServingRejected,
     ServingRequest,
 )
+from exqserve.serving.preprocessing import RendererLanePool, await_task_termination
 from exqserve.serving.runtime_events import (
     completion_reason_from_runtime,
     timing_event_from_runtime,
@@ -271,7 +271,7 @@ def _safe_error(
 class ServingEngine:
     def __init__(
         self,
-        compiler: PromptCompilerLike,
+        compiler: PromptCompilerLike | None,
         parser_factory: ParserFactory,
         controller: RequestControllerLike,
         tool_constraint_factory: ToolConstraintFactory | None = None,
@@ -281,6 +281,7 @@ class ServingEngine:
         reasoning_control_factory: ReasoningControlFactory | None = None,
         reasoning_control_tokenizer: ReasoningControlTokenizer | None = None,
         reasoning_budget_default: ReasoningBudgetDefault | None = None,
+        preprocessing_pool: RendererLanePool | None = None,
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
@@ -292,7 +293,10 @@ class ServingEngine:
             raise TypeError("constrained_parallel_tool_call_limit must be an integer")
         if constrained_parallel_tool_call_limit <= 0:
             raise ValueError("constrained_parallel_tool_call_limit must be positive")
+        if compiler is None and preprocessing_pool is None:
+            raise ValueError("compiler or preprocessing_pool is required")
         self._compiler = compiler
+        self._preprocessing_pool = preprocessing_pool
         self._parser_factory = parser_factory
         self._controller = controller
         self._tool_constraint_factory = tool_constraint_factory
@@ -433,7 +437,9 @@ class ServingEngine:
         )
         return _EffectiveReasoningBudget(max_tokens, message, source, control, close_ids[0])
 
-    def _compile_request(self, request: ServingRequest) -> CompiledPrompt:
+    def _compile_request_with_compiler(
+        self, compiler: PromptCompilerLike, request: ServingRequest
+    ) -> CompiledPrompt:
         if not isinstance(request, ServingRequest):
             raise TypeError("request must be a ServingRequest")
 
@@ -448,7 +454,7 @@ class ServingEngine:
             )
 
         try:
-            return self._compiler.compile(request.input, request.reasoning, request.tools)
+            return compiler.compile(request.input, request.reasoning, request.tools)
         except (TypeError, ValueError) as exc:
             logger.warning(
                 "Prompt compilation rejected for request %s: %s: %s",
@@ -473,7 +479,22 @@ class ServingEngine:
                 )
             ) from exc
 
-    async def _compile_request_async(self, request: ServingRequest) -> CompiledPrompt:
+    def _compile_request(self, request: ServingRequest) -> CompiledPrompt:
+        compiler = self._compiler
+        if compiler is None:
+            raise RuntimeError("direct compiler is unavailable while preprocessing pool is active")
+        return self._compile_request_with_compiler(compiler, request)
+
+    async def _compile_request_async(
+        self, request: ServingRequest, *, kind: str = "chat"
+    ) -> CompiledPrompt:
+        pool = self._preprocessing_pool
+        if pool is not None:
+            return await pool.run(
+                kind,
+                lambda lane: self._compile_request_with_compiler(lane.compiler, request),
+            )
+
         async with self._compile_lock:
             task = asyncio.create_task(asyncio.to_thread(self._compile_request, request))
             try:
@@ -482,12 +503,11 @@ class ServingEngine:
                 # The worker thread cannot be cancelled. Keep the compiler lease
                 # until it exits so a cancelled request cannot overlap a later
                 # tokenizer/vision compilation on the same runtime objects.
-                with contextlib.suppress(Exception):
-                    await task
+                await await_task_termination(task)
                 raise
 
     async def count_input_tokens(self, request: ServingRequest) -> int:
-        return len((await self._compile_request_async(request)).input_ids)
+        return len((await self._compile_request_async(request, kind="count_tokens")).input_ids)
 
     async def submit(self, request: ServingRequest) -> ServingSession:
         if (
@@ -697,6 +717,10 @@ class ServingSession:
         self._reasoning_budget_duplicate_close_pending = False
         self._reasoning_budget_duplicate_close_consumed_in_delta = False
         self._reasoning_budget_post_force_reasoning_tail = ""
+
+    @property
+    def input_token_count(self) -> int:
+        return len(self._compiled_prompt.input_ids)
 
     async def _reasoning_budget_failure(self, code: str, message: str) -> None:
         if self._terminal:

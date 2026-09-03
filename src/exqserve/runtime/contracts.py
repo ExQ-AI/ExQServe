@@ -124,6 +124,7 @@ class ExLlamaV3LoadConfig:
     qc_staging: int | None = None
     max_requeue_tokens: int | None = None
     vision_enabled: bool = False
+    vision_offload: bool = False
     allow_remote_images: bool = False
     max_image_bytes: int = 20 * 1024 * 1024
     dynamic_draft_tokens: bool = False
@@ -143,6 +144,8 @@ class ExLlamaV3LoadConfig:
     ngram_match_min: int = 0
     ngram_draft_size: int = 4
     moe_cpu_offload_layers: int = 0
+    moe_cpu_split_experts: int = 0
+    draft_moe_cpu_offload_layers: int = 0
     moe_cpu_threads: int | None = None
 
     def __post_init__(self) -> None:
@@ -204,6 +207,7 @@ class ExLlamaV3LoadConfig:
         _validate_bool("autosplit_no_forward", self.autosplit_no_forward)
         _validate_bool("cuda_malloc_async", self.cuda_malloc_async)
         _validate_bool("vision_enabled", self.vision_enabled)
+        _validate_bool("vision_offload", self.vision_offload)
         _validate_bool("allow_remote_images", self.allow_remote_images)
         _validate_bool("tensor_parallel", self.tensor_parallel)
         _validate_bool("dynamic_draft_tokens", self.dynamic_draft_tokens)
@@ -233,6 +237,8 @@ class ExLlamaV3LoadConfig:
             raise TypeError("vision_cache_mb must be an integer")
         if self.vision_cache_mb < 0:
             raise ValueError("vision_cache_mb must be non-negative")
+        if self.vision_offload and not self.vision_enabled:
+            raise ValueError("vision_offload requires vision_enabled")
         if not isinstance(self.sysmem_kv_cache_mb, int) or isinstance(
             self.sysmem_kv_cache_mb, bool
         ):
@@ -259,6 +265,18 @@ class ExLlamaV3LoadConfig:
             raise TypeError("moe_cpu_offload_layers must be an integer")
         if self.moe_cpu_offload_layers < 0:
             raise ValueError("moe_cpu_offload_layers must be non-negative")
+        if not isinstance(self.moe_cpu_split_experts, int) or isinstance(
+            self.moe_cpu_split_experts, bool
+        ):
+            raise TypeError("moe_cpu_split_experts must be an integer")
+        if self.moe_cpu_split_experts < 0:
+            raise ValueError("moe_cpu_split_experts must be non-negative")
+        if not isinstance(self.draft_moe_cpu_offload_layers, int) or isinstance(
+            self.draft_moe_cpu_offload_layers, bool
+        ):
+            raise TypeError("draft_moe_cpu_offload_layers must be an integer")
+        if self.draft_moe_cpu_offload_layers < 0:
+            raise ValueError("draft_moe_cpu_offload_layers must be non-negative")
         if self.moe_cpu_threads is not None:
             if not isinstance(self.moe_cpu_threads, int) or isinstance(self.moe_cpu_threads, bool):
                 raise TypeError("moe_cpu_threads must be an integer or None")
@@ -281,6 +299,24 @@ class ExLlamaV3LoadConfig:
             raise ValueError("dynamic_draft_tokens requires MTP or an external draft model")
         if self.moe_cpu_offload_layers and self.tensor_parallel:
             raise ValueError("moe_cpu_offload_layers requires layer-split mode, not tensor parallel")
+        if self.moe_cpu_split_experts and self.moe_cpu_offload_layers:
+            raise ValueError("moe_cpu_split_experts cannot be combined with moe_cpu_offload_layers")
+        if self.moe_cpu_split_experts and self.draft_moe_cpu_offload_layers and self.mtp_enabled:
+            raise ValueError(
+                "moe_cpu_split_experts cannot be combined with draft_moe_cpu_offload_layers"
+            )
+        if self.moe_cpu_split_experts and self.tensor_parallel:
+            raise ValueError("moe_cpu_split_experts requires layer-split mode, not tensor parallel")
+        if self.draft_moe_cpu_offload_layers and not (
+            self.mtp_enabled or self.draft_model_directory is not None
+        ):
+            raise ValueError(
+                "draft_moe_cpu_offload_layers requires MTP or an external draft model"
+            )
+        if self.draft_moe_cpu_offload_layers and self.tensor_parallel:
+            raise ValueError(
+                "draft_moe_cpu_offload_layers requires layer-split mode, not tensor parallel"
+            )
         if not isinstance(self.draft_tokens, int) or isinstance(self.draft_tokens, bool):
             raise TypeError("draft_tokens must be an integer")
         if self.draft_tokens <= 0:

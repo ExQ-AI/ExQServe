@@ -167,6 +167,22 @@ def test_composed_anthropic_text_thinking_tool_and_model_switch(tmp_path: Path) 
             assert text.status_code == 200, text.text
             assert text.json()["content"] == [{"type": "text", "text": "hello"}]
 
+            streamed = await _request(
+                composed.app,
+                "POST",
+                "/v1/messages",
+                headers=_headers("secret"),
+                json={
+                    "model": "first",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking": {"type": "disabled"},
+                    "stream": True,
+                },
+            )
+            assert streamed.status_code == 200, streamed.text
+            assert '"usage":{"input_tokens":1,"output_tokens":0}' in streamed.text
+
             thinking = await _request(
                 composed.app,
                 "POST",

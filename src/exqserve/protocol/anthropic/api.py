@@ -140,6 +140,13 @@ def _is_terminal(event: GenerationEvent) -> bool:
     return isinstance(event, GenerationCompleted | GenerationFailed | GenerationCancelled)
 
 
+def _session_input_token_count(session: ServingSessionLike) -> int:
+    value = getattr(session, "input_token_count", None)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise AnthropicProtocolError(500, "api_error", "Input token count is unavailable.")
+    return value
+
+
 async def _consume(
     session: ServingSessionLike,
     accumulator: AnthropicMessageAccumulator,
@@ -213,6 +220,7 @@ def create_anthropic_router(
                 serializer = AnthropicMessageStreamSerializer(
                     parsed.model,
                     omit_thinking=parsed.omit_thinking,
+                    input_token_count=_session_input_token_count(session),
                 )
                 return StreamingResponse(
                     _iter_sse(session, serializer),

@@ -185,15 +185,21 @@ class AnthropicMessageStreamSerializer:
         *,
         message_id: str | None = None,
         omit_thinking: bool = False,
+        input_token_count: int = 0,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
         if not isinstance(omit_thinking, bool):
             raise TypeError("omit_thinking must be a bool")
+        if not isinstance(input_token_count, int) or isinstance(input_token_count, bool):
+            raise TypeError("input_token_count must be an integer")
+        if input_token_count < 0:
+            raise ValueError("input_token_count must be non-negative")
         self._model = model
         self._id = _message_id(message_id)
         self._signature = _local_signature(self._id)
         self._omit_thinking = omit_thinking
+        self._input_token_count = input_token_count
         self._next_block_index = 0
         self._reasoning_block: int | None = None
         self._text_block: int | None = None
@@ -226,7 +232,7 @@ class AnthropicMessageStreamSerializer:
                             "model": self._model,
                             "stop_reason": None,
                             "stop_sequence": None,
-                            "usage": anthropic_usage(None),
+                            "usage": anthropic_usage(TokenUsage(input_tokens=self._input_token_count)),
                         },
                     },
                 ),

@@ -240,6 +240,13 @@ class ObservedServingSession:
     def compiled_prompt(self) -> ObservedCompiledPromptLike:
         return self._session.compiled_prompt
 
+    @property
+    def input_token_count(self) -> int:
+        value = getattr(self._session, "input_token_count", None)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError("observed serving session does not expose input token count")
+        return value
+
     def __aiter__(self) -> Self:
         return self
 

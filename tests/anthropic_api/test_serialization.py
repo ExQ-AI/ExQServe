@@ -133,7 +133,9 @@ def test_nonstream_accumulator_preserves_repeated_text_and_reasoning_blocks() ->
 
 
 def test_stream_serializer_emits_anthropic_event_flow_and_tool_json_delta() -> None:
-    serializer = AnthropicMessageStreamSerializer("local-qwen", message_id="msg_stream")
+    serializer = AnthropicMessageStreamSerializer(
+        "local-qwen", message_id="msg_stream", input_token_count=9
+    )
     payloads: list[tuple[str, dict[str, object]]] = []
     for event in _events():
         payloads.extend(serializer.feed(event))
@@ -155,6 +157,10 @@ def test_stream_serializer_emits_anthropic_event_flow_and_tool_json_delta() -> N
         "message_stop",
     ]
     assert payloads[0][1]["message"]["id"] == "msg_stream"  # type: ignore[index]
+    assert payloads[0][1]["message"]["usage"] == {  # type: ignore[index]
+        "input_tokens": 9,
+        "output_tokens": 0,
+    }
     assert payloads[1][1] == {
         "type": "content_block_start",
         "index": 0,

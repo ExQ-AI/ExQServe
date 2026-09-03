@@ -91,6 +91,14 @@ class VisionEmbeddingCache:
             self._hits += 1
             return entry[0]
 
+    def peek(self, key: str) -> object | None:
+        """Return a cached embedding without changing public hit/miss accounting."""
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        with self._lock:
+            entry = self._entries.get(key)
+            return None if entry is None else entry[0]
+
     def put(self, key: str, embedding: object) -> bool:
         if not isinstance(key, str):
             raise TypeError("key must be a string")

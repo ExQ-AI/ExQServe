@@ -34,6 +34,7 @@ class _Session:
     def __init__(self, events: list[GenerationEvent]) -> None:
         self._events = list(events)
         self.cancel_calls = 0
+        self.input_token_count = 9
 
     def __aiter__(self) -> AsyncIterator[GenerationEvent]:
         return self

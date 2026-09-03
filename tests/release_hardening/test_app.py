@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
+import pytest
 
+import exqserve.server.app as app_module
+from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
 from exqserve.core.sampling import SamplingOverride, SamplingOverridePolicy
 from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import ToolConstraintMode
+from exqserve.model.registry import GenericHFDialect
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
@@ -85,6 +90,64 @@ class _FakeRuntime:
 
     async def close(self) -> None:
         self.close_calls += 1
+        self.is_ready = False
+
+
+class _RendererRuntime(_FakeRuntime):
+    def __init__(self, *, fail_renderer_at: int | None = None) -> None:
+        super().__init__()
+        self.renderer_calls = 0
+        self.fail_renderer_at = fail_renderer_at
+
+    def create_prompt_renderer(self) -> _FakeRuntime:
+        self.renderer_calls += 1
+        if self.fail_renderer_at == self.renderer_calls:
+            raise RuntimeError("renderer construction failed")
+        return self
+
+
+class _BlockingRendererRuntime(_RendererRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renderer_started = threading.Event()
+        self.renderer_release = threading.Event()
+
+    def create_prompt_renderer(self) -> _FakeRuntime:
+        self.renderer_calls += 1
+        if self.renderer_calls == 1:
+            self.renderer_started.set()
+            self.renderer_release.wait(timeout=2)
+        return self
+
+
+class _FailingCloseRendererRuntime(_RendererRuntime):
+    async def close(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("runtime cleanup failed")
+
+
+class _StatsRuntime(_FakeRuntime):
+    def __init__(self, active_jobs: int) -> None:
+        super().__init__()
+        self._active_jobs = active_jobs
+        self.engine_stats_reads = 0
+
+    @property
+    def engine_stats(self) -> RuntimeEngineStats:
+        self.engine_stats_reads += 1
+        return RuntimeEngineStats(RuntimeEngineState.READY, active_jobs=self._active_jobs)
+
+
+class _BlockingCloseStatsRuntime(_StatsRuntime):
+    def __init__(self, active_jobs: int) -> None:
+        super().__init__(active_jobs)
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_release.wait()
         self.is_ready = False
 
 
@@ -181,6 +244,246 @@ def test_composition_loads_runtime_and_serves_health_metrics_and_chat(tmp_path: 
 
         assert runtime.close_calls == 1
         assert runtime.is_ready is False
+
+    asyncio.run(scenario())
+
+
+def test_metrics_do_not_read_old_runtime_while_model_switch_is_closing_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / "config.json").write_text("{}", encoding="utf-8")
+        (second_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        old_runtime = _BlockingCloseStatsRuntime(active_jobs=7)
+        new_runtime = _StatsRuntime(active_jobs=1)
+        composed = compose_server(
+            ServerConfig(first_dir, model_root=tmp_path, served_model_id="first"),
+            runtime=old_runtime,
+            runtime_factory=lambda: new_runtime,
+        )
+
+        async with composed.app.router.lifespan_context(composed.app):
+            ready = await _request(composed.app, "GET", "/metrics")
+            assert ready.status_code == 200
+            assert "exqserve_engine_active_jobs 7.0" in ready.text
+            assert old_runtime.engine_stats_reads == 1
+
+            switch = asyncio.create_task(composed.model_manager.switch("second"))
+            await old_runtime.close_started.wait()
+            reads_before_switch_scrape = old_runtime.engine_stats_reads
+
+            switching = await _request(composed.app, "GET", "/metrics")
+            assert switching.status_code == 200
+            assert 'exqserve_engine_state{state="unavailable"} 1.0' in switching.text
+            assert "exqserve_engine_active_jobs NaN" in switching.text
+            assert old_runtime.engine_stats_reads == reads_before_switch_scrape
+
+            old_runtime.close_release.set()
+            result = await switch
+            assert result.current_model == "second"
+
+            ready_again = await _request(composed.app, "GET", "/metrics")
+            assert "exqserve_engine_active_jobs 1.0" in ready_again.text
+            assert new_runtime.engine_stats_reads == 1
+
+    asyncio.run(scenario())
+
+
+def test_renderer_workers_gt_one_rejects_external_plugin_v1_subclass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ExternalGenericDialect(GenericHFDialect):
+        pass
+
+    class ExternalRegistry:
+        def resolve(self, architecture: str | None, selector: str = "auto") -> GenericHFDialect:
+            del architecture, selector
+            return ExternalGenericDialect()
+
+    monkeypatch.setattr(app_module, "default_model_dialect_registry", lambda: ExternalRegistry())
+    runtime = _FakeRuntime()
+
+    with pytest.raises(ValueError, match="Plugin API v1"):
+        compose_server(
+            ServerConfig(tmp_path, renderer_workers=2),
+            runtime=runtime,
+        )
+
+    assert runtime.close_calls == 1
+    assert runtime.is_ready is False
+
+
+def test_failed_renderer_setup_rolls_back_loaded_runtime(tmp_path: Path) -> None:
+    runtime = _FakeRuntime()
+
+    with pytest.raises(ValueError, match="independent prompt renderers"):
+        compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+
+    assert len(runtime.load_calls) == 1
+    assert runtime.close_calls == 1
+    assert runtime.is_ready is False
+
+
+def test_partial_renderer_replica_failure_rolls_back_loaded_runtime(tmp_path: Path) -> None:
+    runtime = _RendererRuntime(fail_renderer_at=2)
+
+    with pytest.raises(RuntimeError, match="renderer construction failed"):
+        compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+
+    assert runtime.renderer_calls == 2
+    assert runtime.close_calls == 1
+    assert runtime.is_ready is False
+
+
+def test_compiler_creation_failure_rolls_back_loaded_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _FakeRuntime()
+
+    def fail_compiler(self: GenericHFDialect, adapter: object) -> object:
+        del self, adapter
+        raise RuntimeError("compiler construction failed")
+
+    monkeypatch.setattr(GenericHFDialect, "create_compiler", fail_compiler)
+
+    with pytest.raises(RuntimeError, match="compiler construction failed"):
+        compose_server(ServerConfig(tmp_path), runtime=runtime)
+
+    assert runtime.close_calls == 1
+    assert runtime.is_ready is False
+
+
+def test_failed_bundle_cleanup_surfaces_unresolved_ownership(tmp_path: Path) -> None:
+    runtime = _FailingCloseRendererRuntime(fail_renderer_at=2)
+
+    with pytest.raises(BaseExceptionGroup, match="runtime ownership could not be resolved") as captured:
+        compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+
+    assert runtime.close_calls == 1
+    messages = [str(exc) for exc in captured.value.exceptions]
+    assert any("renderer construction failed" in message for message in messages)
+    assert any("model bundle rollback failed" in message for message in messages)
+
+
+def test_post_pool_setup_failure_closes_pool_before_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_pool = app_module.RendererLanePool
+    created_pools: list[object] = []
+
+    class RecordingPool(base_pool):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.close_calls = 0
+            created_pools.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    monkeypatch.setattr(app_module, "RendererLanePool", RecordingPool)
+    runtime = _RendererRuntime()
+
+    with pytest.raises(ValueError, match="does not support constrained tool generation"):
+        compose_server(
+            ServerConfig(
+                tmp_path,
+                renderer_workers=2,
+                tool_constraint_mode=ToolConstraintMode.FORMAT,
+            ),
+            runtime=runtime,
+        )
+
+    assert len(created_pools) == 1
+    pool = created_pools[0]
+    assert pool.close_calls == 1  # type: ignore[attr-defined]
+    assert pool.is_closed is True  # type: ignore[attr-defined]
+    assert runtime.close_calls == 1
+    assert runtime.is_ready is False
+
+
+def test_failed_bundle_rollback_works_inside_running_event_loop(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        with pytest.raises(ValueError, match="independent prompt renderers"):
+            compose_server(ServerConfig(tmp_path, renderer_workers=2), runtime=runtime)
+        assert runtime.close_calls == 1
+        assert runtime.is_ready is False
+
+    asyncio.run(scenario())
+
+
+def test_switch_replacement_build_failure_rolls_back_new_runtime(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / "config.json").write_text("{}", encoding="utf-8")
+        (second_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        initial = _RendererRuntime()
+        replacement = _RendererRuntime(fail_renderer_at=2)
+        composed = compose_server(
+            ServerConfig(first_dir, model_root=tmp_path, renderer_workers=2),
+            runtime=initial,
+            runtime_factory=lambda: replacement,
+        )
+
+        with pytest.raises(RuntimeError, match="renderer construction failed"):
+            await composed.model_manager.switch("second")
+
+        assert initial.close_calls == 1
+        assert replacement.close_calls == 1
+        assert replacement.is_ready is False
+        assert composed.model_manager.state.value == "error"
+        assert composed.model_manager.current_runtime is None
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_switch_waits_for_background_build_and_rolls_back_orphan(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / "config.json").write_text("{}", encoding="utf-8")
+        (second_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        initial = _RendererRuntime()
+        replacement = _BlockingRendererRuntime()
+        composed = compose_server(
+            ServerConfig(first_dir, model_root=tmp_path, renderer_workers=2),
+            runtime=initial,
+            runtime_factory=lambda: replacement,
+        )
+
+        switch = asyncio.create_task(composed.model_manager.switch("second"))
+        for _ in range(200):
+            if replacement.renderer_started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert replacement.renderer_started.is_set()
+
+        switch.cancel()
+        await asyncio.sleep(0.02)
+        switch.cancel()
+        await asyncio.sleep(0.02)
+        assert not switch.done()
+        assert replacement.close_calls == 0
+
+        replacement.renderer_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await switch
+
+        assert replacement.close_calls == 1
+        assert replacement.is_ready is False
+        assert composed.model_manager.state.value == "error"
+        assert composed.model_manager.current_runtime is None
 
     asyncio.run(scenario())
 
@@ -651,6 +954,18 @@ def test_bearer_auth_protects_v1_and_metrics_but_not_health(tmp_path: Path) -> N
                 headers={"Authorization": "Bearer alpha"},
             )
             assert metrics.status_code == 200
+            assert (await _request(composed.app, "GET", "/docs")).status_code == 404
+            assert (await _request(composed.app, "GET", "/redoc")).status_code == 404
+            assert (await _request(composed.app, "GET", "/openapi.json")).status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_docs_remain_available_without_api_keys(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        composed = compose_server(ServerConfig(tmp_path), runtime=_FakeRuntime())
+        assert (await _request(composed.app, "GET", "/docs")).status_code == 200
+        assert (await _request(composed.app, "GET", "/openapi.json")).status_code == 200
 
     asyncio.run(scenario())
 

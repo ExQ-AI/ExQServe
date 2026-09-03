@@ -16,14 +16,17 @@ import os
 import socket
 import ssl
 import sys
+import threading
+import time
 import urllib.parse
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import Any, Protocol
 
+from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
@@ -288,25 +291,38 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._ssl_context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
+_REMOTE_IMAGE_TOTAL_TIMEOUT_SECONDS = 15.0
+_REMOTE_IMAGE_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _remaining_remote_image_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("remote image fetch exceeded total timeout")
+    return remaining
+
+
 def _open_remote_image_response(
     resolved: _ResolvedRemoteImageUrl,
+    deadline: float,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
     last_error: Exception | None = None
     for address in resolved.addresses:
+        timeout = _remaining_remote_image_timeout(deadline)
         connection: http.client.HTTPConnection
         if resolved.scheme == "https":
             connection = _PinnedHTTPSConnection(
                 resolved.hostname,
                 resolved.port,
                 pinned_address=address,
-                timeout=15,
+                timeout=timeout,
             )
         else:
             connection = _PinnedHTTPConnection(
                 resolved.hostname,
                 resolved.port,
                 pinned_address=address,
-                timeout=15,
+                timeout=timeout,
             )
         try:
             connection.request(
@@ -318,19 +334,47 @@ def _open_remote_image_response(
                     "Accept-Encoding": "identity",
                 },
             )
-            return connection, connection.getresponse()
+            response = connection.getresponse()
+            _remaining_remote_image_timeout(deadline)
+            return connection, response
         except (OSError, http.client.HTTPException) as exc:
             last_error = exc
             connection.close()
     raise OSError("remote image connection failed for all validated addresses") from last_error
 
 
+def _read_remote_image_response(
+    connection: http.client.HTTPConnection,
+    response: http.client.HTTPResponse,
+    max_bytes: int,
+    deadline: float,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total <= max_bytes:
+        timeout = _remaining_remote_image_timeout(deadline)
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout)
+        remaining_bytes = max_bytes + 1 - total
+        if remaining_bytes <= 0:
+            break
+        chunk = response.read1(min(_REMOTE_IMAGE_READ_CHUNK_BYTES, remaining_bytes))
+        _remaining_remote_image_timeout(deadline)
+        if not chunk:
+            break
+        chunks.append(bytes(chunk))
+        total += len(chunk)
+    return b"".join(chunks)
+
+
 def _remote_image_bytes(source: str, max_bytes: int) -> bytes:
     current_source = source
     redirects = 0
+    deadline = time.monotonic() + _REMOTE_IMAGE_TOTAL_TIMEOUT_SECONDS
     while True:
+        _remaining_remote_image_timeout(deadline)
         resolved = _resolve_remote_image_url(current_source)
-        connection, response = _open_remote_image_response(resolved)
+        connection, response = _open_remote_image_response(resolved, deadline)
         try:
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.getheader("Location")
@@ -352,7 +396,7 @@ def _remote_image_bytes(source: str, max_bytes: int) -> bytes:
                     declared_size = None
                 if declared_size is not None and declared_size > max_bytes:
                     raise ValueError("remote image exceeds max_image_bytes")
-            data = bytes(response.read(max_bytes + 1))
+            data = _read_remote_image_response(connection, response, max_bytes, deadline)
         finally:
             connection.close()
         if len(data) > max_bytes:
@@ -1145,11 +1189,13 @@ def _create_backend_job(
 class _ExLlamaV3Resources:
     config: ExLlamaV3LoadConfig
     backend: Any
+    backend_config: Any
     tokenizer: Any
     model: Any
     cache: Any
     vision_model: Any | None
     vision_cache: VisionEmbeddingCache | None
+    vision_lock: threading.Lock
     draft_model: Any | None
     draft_cache: Any | None
     loras: tuple[Any, ...]
@@ -1318,9 +1364,12 @@ class _ExLlamaV3PromptRenderer:
                 embedding = None if vision_cache is None else vision_cache.get(cache_key)
                 if embedding is None:
                     image = _decode_image_bytes(data)
-                    embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
-                    if vision_cache is not None:
-                        vision_cache.put(cache_key, embedding)
+                    with resources.vision_lock:
+                        embedding = None if vision_cache is None else vision_cache.peek(cache_key)
+                        if embedding is None:
+                            embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
+                            if vision_cache is not None:
+                                vision_cache.put(cache_key, embedding)
                 embeddings.append(embedding)
             encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
             if sentinels:
@@ -1356,6 +1405,22 @@ class _ExLlamaV3PromptRenderer:
             )
             input_ids = _tensor_to_token_ids(encoded)
         return RuntimeRenderedPrompt(visible_text, input_ids, attachments)
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
+
+
+def _call_optional_nonnegative_int(owner: object, name: str) -> int | None:
+    method = getattr(owner, name, None)
+    if not callable(method):
+        return None
+    try:
+        return _optional_nonnegative_int(method())
+    except Exception:  # noqa: BLE001 - optional upstream stats must degrade safely.
+        return None
 
 
 class _GeneratorLifecycleState(Enum):
@@ -1396,6 +1461,74 @@ class ExLlamaV3Runtime:
         if resources is None or resources.vision_cache is None:
             return None
         return resources.vision_cache.stats()
+
+    @property
+    def engine_stats(self) -> RuntimeEngineStats:
+        resources = self._resources
+        if resources is None or self._closing:
+            return RuntimeEngineStats(RuntimeEngineState.UNAVAILABLE)
+        if self._generator_state is _GeneratorLifecycleState.RECOVERING:
+            return RuntimeEngineStats(RuntimeEngineState.RECOVERING)
+        if self._generator_state is _GeneratorLifecycleState.FAILED:
+            return RuntimeEngineStats(RuntimeEngineState.FAILED)
+
+        generator = self._generator
+        if generator is None:
+            cache_tokens = _optional_nonnegative_int(getattr(resources.cache, "max_num_tokens", None))
+            total_pages = None if cache_tokens is None else cache_tokens // 256
+            return RuntimeEngineStats(
+                RuntimeEngineState.UNINITIALIZED,
+                active_jobs=0,
+                pending_jobs=0,
+                max_batch_size=resources.config.max_batch_size,
+                kv_pages_total=total_pages,
+                kv_pages_referenced=0 if total_pages is not None else None,
+                kv_pages_unreferenced=total_pages,
+            )
+
+        backend_generator = getattr(generator, "generator", None)
+        if backend_generator is None:
+            return RuntimeEngineStats(RuntimeEngineState.READY)
+        active_jobs = _call_optional_nonnegative_int(backend_generator, "num_active_jobs")
+        pending_jobs = _call_optional_nonnegative_int(backend_generator, "num_pending_jobs")
+        max_batch_size = _optional_nonnegative_int(getattr(backend_generator, "max_batch_size", None))
+        pagetable = getattr(backend_generator, "pagetable", None)
+        total_pages = _optional_nonnegative_int(getattr(pagetable, "max_pages", None))
+        unreferenced_pages = (
+            None
+            if pagetable is None
+            else _call_optional_nonnegative_int(pagetable, "num_unreferenced_pages")
+        )
+        referenced_pages = (
+            total_pages - unreferenced_pages
+            if total_pages is not None
+            and unreferenced_pages is not None
+            and unreferenced_pages <= total_pages
+            else None
+        )
+        page_metrics = getattr(pagetable, "metrics", None)
+        metrics = page_metrics if isinstance(page_metrics, Mapping) else {}
+        return RuntimeEngineStats(
+            RuntimeEngineState.READY,
+            active_jobs=active_jobs,
+            pending_jobs=pending_jobs,
+            max_batch_size=max_batch_size,
+            kv_pages_total=total_pages,
+            kv_pages_referenced=referenced_pages,
+            kv_pages_unreferenced=unreferenced_pages,
+            kv_pages_evicted_since_generator_start=_optional_nonnegative_int(metrics.get("evictions")),
+            kv_cached_pages_evicted_since_generator_start=_optional_nonnegative_int(metrics.get("evictions_live")),
+            kv_recurrent_checkpoints_stranded_since_generator_start=_optional_nonnegative_int(metrics.get("stashes_stranded")),
+            kv_pages_allocated_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_pages")),
+            kv_cached_pages_reused_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_cached_pages")),
+            kv_pages_restored_from_cpu_tier_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_tier_pages")),
+            kv_cached_kv_only_pages_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_kv_only_pages")),
+        )
+
+    def create_prompt_renderer(self) -> _ExLlamaV3PromptRenderer:
+        resources = self._require_resources()
+        tokenizer = resources.backend.Tokenizer.from_config(resources.backend_config)
+        return _ExLlamaV3PromptRenderer(replace(resources, tokenizer=tokenizer))
 
     @property
     def is_ready(self) -> bool:
@@ -1623,8 +1756,16 @@ class ExLlamaV3Runtime:
         try:
             backend_config = backend.Config.from_directory(config.model_directory)
             backend_config.infer_params.moe_cpu_offload = config.moe_cpu_offload_layers
+            backend_config.infer_params.moe_cpu_split = config.moe_cpu_split_experts
+            backend_config.infer_params.vision_pinned = config.vision_offload
             if config.moe_cpu_threads is not None:
                 backend_config.infer_params.moe_cpu_threads = config.moe_cpu_threads
+            if config.mtp_enabled:
+                backend_config.infer_params.draft_moe_cpu_offload = (
+                    config.draft_moe_cpu_offload_layers
+                )
+                if config.moe_cpu_threads is not None:
+                    backend_config.infer_params.draft_moe_cpu_threads = config.moe_cpu_threads
             model_metadata = RuntimeModelMetadata(
                 _backend_context_limit(backend_config),
                 _backend_architecture(backend_config),
@@ -1659,6 +1800,9 @@ class ExLlamaV3Runtime:
                 draft_model = backend.Model.from_config(backend_config, component="mtp")
             elif config.draft_model_directory is not None:
                 draft_config = backend.Config.from_directory(config.draft_model_directory)
+                draft_config.infer_params.moe_cpu_offload = config.draft_moe_cpu_offload_layers
+                if config.moe_cpu_threads is not None:
+                    draft_config.infer_params.moe_cpu_threads = config.moe_cpu_threads
                 draft_model = backend.Model.from_config(draft_config, component="text")
 
             cache_kwargs: dict[str, object] = {"max_batch_size": config.max_batch_size}
@@ -1776,11 +1920,13 @@ class ExLlamaV3Runtime:
         resources = _ExLlamaV3Resources(
             config,
             backend,
+            backend_config,
             text_codec,
             model,
             cache_object,
             vision_model,
             vision_cache,
+            threading.Lock(),
             draft_model,
             draft_cache_object,
             tuple(loras),

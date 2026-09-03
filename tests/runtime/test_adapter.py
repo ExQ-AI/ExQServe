@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -21,6 +22,7 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
 )
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime
+from exqserve.serving.preprocessing import RendererLane, RendererLanePool
 
 
 class _FakeTensor:
@@ -260,6 +262,7 @@ def _backend(
         "cache_objects": [],
         "model_from_config_calls": [],
         "model_infer_params_at_from_config": [],
+        "model_infer_params_full_at_from_config": [],
         "load_order": load_order,
     }
 
@@ -307,6 +310,18 @@ def _backend(
                     None if infer_params is None else getattr(infer_params, "moe_cpu_offload", None),
                     None if infer_params is None else getattr(infer_params, "moe_cpu_threads", None),
                 )
+            )
+            state["model_infer_params_full_at_from_config"].append(
+                {
+                    "directory": getattr(config, "directory", None),
+                    "component": component,
+                    "moe_cpu_offload": None if infer_params is None else getattr(infer_params, "moe_cpu_offload", None),
+                    "moe_cpu_threads": None if infer_params is None else getattr(infer_params, "moe_cpu_threads", None),
+                    "moe_cpu_split": None if infer_params is None else getattr(infer_params, "moe_cpu_split", None),
+                    "vision_pinned": None if infer_params is None else getattr(infer_params, "vision_pinned", None),
+                    "draft_moe_cpu_offload": None if infer_params is None else getattr(infer_params, "draft_moe_cpu_offload", None),
+                    "draft_moe_cpu_threads": None if infer_params is None else getattr(infer_params, "draft_moe_cpu_threads", None),
+                }
             )
             if component == "mtp":
                 state["mtp_config"] = config
@@ -762,6 +777,308 @@ def test_load_applies_main_moe_cpu_settings_before_model_construction(
     model_config = state["model_config"]
     assert model_config.infer_params.moe_cpu_offload == 12
     assert model_config.infer_params.moe_cpu_threads == 6
+
+
+def test_load_applies_moe_split_and_vision_offload_before_component_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=True)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_offload=True,
+            moe_cpu_split_experts=3,
+        )
+    )
+
+    snapshots = backend._state["model_infer_params_full_at_from_config"]
+    assert snapshots[0]["component"] == "text"
+    assert snapshots[0]["moe_cpu_split"] == 3
+    assert snapshots[0]["vision_pinned"] is True
+    assert snapshots[1]["component"] == "vision"
+    assert snapshots[1]["moe_cpu_split"] == 3
+    assert snapshots[1]["vision_pinned"] is True
+
+
+def test_load_applies_mtp_draft_moe_offload_to_shared_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            mtp_enabled=True,
+            moe_cpu_offload_layers=4,
+            draft_moe_cpu_offload_layers=5,
+            moe_cpu_threads=2,
+        )
+    )
+
+    snapshots = backend._state["model_infer_params_full_at_from_config"]
+    assert snapshots[0]["component"] == "text"
+    assert snapshots[0]["moe_cpu_offload"] == 4
+    assert snapshots[0]["draft_moe_cpu_offload"] == 5
+    assert snapshots[0]["draft_moe_cpu_threads"] == 2
+    assert snapshots[1]["component"] == "mtp"
+    assert snapshots[1]["moe_cpu_offload"] == 4
+    assert snapshots[1]["draft_moe_cpu_offload"] == 5
+    assert snapshots[1]["draft_moe_cpu_threads"] == 2
+
+
+def test_load_applies_external_draft_moe_offload_to_draft_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            draft_model_directory="/models/draft",
+            moe_cpu_split_experts=4,
+            draft_moe_cpu_offload_layers=6,
+            moe_cpu_threads=3,
+        )
+    )
+
+    snapshots = backend._state["model_infer_params_full_at_from_config"]
+    assert snapshots[0]["directory"] == "/models/qwen"
+    assert snapshots[0]["moe_cpu_split"] == 4
+    assert snapshots[0]["moe_cpu_offload"] in {None, 0}
+    assert snapshots[1]["directory"] == "/models/draft"
+    assert snapshots[1]["moe_cpu_split"] in {None, 0}
+    assert snapshots[1]["moe_cpu_offload"] == 6
+    assert snapshots[1]["moe_cpu_threads"] == 3
+
+
+def test_prompt_renderer_factory_creates_independent_tokenizer_replicas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    root_tokenizer = backend._state["tokenizer"]
+    backend_config = backend._state["tokenizer_config"]
+    replicas: list[_FakeTokenizer] = []
+
+    def make_tokenizer(config: object) -> _FakeTokenizer:
+        assert config is backend_config
+        tokenizer = _FakeTokenizer()
+        replicas.append(tokenizer)
+        return tokenizer
+
+    monkeypatch.setattr(backend.Tokenizer, "from_config", staticmethod(make_tokenizer))
+
+    first = runtime.create_prompt_renderer()
+    second = runtime.create_prompt_renderer()
+
+    assert len(replicas) == 2
+    assert replicas[0] is not replicas[1]
+    assert replicas[0] is not root_tokenizer
+    assert replicas[1] is not root_tokenizer
+    assert first.tokenize_encoded_prompt("same") == second.tokenize_encoded_prompt("same")
+
+
+def test_text_renderer_progresses_while_other_lane_waits_on_vision_single_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=True)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    backend_config = backend._state["tokenizer_config"]
+    replicas: list[_FakeTokenizer] = []
+
+    def make_tokenizer(config: object) -> _FakeTokenizer:
+        assert config is backend_config
+        tokenizer = _FakeTokenizer()
+        replicas.append(tokenizer)
+        return tokenizer
+
+    monkeypatch.setattr(backend.Tokenizer, "from_config", staticmethod(make_tokenizer))
+    vision_renderer = runtime.create_prompt_renderer()
+    text_renderer = runtime.create_prompt_renderer()
+    replicas[0].rendered_text = "<|image|>"
+    replicas[1].rendered_text = "text-only"
+
+    vision_started = threading.Event()
+    vision_release = threading.Event()
+    vision_model = backend._state["vision_model"]
+
+    def blocking_embedding(tokenizer: object, image: object) -> object:
+        vision_started.set()
+        vision_release.wait(timeout=2)
+        return SimpleNamespace(
+            text_alias="<$EMB_1$>",
+            token_list=[2, 1_000_000_001, 3],
+            embeddings=_FakeEmbeddingTensor(),
+            deepstack_embeddings=[],
+        )
+
+    monkeypatch.setattr(vision_model, "get_image_embeddings", blocking_embedding)
+    pool = RendererLanePool(
+        (
+            RendererLane(vision_renderer, object()),  # type: ignore[arg-type]
+            RendererLane(text_renderer, object()),  # type: ignore[arg-type]
+        )
+    )
+
+    async def scenario() -> None:
+        vision_messages = [
+            {"role": "user", "content": [{"type": "image", "image": "image-a"}]}
+        ]
+        text_messages = [{"role": "user", "content": "hello"}]
+        vision = asyncio.create_task(
+            pool.run(
+                "chat",
+                lambda lane: lane.renderer.render_chat_template(  # type: ignore[attr-defined]
+                    vision_messages,
+                    None,
+                    {},
+                    add_generation_prompt=True,
+                    protect_literal_tokens=False,
+                ),
+            )
+        )
+        for _ in range(200):
+            if vision_started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert vision_started.is_set()
+
+        text = await asyncio.wait_for(
+            pool.run(
+                "chat",
+                lambda lane: lane.renderer.render_chat_template(  # type: ignore[attr-defined]
+                    text_messages,
+                    None,
+                    {},
+                    add_generation_prompt=True,
+                    protect_literal_tokens=False,
+                ),
+            ),
+            timeout=0.5,
+        )
+        assert text.text == "text-only"
+        vision_release.set()
+        await vision
+
+    asyncio.run(scenario())
+
+
+def test_two_vision_lanes_share_single_flight_and_double_check_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=True)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    backend_config = backend._state["tokenizer_config"]
+    replicas: list[_FakeTokenizer] = []
+
+    def make_tokenizer(config: object) -> _FakeTokenizer:
+        assert config is backend_config
+        tokenizer = _FakeTokenizer()
+        tokenizer.rendered_text = "<|image|>"
+        replicas.append(tokenizer)
+        return tokenizer
+
+    monkeypatch.setattr(backend.Tokenizer, "from_config", staticmethod(make_tokenizer))
+    first_renderer = runtime.create_prompt_renderer()
+    second_renderer = runtime.create_prompt_renderer()
+    first_started = threading.Event()
+    first_release = threading.Event()
+    embedding_calls: list[object] = []
+    vision_model = backend._state["vision_model"]
+
+    def blocking_embedding(tokenizer: object, image: object) -> object:
+        embedding_calls.append(tokenizer)
+        first_started.set()
+        first_release.wait(timeout=2)
+        return SimpleNamespace(
+            text_alias="<$EMB_1$>",
+            token_list=[2, 1_000_000_001, 3],
+            embeddings=_FakeEmbeddingTensor(),
+            deepstack_embeddings=[],
+        )
+
+    monkeypatch.setattr(vision_model, "get_image_embeddings", blocking_embedding)
+    pool = RendererLanePool(
+        (
+            RendererLane(first_renderer, object()),  # type: ignore[arg-type]
+            RendererLane(second_renderer, object()),  # type: ignore[arg-type]
+        )
+    )
+
+    async def scenario() -> None:
+        messages = [{"role": "user", "content": [{"type": "image", "image": "same"}]}]
+
+        def render(lane: RendererLane) -> object:
+            return lane.renderer.render_chat_template(  # type: ignore[attr-defined]
+                messages,
+                None,
+                {},
+                add_generation_prompt=True,
+                protect_literal_tokens=False,
+            )
+
+        first = asyncio.create_task(pool.run("chat", render))
+        for _ in range(200):
+            if first_started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert first_started.is_set()
+        second = asyncio.create_task(pool.run("chat", render))
+        await asyncio.sleep(0.05)
+        assert len(embedding_calls) == 1
+
+        first_release.set()
+        await asyncio.gather(first, second)
+        assert len(embedding_calls) == 1
+        stats = runtime.vision_cache_stats
+        assert stats is not None
+        assert stats.entries == 1
+
+    asyncio.run(scenario())
 
 
 def test_mtp_fp16_draft_cache_omits_quantization_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:

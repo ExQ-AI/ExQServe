@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
+from typing import cast
 
 from exqserve.core.events import (
     CompletionReason,
@@ -18,6 +20,7 @@ from exqserve.core.items import RawPromptItem
 from exqserve.core.request import RawPromptRequest
 from exqserve.core.timing import GenerationTiming
 from exqserve.core.usage import TokenUsage
+from exqserve.model.contracts import PromptCompilerLike
 from exqserve.runtime.contracts import (
     RuntimeFinished,
     RuntimeGenerationRequest,
@@ -28,6 +31,7 @@ from exqserve.runtime.contracts import (
     RuntimeTiming,
 )
 from exqserve.serving.contracts import RawServingRequest
+from exqserve.serving.preprocessing import RendererLane, RendererLanePool
 from exqserve.serving.raw import RawServingEngine
 
 
@@ -125,6 +129,48 @@ def test_raw_serving_text_prompt_tokenizes_directly_and_emits_plain_text_events(
         assert session.compiled_prompt.text == "PROMPT"
         assert session.compiled_prompt.input_ids == (101, 102, 103)
         assert session.compiled_prompt.stop_conditions == ("STOP",)
+
+    asyncio.run(scenario())
+
+
+def test_raw_text_tokenization_uses_shared_pool_off_event_loop() -> None:
+    async def scenario() -> None:
+        main_thread = threading.get_ident()
+        started = threading.Event()
+        release = threading.Event()
+        worker_threads: list[int] = []
+
+        class BlockingTokenizer(_Tokenizer):
+            def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
+                worker_threads.append(threading.get_ident())
+                started.set()
+                release.wait(timeout=2)
+                return super().tokenize_text(text)
+
+        tokenizer = BlockingTokenizer()
+        lane = RendererLane(tokenizer, cast(PromptCompilerLike, object()))
+        pool = RendererLanePool((lane,))
+        controller = _Controller([])
+        engine = RawServingEngine(None, controller, preprocessing_pool=pool)
+
+        submit = asyncio.create_task(engine.submit(_raw(RawPromptItem(text="PROMPT"))))
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set()
+        assert not submit.done()
+        assert worker_threads == [worker_threads[0]]
+        assert worker_threads[0] != main_thread
+
+        # The event loop remains responsive while the worker thread is blocked.
+        progressed = False
+        await asyncio.sleep(0)
+        progressed = True
+        assert progressed
+        release.set()
+        session = await submit
+        assert session.compiled_prompt.input_ids == (101, 102, 103)
 
     asyncio.run(scenario())
 

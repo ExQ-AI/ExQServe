@@ -33,6 +33,7 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
 )
 from exqserve.serving.contracts import RawServingRequest, ServingRejected
+from exqserve.serving.preprocessing import RendererLanePool
 from exqserve.serving.runtime_events import (
     completion_reason_from_runtime,
     timing_event_from_runtime,
@@ -92,12 +93,16 @@ def _safe_error(
 class RawServingEngine:
     def __init__(
         self,
-        tokenizer: RawPromptTokenizer,
+        tokenizer: RawPromptTokenizer | None,
         controller: RawRequestController,
         *,
         output_limit_resolver: Callable[[int, int | None], int] | None = None,
+        preprocessing_pool: RendererLanePool | None = None,
     ) -> None:
+        if tokenizer is None and preprocessing_pool is None:
+            raise ValueError("tokenizer or preprocessing_pool is required")
         self._tokenizer = tokenizer
+        self._preprocessing_pool = preprocessing_pool
         self._controller = controller
         self._output_limit_resolver = output_limit_resolver
 
@@ -108,8 +113,19 @@ class RawServingEngine:
         assert isinstance(prompt, RawPromptItem)
 
         if prompt.text is not None:
+            prompt_text = prompt.text
             try:
-                rendered = self._tokenizer.tokenize_text(prompt.text)
+                pool = self._preprocessing_pool
+                if pool is not None:
+                    rendered = await pool.run(
+                        "raw_text",
+                        lambda lane: lane.renderer.tokenize_text(prompt_text),
+                    )
+                else:
+                    tokenizer = self._tokenizer
+                    if tokenizer is None:
+                        raise RuntimeError("raw tokenizer is unavailable")
+                    rendered = tokenizer.tokenize_text(prompt.text)
             except (TypeError, ValueError) as exc:
                 raise ServingRejected(
                     _safe_error(
@@ -126,7 +142,7 @@ class RawServingEngine:
                         "Raw prompt tokenization failed internally.",
                     )
                 ) from exc
-            text = prompt.text
+            text = prompt_text
             input_ids = rendered.input_ids
         else:
             assert prompt.token_ids is not None

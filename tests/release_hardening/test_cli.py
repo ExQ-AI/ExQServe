@@ -176,6 +176,43 @@ def test_cli_and_yaml_parse_ngram_and_moe_cpu_options(tmp_path: Path) -> None:
         cli.parse_config(["--config", str(invalid_key)])
 
 
+def test_cli_and_yaml_parse_thin_runtime_parity_options(tmp_path: Path) -> None:
+    cli_config = cli.parse_config(
+        [
+            str(tmp_path / "vision-model"),
+            "--vision",
+            "--vision-offload",
+            "--moe-cpu-split-experts",
+            "3",
+        ]
+    )
+    assert cli_config.vision_enabled is True
+    assert cli_config.vision_offload is True
+    assert cli_config.moe_cpu_split_experts == 3
+
+    config_path = tmp_path / "thin-runtime.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"model-directory: {tmp_path / 'model'}",
+                "mtp: true",
+                "moe-cpu-offload-layers: 4",
+                "draft-moe-cpu-offload-layers: 5",
+                "moe-cpu-threads: 6",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    yaml_config = cli.parse_config(["--config", str(config_path)])
+    assert yaml_config.mtp_enabled is True
+    assert yaml_config.moe_cpu_offload_layers == 4
+    assert yaml_config.draft_moe_cpu_offload_layers == 5
+    assert yaml_config.moe_cpu_threads == 6
+
+    with pytest.raises(ValueError, match="vision_offload requires vision_enabled"):
+        cli.parse_config([str(tmp_path / "model"), "--vision-offload"])
+
+
 def test_cli_loads_complete_yaml_config_without_positional_model(tmp_path: Path) -> None:
     model = tmp_path / "Qwen3.8-27B"
     capture = tmp_path / "capture.jsonl"

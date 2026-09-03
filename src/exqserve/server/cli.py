@@ -58,6 +58,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "qc_staging": None,
     "max_requeue_tokens": None,
     "vision": False,
+    "vision_offload": False,
     "allow_remote_images": False,
     "max_image_bytes": 20 * 1024 * 1024,
     "vision_cache_mb": 256,
@@ -66,6 +67,8 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "ngram_match_min": 0,
     "ngram_draft_size": 4,
     "moe_cpu_offload_layers": 0,
+    "moe_cpu_split_experts": 0,
+    "draft_moe_cpu_offload_layers": 0,
     "moe_cpu_threads": None,
     "max_in_flight": 8,
     "max_prompt_tokens": None,
@@ -76,6 +79,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "reasoning_budget_tokens": None,
     "reasoning_budget_message": "",
     "anthropic_compatibility_profile": None,
+    "renderer_workers": 1,
     "response_store_max_records": 1024,
     "response_store_ttl_seconds": 3600.0,
     "response_store_max_bytes": 64 * 1024 * 1024,
@@ -97,6 +101,7 @@ _BOOLEAN_CONFIG_KEYS = frozenset(
         "tensor-parallel",
         "cuda-malloc-async",
         "vision",
+        "vision-offload",
         "allow-remote-images",
         "public-metrics",
     }
@@ -267,6 +272,19 @@ def _build_parser(
         ),
     )
     parser.add_argument(
+        "--moe-cpu-split-experts",
+        type=int,
+        help=(
+            "Keep N routed experts per eligible MoE layer on CPU through ExLlamaV3 split mode; "
+            "0 disables expert splitting."
+        ),
+    )
+    parser.add_argument(
+        "--draft-moe-cpu-offload-layers",
+        type=int,
+        help="Run the first N eligible draft/MTP MoE layers on CPU; 0 disables draft offload.",
+    )
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         help="Worker thread count for ExLlamaV3 MoE CPU offload; leave unset for upstream default.",
@@ -317,6 +335,11 @@ def _build_parser(
         help="Load the model's ExLlamaV3 vision component and accept image input.",
     )
     parser.add_argument(
+        "--vision-offload",
+        action=argparse.BooleanOptionalAction,
+        help="Keep the ExLlamaV3 vision component on pinned host memory to reduce VRAM use.",
+    )
+    parser.add_argument(
         "--allow-remote-images",
         action=argparse.BooleanOptionalAction,
         help="Allow HTTP(S) image URLs. Data-image URLs work with --vision without this flag.",
@@ -365,6 +388,11 @@ def _build_parser(
         "--anthropic-compatibility-profile",
         choices=("claude-code-2.1.251",),
         help="Enable a version-pinned best-effort Anthropic client compatibility profile.",
+    )
+    parser.add_argument(
+        "--renderer-workers",
+        type=int,
+        help="Bounded prompt renderer/compiler worker lanes; default 1.",
     )
     parser.add_argument("--response-store-max-records", type=int)
     parser.add_argument("--response-store-ttl-seconds", type=float)
@@ -638,6 +666,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.qc_staging,
         args.max_requeue_tokens,
         args.vision,
+        args.vision_offload,
         args.allow_remote_images,
         args.max_image_bytes,
         _configured_api_keys(args),
@@ -668,12 +697,15 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         args.ngram_match_min,
         args.ngram_draft_size,
         args.moe_cpu_offload_layers,
+        args.moe_cpu_split_experts,
+        args.draft_moe_cpu_offload_layers,
         args.moe_cpu_threads,
         args.tool_call_fanout_limit,
         args.constrained_parallel_tool_call_limit,
         args.reasoning_budget_tokens,
         args.reasoning_budget_message,
         args.anthropic_compatibility_profile,
+        args.renderer_workers,
     )
 
 
