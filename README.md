@@ -16,7 +16,10 @@ ExQServe focuses on Agent-facing serving semantics rather than treating every mo
 - Agent workflows with reasoning, tool calling, parallel tool calls, OpenAI `strict:true` function tools, LLGuidance-backed constrained decoding, Structured Outputs, streaming, cancellation, and continuation
 - Model-native Agent adaptations for the Qwen3.5 architecture family, Gemma 4, Muse Glimmer, DeepSeek V4, and GLM-5, plus a conservative Generic HF fallback
 - Pluggable model-dialect API for extending model-native reasoning and Tool Calling protocols
-- Long-context and runtime controls including quantized KV cache, system-memory KV/recurrent caches, MTP, n-gram drafting, external draft models, MoE CPU offload, CUDA device selection, and ExLlamaV3 tensor parallelism
+- Runtime recovery and request-lifecycle hardening, including safe ExLlamaV3 generator rebuilds after recoverable backend failures
+- Automatic output-budget resolution, soft Reasoning Budget controls, and an optional Claude Code Anthropic compatibility profile
+- Long-context and runtime controls including quantized KV cache, system-memory KV/recurrent caches, MTP, n-gram drafting, external draft models, MoE CPU offload, ExLlamaV3 offload controls, CUDA device selection, and tensor parallelism
+- Serving observability and renderer concurrency controls for long-running Agent workloads
 - Model switching, PEFT LoRA, YAML configuration, Prometheus metrics, and optional API-key authentication
 
 ## Model support

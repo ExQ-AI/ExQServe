@@ -16,7 +16,10 @@ ExQServe 重点处理 Agent 场景的服务语义，而不是把不同模型都�
 - 面向 Agent 场景支持思考内容与最终回答分离、工具调用、并行工具调用、OpenAI `strict:true` Function Tools、基于 LLGuidance 的 Constrained Decoding、Structured Outputs、流式响应、请求取消和连续调用
 - 已针对 Qwen3.5 架构系列、Gemma 4、Muse Glimmer、DeepSeek V4 和 GLM-5 实现模型原生 Agent 适配；其他兼容 Hugging Face 模型可走保守的通用兼容路径
 - 提供可插拔的 Model Dialect API，用于扩展模型原生的思考与工具调用协议
-- 支持长上下文、量化 KV Cache、系统内存 KV/Recurrent Cache、MTP、n-gram drafting、外部 draft model、MoE CPU offload、CUDA 设备选择和 ExLlamaV3 Tensor Parallel
+- 提供运行时恢复与请求生命周期加固；对于可安全恢复的后端故障，可重建 ExLlamaV3 Generator
+- 支持自动 Output Budget、Soft Reasoning Budget，以及可选的 Claude Code Anthropic 兼容 Profile
+- 支持长上下文和运行时控制，包括量化 KV Cache、系统内存 KV/Recurrent Cache、MTP、n-gram drafting、外部 draft model、MoE CPU offload、ExLlamaV3 offload controls、CUDA 设备选择和 Tensor Parallel
+- 提供服务可观测性和 Renderer 并发控制，面向长时间 Agent 工作负载
 - 支持模型切换、PEFT LoRA、YAML 配置、Prometheus Metrics 和可选 API Key
 
 ## 模型支持
