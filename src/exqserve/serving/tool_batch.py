@@ -154,7 +154,6 @@ class ToolCallBatchGate:
         )
         self._accepted_call_ids: set[str] = set()
         self._completed_calls: list[ToolCallItem] = []
-        self._completed_call_signatures: set[tuple[str, str]] = set()
         self._buffered_events: list[GenerationEvent] = []
         self._lifecycle = _BatchLifecycle.OPEN
 
@@ -246,18 +245,6 @@ class ToolCallBatchGate:
                 )
             )
 
-        canonical_arguments = detailed_validation.canonical_arguments[-1]
-        assert canonical_arguments is not None
-        signature = (event.call.name, canonical_arguments)
-        if self._atomic_parallel_tools and signature in self._completed_call_signatures:
-            return BatchDecision(
-                failure=BatchFailure(
-                    "tool_policy_violation",
-                    "Model repeated a tool call inside one constrained parallel batch.",
-                )
-            )
-        if self._atomic_parallel_tools:
-            self._completed_call_signatures.add(signature)
         self._completed_calls.append(event.call)
         self._buffered_events.append(event)
         return BatchDecision()

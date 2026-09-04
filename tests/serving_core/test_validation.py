@@ -795,7 +795,7 @@ def test_atomic_constrained_parallel_double_terminal_does_not_double_flush() -> 
     asyncio.run(scenario())
 
 
-def test_atomic_constrained_parallel_rejects_canonical_duplicate_without_publication() -> None:
+def test_atomic_constrained_parallel_allows_canonical_duplicate_and_publishes_atomically() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
@@ -819,20 +819,28 @@ def test_atomic_constrained_parallel_rejects_canonical_duplicate_without_publica
         ).submit(_request(policy))
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        assert not session._pending
+        assert session._tool_batch.buffered_event_count == 6
+
+        await session._process_runtime(_finished())
         events = [event async for event in session]
 
-        assert not any(
-            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
-            for event in events
-        )
-        assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.code == "tool_policy_violation"
-        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+        assert events[:6] == [
+            ToolCallStarted("req", "call-1", "lookup", 0),
+            ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
+            ToolCallCompleted("req", first),
+            ToolCallStarted("req", "call-2", "lookup", 1),
+            ToolCallArgumentsDelta("req", "call-2", '{ "id" : 1 }', 1),
+            ToolCallCompleted("req", duplicate),
+        ]
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+        assert controlled.cancel_calls == []
 
     asyncio.run(scenario())
 
 
-def test_atomic_constrained_parallel_rejects_non_adjacent_duplicate_without_publication() -> None:
+def test_atomic_constrained_parallel_allows_non_adjacent_canonical_duplicate() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
@@ -860,14 +868,20 @@ def test_atomic_constrained_parallel_rejects_non_adjacent_duplicate_without_publ
         ).submit(_request(policy))
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        assert not session._pending
+        assert session._tool_batch.buffered_event_count == 9
+
+        await session._process_runtime(_finished())
         events = [event async for event in session]
 
-        assert not any(
-            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
-            for event in events
-        )
-        assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.code == "tool_policy_violation"
+        assert [event for event in events if isinstance(event, ToolCallCompleted)] == [
+            ToolCallCompleted("req", first),
+            ToolCallCompleted("req", second),
+            ToolCallCompleted("req", repeated_first),
+        ]
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+        assert controlled.cancel_calls == []
 
     asyncio.run(scenario())
 
@@ -952,15 +966,12 @@ def test_atomic_constrained_parallel_cancel_failure_cannot_resurrect_aborted_bat
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         first = ToolCallItem("call-1", "lookup", '{"id":1}', 0)
-        repeated = ToolCallItem("call-2", "lookup", '{ "id" : 1 }', 1)
         parser = _ScriptedParser(
             (
                 ToolCallStarted("req", "call-1", "lookup", 0),
                 ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0),
                 ToolCallCompleted("req", first),
                 ToolCallStarted("req", "call-2", "lookup", 1),
-                ToolCallArgumentsDelta("req", "call-2", '{ "id" : 1 }', 1),
-                ToolCallCompleted("req", repeated),
             )
         )
         controlled = _CancelRaises([])
@@ -969,6 +980,8 @@ def test_atomic_constrained_parallel_cancel_failure_cannot_resurrect_aborted_bat
             lambda request_id, reasoning, tool_policy: parser,
             _Controller(controlled),
             _tool_constraint_factory,
+            tool_call_fanout_limit=32,
+            constrained_parallel_tool_call_limit=1,
         ).submit(_request(policy))
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
