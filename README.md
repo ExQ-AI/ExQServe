@@ -12,16 +12,19 @@ ExQServe handles Agent-facing serving semantics across model families while pres
 
 For Tool Calling, schema and boundary handling can be enforced during generation. LLGuidance-backed constrained decoding is combined with Tool Call validation and atomic commit of parallel calls, so malformed or incomplete calls are rejected before they reach the next Agent turn.
 
-Runtime and protocol failures are surfaced with explicit recovery, retryability, and restart states. When recovery is safe, a failed ExLlamaV3 generator is quarantined and rebuilt.
+OpenAI Responses continuation keeps `previous_response_id`, retained state, and response lifecycle/terminal identity under one serialized authority, with bounded parent-linked delta retention.
+
+Runtime and protocol failures are surfaced with explicit recovery, retryability, and restart states. Safe backend failures can rebuild the ExLlamaV3 generator, while optional bounded inference-attempt recovery can make one additional safe attempt before irreversible output is published. Attempt recovery is disabled by default.
 
 ## Features
 
 - OpenAI and Anthropic compatible APIs, including Chat Completions, Responses, Messages, Completions, Models, and token counting
 - Agent workflows with reasoning, tool calling, parallel tool calls, OpenAI `strict:true` function tools, LLGuidance-backed constrained decoding, Structured Outputs, streaming, cancellation, and continuation
-- Model-native Agent adaptations for the Qwen3.5 architecture family, Gemma 4, Muse Glimmer, DeepSeek V4, and GLM-5, plus a conservative Generic HF fallback
+- Model-native Agent adaptations for the Qwen3.5 architecture family, Gemma 4, Muse Glimmer, DeepSeek V4, and GLM-5, plus conservative architecture bindings for Qwen4Exp, GLM5Next / GLM 5.3, Step 3.5, and Step 3.7, and a Generic HF fallback
 - Pluggable model-dialect API for extending model-native reasoning and Tool Calling protocols
 - Generation guarantees with fail-closed Tool Call validation, atomic constrained-parallel batches, protocol-aware output boundaries, and explicit terminal semantics
-- Agent-oriented failure and recovery semantics, including context-capacity normalization, protocol-visible recovery facts, and safe ExLlamaV3 generator recovery
+- Stateful OpenAI Responses continuation with `previous_response_id`, bounded parent-linked delta retention, and serialized lifecycle/terminal identity
+- Agent-oriented failure and recovery semantics, including context-capacity normalization, protocol-visible recovery facts, safe ExLlamaV3 generator recovery, and optional bounded inference-attempt recovery
 - Soft Reasoning Budget handling, automatic output-limit resolution, and an optional Claude Code compatibility profile with model-aware mid-conversation system handling and cache-local prompts
 - Long-context and ExLlamaV3 runtime controls including quantized KV cache, system-memory KV/recurrent caches, MTP, n-gram drafting, external draft models, MoE CPU offload/expert splitting, vision offload, CUDA device selection, and tensor parallelism
 - Model switching, PEFT LoRA, YAML configuration, Prometheus metrics, and optional API-key authentication
@@ -35,6 +38,10 @@ Runtime and protocol failures are surfaced with explicit recovery, retryability,
 | Muse Glimmer family | Adapted | ATEM/channel protocol; `low`, `medium`, `high`, and `xhigh` reasoning strengths |
 | DeepSeek family | Adapted (untested) | Agent protocol adaptation is implemented; GPU validation is still pending |
 | GLM family | Adapted (untested) | Agent protocol adaptation is implemented; GPU validation is still pending |
+| Qwen4Exp | Conservative binding | Architecture recognition and native termination; unproven reasoning, Tool Calling, and vision capabilities remain disabled |
+| GLM5Next / GLM 5.3 | Conservative binding | Architecture recognition and native termination; unproven reasoning, Tool Calling, and vision capabilities remain disabled |
+| Step 3.5 | Conservative adaptation | Always-on reasoning envelope and native termination; Tool Calling remains disabled until directly proven |
+| Step 3.7 | Conservative binding | Architecture recognition and native termination; unproven Agent capabilities remain disabled |
 | Other compatible Hugging Face models | Generic compatibility | Uses the model's own Hugging Face chat template; reasoning and tool handling remain conservative |
 
 Adapted families preserve their model-native reasoning and tool protocols. Vision has been validated on Qwen3.8, Gemma 4, and Muse Glimmer; Generic HF can preserve multimodal input when the backend exposes a compatible vision component. Image input is opt-in with `--vision`, and unsupported model/backend combinations fail explicitly instead of silently falling back to text mode.
@@ -48,8 +55,8 @@ Release validation covers:
 - multi-turn, parallel, named, required, and `strict:true` Tool Calling with tool-result continuation
 - constrained generation, Structured Outputs, malformed/incomplete model-output boundaries, and fail-closed Tool Call handling
 - long-context continuation, cache-local prompt handling, automatic output budgeting, and soft reasoning budgets
-- request cancellation, context-capacity rejection, terminal-state serialization, and protocol-visible failure/recovery facts
-- backend generator failure, safe recovery, and restart-required behavior when runtime state cannot be reused safely
+- `previous_response_id` continuation, retained-state lifecycle, cancellation/finish races, context-capacity rejection, and terminal-state serialization
+- backend generator failure, safe recovery, optional bounded inference-attempt recovery, and restart-required behavior when runtime state cannot be reused safely
 
 Release-specific workload results are published with the corresponding release instead of being kept here as permanent benchmarks.
 
@@ -183,7 +190,7 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--model-dialect` | Select a built-in or installed model Agent dialect; `auto` discovers compatible dialects |
 | `--tool-constraint-mode` | Generation-time tool constraints: `off`, `format`, or `schema` |
 | `--max-tool-calls-per-generation` | Limit protocol-visible tool calls in one assistant generation |
-| `--max-constrained-parallel-tool-calls` | Limit one atomic constrained-parallel tool batch |
+| `--max-constrained-parallel-tool-calls` | Limit one atomic constrained-parallel tool batch (default `4`) |
 | `--anthropic-compatibility-profile` | Optional best-effort Anthropic client profile; use `claude-code` for Claude Code-style workloads |
 | `--chat-template` | Override the model's HF chat template with a UTF-8 Jinja file |
 | `--vision` | Load the model's vision component and accept image input; fails clearly if the selected model/backend cannot provide it |
@@ -199,6 +206,7 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--max-prompt-tokens` | Optional server-side prompt-token limit |
 | `--max-output-tokens` | Optional server-side output-token limit |
 | `--max-total-tokens` | Optional server-side prompt + output token limit |
+| `--max-inference-recovery-attempts` | Bounded inference-attempt recovery: `0` disables it (default), `1` allows one additional safe attempt before irreversible publication |
 | `--default-output-tokens` | Default API output limit; `auto`/unset lets the serving layer resolve the available output budget |
 | `--reasoning-budget-tokens` | Default soft reasoning-token budget; `-1` disables the server default |
 | `--reasoning-budget-message` | Optional text inserted inside reasoning immediately before a budget-forced close |

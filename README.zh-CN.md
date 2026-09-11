@@ -12,16 +12,19 @@ ExQServe 面向 Agent 场景处理不同模型族的服务语义，同时通过 
 
 在 Tool Calling 上，ExQServe 可以在生成阶段约束 Schema 和调用边界。LLGuidance Constrained Decoding 与 Tool Call 校验、并行调用原子提交结合，格式错误或不完整的调用会在进入下一轮 Agent 对话前被拒绝。
 
-运行时和协议故障会带有明确的恢复、重试和重启状态。条件允许时，失败的 ExLlamaV3 Generator 会被隔离并重建。
+OpenAI Responses 的连续调用会将 `previous_response_id`、保留状态以及 Response 生命周期/终止身份交给同一个串行化权威管理，并通过有界的父子 Delta 状态保存上下文。
+
+运行时和协议故障会带有明确的恢复、重试和重启状态。安全条件下可以重建失败的 ExLlamaV3 Generator；可选的有界 Inference Attempt Recovery 只会在尚未产生不可逆输出时额外尝试一次，默认关闭。
 
 ## 主要功能
 
 - 同时兼容 OpenAI 和 Anthropic API，包括 Chat Completions、Responses、Messages、Completions、Models 和 token 计数
 - 面向 Agent 场景支持思考内容与最终回答分离、工具调用、并行工具调用、OpenAI `strict:true` Function Tools、基于 LLGuidance 的 Constrained Decoding、Structured Outputs、流式响应、请求取消和连续调用
-- 已针对 Qwen3.5 架构系列、Gemma 4、Muse Glimmer、DeepSeek V4 和 GLM-5 实现模型原生 Agent 适配；其他兼容 Hugging Face 模型可走保守的通用兼容路径
+- 已针对 Qwen3.5 架构系列、Gemma 4、Muse Glimmer、DeepSeek V4 和 GLM-5 实现模型原生 Agent 适配；Qwen4Exp、GLM5Next / GLM 5.3、Step 3.5 和 Step 3.7 提供保守的 Architecture Binding，其他兼容 Hugging Face 模型可走通用兼容路径
 - 提供可插拔的 Model Dialect API，用于扩展模型原生的思考与工具调用协议
 - 提供 Generation Guarantees，包括 fail-closed Tool Call 校验、受约束并行 Tool Call 的原子批次提交、协议感知输出边界和明确终止语义
-- 提供面向 Agent 的失败与恢复语义，包括上下文容量错误归一化、协议可见的恢复信息，以及安全条件下的 ExLlamaV3 Generator Recovery
+- 支持有状态的 OpenAI Responses 连续调用，包括 `previous_response_id`、有界父子 Delta 状态保存，以及串行化的生命周期/终止身份
+- 提供面向 Agent 的失败与恢复语义，包括上下文容量错误归一化、协议可见的恢复信息、安全条件下的 ExLlamaV3 Generator Recovery，以及可选的有界 Inference Attempt Recovery
 - 支持 Soft Reasoning Budget、自动 Output Budget，以及可选的 Claude Code 兼容 Profile；对话中途的 system 内容会按模型能力处理，并尽量保持 Prefix Cache 局部性
 - 支持长上下文和 ExLlamaV3 运行时控制，包括量化 KV Cache、系统内存 KV/Recurrent Cache、MTP、n-gram drafting、外部 draft model、MoE CPU offload/专家拆分、Vision Offload、CUDA 设备选择和 Tensor Parallel
 - 支持模型切换、PEFT LoRA、YAML 配置、Prometheus Metrics 和可选 API Key
@@ -35,6 +38,10 @@ ExQServe 面向 Agent 场景处理不同模型族的服务语义，同时通过 
 | Muse Glimmer 系列 | 已适配 | ATEM/channel 协议；支持 `low`、`medium`、`high`、`xhigh` 四档思考强度 |
 | DeepSeek 系列 | 已适配（未测试） | Agent 协议适配已完成，尚未进行 GPU 实测 |
 | GLM 系列 | 已适配（未测试） | Agent 协议适配已完成，尚未进行 GPU 实测 |
+| Qwen4Exp | 保守 Binding | 支持 Architecture 识别和原生终止；尚未直接证明的思考、Tool Calling、Vision 能力保持关闭 |
+| GLM5Next / GLM 5.3 | 保守 Binding | 支持 Architecture 识别和原生终止；尚未直接证明的思考、Tool Calling、Vision 能力保持关闭 |
+| Step 3.5 | 保守适配 | 支持已验证的 always-on reasoning envelope 和原生终止；Tool Calling 在直接证明前保持关闭 |
+| Step 3.7 | 保守 Binding | 支持 Architecture 识别和原生终止；尚未直接证明的 Agent 能力保持关闭 |
 | 其他兼容 Hugging Face 模型 | 通用兼容 | 使用模型自带的 Hugging Face chat template；思考和工具调用按保守方式处理 |
 
 已适配系列会保留各自的思考与工具调用格式。Qwen3.8、Gemma 4 和 Muse Glimmer 已验证图片输入；其他 Hugging Face 模型在后端提供兼容视觉组件时也可以保留多模态输入。图片能力需要显式开启 `--vision`，不支持的模型或后端会直接报错，不会静默退回纯文本模式。
@@ -48,8 +55,8 @@ Release 验证覆盖：
 - 多轮、并行、named、required 和 `strict:true` Tool Calling，以及工具结果回传后的继续生成
 - Constrained Generation、Structured Outputs、模型输出不完整/格式异常边界，以及 fail-closed Tool Call 处理
 - 长上下文继续生成、Cache-local Prompt 处理、自动 Output Budget 和 Soft Reasoning Budget
-- 请求取消、上下文容量拒绝、终止状态序列化，以及协议可见的失败/恢复信息
-- 后端 Generator 故障、安全恢复，以及运行时状态无法安全复用时的 restart-required 行为
+- `previous_response_id` 连续调用、保留状态生命周期、取消/完成竞争、上下文容量拒绝和终止状态序列化
+- 后端 Generator 故障、安全恢复、可选的有界 Inference Attempt Recovery，以及运行时状态无法安全复用时的 restart-required 行为
 
 每个版本的工作负载结果会随对应 Release 一起发布，不在 README 中长期固定为 Benchmark。
 
@@ -183,7 +190,7 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--model-dialect` | 选择内置或已安装的 Model Dialect；`auto` 会自动发现兼容 Dialect |
 | `--tool-constraint-mode` | 生成阶段工具约束：`off`、`format` 或 `schema` |
 | `--max-tool-calls-per-generation` | 限制一次 assistant 生成中对外可见的工具调用数量 |
-| `--max-constrained-parallel-tool-calls` | 限制一次原子化受约束并行工具调用批次的大小 |
+| `--max-constrained-parallel-tool-calls` | 限制一次原子化受约束并行工具调用批次的大小，默认 `4` |
 | `--anthropic-compatibility-profile` | 可选的 Anthropic 客户端兼容 Profile；Claude Code 风格工作负载可使用 `claude-code` |
 | `--chat-template` | 使用 UTF-8 Jinja 文件覆盖模型自带的 HF chat template |
 | `--vision` | 加载模型的视觉组件并接受图片输入；模型或后端不支持时会直接报错 |
@@ -199,6 +206,7 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--max-prompt-tokens` | 可选的服务端 Prompt Token 上限 |
 | `--max-output-tokens` | 可选的服务端 Output Token 上限 |
 | `--max-total-tokens` | 可选的服务端 Prompt + Output 总 Token 上限 |
+| `--max-inference-recovery-attempts` | 有界 Inference Attempt Recovery：`0` 关闭（默认），`1` 允许在不可逆输出前额外进行一次安全尝试 |
 | `--default-output-tokens` | API 默认输出上限；`auto`/未设置时由服务层根据可用容量自动解析 Output Budget |
 | `--reasoning-budget-tokens` | 默认 Soft Reasoning Token Budget；`-1` 关闭服务端默认值 |
 | `--reasoning-budget-message` | Reasoning Budget 强制收束前，可选插入到 reasoning 内的提示文本 |
