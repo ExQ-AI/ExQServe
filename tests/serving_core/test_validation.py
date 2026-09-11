@@ -11,7 +11,7 @@ from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.control.request import RequestTerminalReason
-from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause, SemanticCommitClass
 from exqserve.core.events import (
     CompletionReason,
     GenerationCancelled,
@@ -20,6 +20,7 @@ from exqserve.core.events import (
     GenerationFailed,
     GenerationStarted,
     ReasoningDelta,
+    TextCompleted,
     TextDelta,
     TextStarted,
     ToolCallArgumentsDelta,
@@ -34,8 +35,11 @@ from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenProvenanceError,
+    ParserAmbiguityDetail,
+    ParserConstraintScope,
     ParserCreationContext,
     ParserTerminalIssue,
+    ParserTerminalIssueKind,
     TemplateRequest,
     ToolConstraintGuarantee,
     ToolGenerationConstraint,
@@ -64,16 +68,19 @@ from exqserve.serving.terminal import (
     TerminalDisposition,
     TerminalPrimaryOwner,
 )
+from exqserve.state.session import StatefulServingSession
+from exqserve.state.store import InMemoryResponseStore
 
 
 @dataclass(frozen=True)
 class _Finish:
     events: tuple[GenerationEvent, ...]
     incomplete_tool_call: bool = False
+    issue: ParserTerminalIssue | None = None
 
     @property
     def terminal_issue(self) -> ParserTerminalIssue | None:
-        return incomplete_tool_terminal_issue(self.incomplete_tool_call)
+        return self.issue or incomplete_tool_terminal_issue(self.incomplete_tool_call)
 
 
 class _ScriptedParser:
@@ -222,13 +229,14 @@ def _qwen_reasoning_parser_factory(
 
 def _finished(
     *,
+    reason: RuntimeStopReason = RuntimeStopReason.EOS,
     hard_constraint_installed: bool = False,
     hard_constraint_activated: bool = False,
     effective_generation_guarantee: GenerationGuarantee = GenerationGuarantee.NONE,
 ) -> RuntimeFinished:
     return RuntimeFinished(
         "req",
-        RuntimeStopReason.EOS,
+        reason,
         TokenUsage(input_tokens=2, output_tokens=5),
         RuntimeTiming(),
         hard_constraint_installed=hard_constraint_installed,
@@ -237,9 +245,47 @@ def _finished(
     )
 
 
+def _l1_1_parser_context(guarantee: GenerationGuarantee) -> ParserCreationContext:
+    compatibility = resolve_qwen_parser_context(
+        None,
+        None,
+        ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY,
+    )
+    assert compatibility is not None
+    return ParserCreationContext(
+        hard_constraint_installed=True,
+        generation_guarantee=guarantee,
+        tool_region_decoder_factory=compatibility.tool_region_decoder_factory,
+    )
+
+
+def _l1_1_outside_tool_source() -> tuple[str, NativeTokenSpan]:
+    source = (
+        "```text\n"
+        "literal protocol example\n"
+        "<tool_call>\n"
+        "<function=read>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    marker_at = source.index("<tool_call>")
+    return source, NativeTokenSpan(marker_at, marker_at + len("<tool_call>"), 248058, "<tool_call>")
+
+
 def _tool_constraint_factory(policy: ToolPolicy) -> ToolGenerationConstraint:
     del policy
     return ToolGenerationConstraint("<tool>", 'start: "ok"', True)
+
+
+def _l1_1_schema_tool_constraint_factory(policy: ToolPolicy) -> ToolGenerationConstraint:
+    return ToolGenerationConstraint(
+        "<tool>",
+        'start: "ok"',
+        True,
+        branch_guarantees=tuple(
+            (tool.name, GenerationGuarantee.SCHEMA) for tool in policy.tools
+        ),
+    )
 
 
 async def _completed_call_failure(
@@ -668,8 +714,8 @@ def test_parallel_false_accepts_first_call_then_fails_second_completion() -> Non
         assert ToolCallStarted("req", "call-1", "lookup", 0) in events
         assert ToolCallArgumentsDelta("req", "call-1", '{"id":1}', 0) in events
         assert ToolCallCompleted("req", first) not in events
-        assert ToolCallStarted("req", "call-2", "lookup", 1) in events
-        assert ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1) in events
+        assert ToolCallStarted("req", "call-2", "lookup", 1) not in events
+        assert ToolCallArgumentsDelta("req", "call-2", '{"id":2}', 1) not in events
         assert ToolCallCompleted("req", second) not in events
         assert isinstance(events[-1], GenerationFailed)
         assert events[-1].error.code == "tool_policy_violation"
@@ -1287,7 +1333,7 @@ def test_qwen_dsh_raw_parameter_collision_completes_at_serving_boundary() -> Non
     asyncio.run(scenario())
 
 
-def test_qwen_ambiguous_full_close_never_publishes_shortened_executable_call() -> None:
+def test_qwen_ambiguous_full_close_falls_back_without_shortened_executable_call() -> None:
     async def scenario() -> None:
         bash_tool = FunctionTool(
             "bash",
@@ -1320,13 +1366,14 @@ def test_qwen_ambiguous_full_close_never_publishes_shortened_executable_call() -
             isinstance(event, ToolCallArgumentsDelta) and '"command":"before"' in event.delta
             for event in events
         )
-        assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.code == "protocol_ambiguity"
+        assert "".join(event.text for event in events if isinstance(event, TextDelta)) == raw
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.STOP
 
     asyncio.run(scenario())
 
 
-def test_qwen_semantic_hold_limit_is_early_terminal_and_preserves_safe_prefix() -> None:
+def test_qwen_semantic_hold_limit_recovers_literal_on_eos_without_tool_surface() -> None:
     async def scenario() -> None:
         limit = 64 * 1024
         marker = "</think>"
@@ -1358,18 +1405,17 @@ def test_qwen_semantic_hold_limit_is_early_terminal_and_preserves_safe_prefix() 
 
         events = [event async for event in session]
 
-        assert "".join(event.text for event in events if isinstance(event, ReasoningDelta)) == prefix
-        assert not any(isinstance(event, ToolCallCompleted) for event in events)
-        assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.code == "protocol_ambiguity"
-        assert events[-1].error.cause is FailureCause.PARSER_AMBIGUITY_LIMIT
-        assert controlled.cancel_calls == [RequestTerminalReason.APPLICATION_CANCELLED]
+        assert "".join(event.text for event in events if isinstance(event, ReasoningDelta)) == raw
+        assert not any(isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.STOP
+        assert controlled.cancel_calls == []
 
     asyncio.run(scenario())
 
 
-def test_qwen_unresolved_boundary_maps_runtime_finish_reason_without_silent_success() -> None:
-    async def run(reason: RuntimeStopReason) -> GenerationFailed:
+def test_qwen_unresolved_boundary_recovers_only_for_safe_runtime_terminal() -> None:
+    async def run(reason: RuntimeStopReason) -> tuple[list[GenerationEvent], str]:
         marker = "</think>"
         raw = "SAFE_PREFIX\n```text\nliteral\n" + marker + "tail"
         marker_at = raw.index(marker)
@@ -1400,15 +1446,22 @@ def test_qwen_unresolved_boundary_maps_runtime_finish_reason_without_silent_succ
             parser_context_factory=resolve_qwen_parser_context,
         ).submit(_request(policy))
         events = [event async for event in session]
-        assert not any(isinstance(event, ToolCallCompleted) for event in events)
-        assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.code == "protocol_ambiguity"
-        return events[-1]
+        assert not any(isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted) for event in events)
+        return events, raw
 
-    eos = asyncio.run(run(RuntimeStopReason.EOS))
-    length = asyncio.run(run(RuntimeStopReason.LENGTH))
-    assert eos.error.cause is FailureCause.OUTPUT_EOS
-    assert length.error.cause is FailureCause.OUTPUT_LENGTH
+    eos_events, raw = asyncio.run(run(RuntimeStopReason.EOS))
+    filter_events, filter_raw = asyncio.run(run(RuntimeStopReason.FILTER))
+    length_events, _ = asyncio.run(run(RuntimeStopReason.LENGTH))
+
+    for events, expected_raw in ((eos_events, raw), (filter_events, filter_raw)):
+        assert "".join(event.text for event in events if isinstance(event, ReasoningDelta)) == expected_raw
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.STOP
+
+    assert "".join(event.text for event in length_events if isinstance(event, ReasoningDelta)) == "SAFE_PREFIX\n```text\nliteral\n"
+    assert isinstance(length_events[-1], GenerationFailed)
+    assert length_events[-1].error.code == "protocol_ambiguity"
+    assert length_events[-1].error.cause is FailureCause.OUTPUT_LENGTH
 
 
 def test_qwen_cleanup_ambiguity_does_not_override_runtime_failure() -> None:
@@ -1450,6 +1503,350 @@ def test_qwen_cleanup_ambiguity_does_not_override_runtime_failure() -> None:
         assert events[-1].error.category is ErrorCategory.RUNTIME_FAILURE
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("guarantee", "strict"),
+    [
+        (GenerationGuarantee.FORMAT, False),
+        (GenerationGuarantee.SCHEMA, False),
+        (GenerationGuarantee.SCHEMA, True),
+    ],
+)
+@pytest.mark.parametrize("reason", [RuntimeStopReason.EOS, RuntimeStopReason.FILTER])
+def test_qwen_auto_outside_tool_literal_fallback_ignores_mechanical_constraint_activation(
+    guarantee: GenerationGuarantee,
+    strict: bool,
+    reason: RuntimeStopReason,
+) -> None:
+    async def scenario() -> None:
+        source, span = _l1_1_outside_tool_source()
+        policy = ToolPolicy(
+            (_tool("read", strict=strict),),
+            ToolChoice(ToolChoiceMode.AUTO),
+            allow_parallel=True,
+        )
+        controlled = _Controlled(
+            [
+                RuntimeStarted("req"),
+                RuntimeTextDelta(
+                    "req",
+                    source,
+                    native_token_spans=(span,),
+                    native_token_provenance=True,
+                ),
+                _finished(
+                    reason=reason,
+                    hard_constraint_installed=True,
+                    hard_constraint_activated=True,
+                    effective_generation_guarantee=guarantee,
+                ),
+            ]
+        )
+        context = _l1_1_parser_context(guarantee)
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_reasoning_parser_factory,
+            _Controller(controlled),
+            _l1_1_schema_tool_constraint_factory,
+            parser_context_factory=lambda tool_constraint, installation, fallback: context,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert "".join(event.text for event in events if isinstance(event, ReasoningDelta)) == source
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert not any(isinstance(event, GenerationFailed) for event in events)
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.STOP
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", [ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED])
+def test_qwen_outside_tool_literal_fallback_keeps_explicit_tool_contract_hard(
+    mode: ToolChoiceMode,
+) -> None:
+    async def scenario() -> None:
+        source, span = _l1_1_outside_tool_source()
+        choice = ToolChoice(mode, "read") if mode is ToolChoiceMode.NAMED else ToolChoice(mode)
+        policy = ToolPolicy((_tool("read"),), choice, allow_parallel=True)
+        controlled = _Controlled(
+            [
+                RuntimeStarted("req"),
+                RuntimeTextDelta(
+                    "req",
+                    source,
+                    native_token_spans=(span,),
+                    native_token_provenance=True,
+                ),
+                _finished(
+                    reason=RuntimeStopReason.FILTER,
+                    hard_constraint_installed=True,
+                    hard_constraint_activated=True,
+                    effective_generation_guarantee=GenerationGuarantee.SCHEMA,
+                ),
+            ]
+        )
+        context = _l1_1_parser_context(GenerationGuarantee.SCHEMA)
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_reasoning_parser_factory,
+            _Controller(controlled),
+            _l1_1_schema_tool_constraint_factory,
+            parser_context_factory=lambda tool_constraint, installation, fallback: context,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+        reasoning = "".join(event.text for event in events if isinstance(event, ReasoningDelta))
+
+        assert "<tool_call>" not in reasoning
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "protocol_ambiguity"
+
+    asyncio.run(scenario())
+
+
+def test_qwen_auto_outside_tool_literal_fallback_keeps_length_and_structured_output_hard() -> None:
+    async def run(*, structured: StructuredOutputSpec | None, reason: RuntimeStopReason) -> list[GenerationEvent]:
+        source, span = _l1_1_outside_tool_source()
+        policy = ToolPolicy((_tool("read", strict=True),), ToolChoice(ToolChoiceMode.AUTO), True)
+        controlled = _Controlled(
+            [
+                RuntimeStarted("req"),
+                RuntimeTextDelta(
+                    "req",
+                    source,
+                    native_token_spans=(span,),
+                    native_token_provenance=True,
+                ),
+                _finished(
+                    reason=reason,
+                    hard_constraint_installed=True,
+                    hard_constraint_activated=True,
+                    effective_generation_guarantee=GenerationGuarantee.SCHEMA,
+                ),
+            ]
+        )
+        context = _l1_1_parser_context(GenerationGuarantee.SCHEMA)
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_reasoning_parser_factory,
+            _Controller(controlled),
+            _l1_1_schema_tool_constraint_factory,
+            parser_context_factory=lambda tool_constraint, installation, fallback: context,
+        ).submit(_request(policy, structured=structured))
+        return [event async for event in session]
+
+    length_events = asyncio.run(run(structured=None, reason=RuntimeStopReason.LENGTH))
+    structured_events = asyncio.run(
+        run(
+            structured=StructuredOutputSpec(JsonSchema('{"type":"object"}')),
+            reason=RuntimeStopReason.FILTER,
+        )
+    )
+
+    for events in (length_events, structured_events):
+        reasoning = "".join(event.text for event in events if isinstance(event, ReasoningDelta))
+        assert "<tool_call>" not in reasoning
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "protocol_ambiguity"
+    assert length_events[-1].error.cause is FailureCause.OUTPUT_LENGTH
+
+
+def test_tool_scope_literal_fallback_contract_is_unresolved_boundary_only() -> None:
+    issue = ParserTerminalIssue(
+        ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+        ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+        ParserConstraintScope.TOOL,
+        literal_fallback_committed=True,
+    )
+    assert issue.literal_fallback_committed is True
+
+    with pytest.raises(ValueError, match="unresolved TOOL ambiguity"):
+        ParserTerminalIssue(
+            ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+            ParserAmbiguityDetail.HOLD_LIMIT,
+            ParserConstraintScope.TOOL,
+            literal_fallback_committed=True,
+        )
+
+
+def test_qwen_auto_unconstrained_tool_scope_ambiguity_falls_back_only_on_eos() -> None:
+    async def run(reason: RuntimeStopReason) -> list[GenerationEvent]:
+        tool = FunctionTool(
+            "write",
+            None,
+            JsonSchema(
+                '{"type":"object","properties":{"content":{"type":"string"}},'
+                '"required":["content"],"additionalProperties":false}'
+            ),
+            strict=False,
+        )
+        policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+        source = (
+            "<tool_call><function=write><parameter=content>"
+            "prefix </parameter></function></tool_call> literal suffix"
+            "</parameter></function></tool_call>"
+        )
+        controlled = _Controlled(
+            [RuntimeStarted("req"), RuntimeTextDelta("req", source), _finished(reason=reason)]
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_parser_factory,
+            _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
+        ).submit(_request(policy))
+        return [event async for event in session]
+
+    eos_events = asyncio.run(run(RuntimeStopReason.EOS))
+    filter_events = asyncio.run(run(RuntimeStopReason.FILTER))
+    length_events = asyncio.run(run(RuntimeStopReason.LENGTH))
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        "prefix </parameter></function></tool_call> literal suffix"
+        "</parameter></function></tool_call>"
+    )
+
+    assert "".join(event.text for event in eos_events if isinstance(event, TextDelta)) == source
+    assert not any(
+        isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+        for event in eos_events
+    )
+    assert isinstance(eos_events[-1], GenerationCompleted)
+    assert eos_events[-1].reason is CompletionReason.STOP
+
+    responses = ResponsesStreamSerializer("model", response_id="resp-l2a", created_at=1)
+    response_wire = [
+        payload
+        for event in (GenerationStarted("req"), *eos_events)
+        for payload in responses.feed(event)
+    ]
+    assert "".join(
+        str(payload["delta"])
+        for payload in response_wire
+        if payload["type"] == "response.output_text.delta"
+    ) == source
+    assert not any("function_call" in str(payload["type"]) for payload in response_wire)
+    assert [
+        payload["type"]
+        for payload in response_wire
+        if payload["type"] in {"response.completed", "response.failed", "response.incomplete"}
+    ] == ["response.completed"]
+
+    for events in (filter_events, length_events):
+        assert not any(isinstance(event, TextDelta) for event in events)
+        assert not any(
+            isinstance(event, ToolCallStarted | ToolCallArgumentsDelta | ToolCallCompleted)
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "protocol_ambiguity"
+    assert length_events[-1].error.cause is FailureCause.OUTPUT_LENGTH
+
+
+def test_tool_scope_literal_fallback_keeps_active_constraint_hard() -> None:
+    async def scenario() -> None:
+        issue = ParserTerminalIssue(
+            ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+            ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+            ParserConstraintScope.TOOL,
+            literal_fallback_committed=True,
+        )
+        parser = _ScriptedParser(
+            (),
+            _Finish(
+                (
+                    TextStarted("req"),
+                    TextDelta("req", "deferred literal"),
+                    TextCompleted("req", "deferred literal"),
+                ),
+                issue=issue,
+            ),
+        )
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), True)
+        controlled = _Controlled(
+            [
+                RuntimeTextDelta("req", "raw"),
+                _finished(
+                    reason=RuntimeStopReason.EOS,
+                    hard_constraint_installed=True,
+                    hard_constraint_activated=True,
+                    effective_generation_guarantee=GenerationGuarantee.SCHEMA,
+                ),
+            ]
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert not any(
+            isinstance(event, TextDelta) and event.text == "deferred literal"
+            for event in events
+        )
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "protocol_ambiguity"
+        assert events[-1].error.cause is FailureCause.CONSTRAINT_FAILURE
+
+    asyncio.run(scenario())
+
+
+def test_outside_tool_literal_fallback_never_overrides_unstaged_tool_scope_or_public_tool_surface() -> None:
+    async def run(
+        issue: ParserTerminalIssue,
+        *,
+        public_tool_surface: bool = False,
+    ) -> list[GenerationEvent]:
+        parser = _ScriptedParser(
+            (),
+            _Finish((ReasoningDelta("req", "deferred literal"),), issue=issue),
+        )
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), True)
+        controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished(reason=RuntimeStopReason.FILTER)])
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+        ).submit(_request(policy))
+        if public_tool_surface:
+            session._commit_class = SemanticCommitClass.PARTIAL_TOOL_COMMITTED
+        return [event async for event in session]
+
+    tool_scope = ParserTerminalIssue(
+        ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+        ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+        ParserConstraintScope.TOOL,
+    )
+    outside_tool_committed = ParserTerminalIssue(
+        ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+        ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+        ParserConstraintScope.OUTSIDE_TOOL,
+        literal_fallback_committed=True,
+    )
+
+    tool_scope_events = asyncio.run(run(tool_scope))
+    published_tool_events = asyncio.run(
+        run(outside_tool_committed, public_tool_surface=True)
+    )
+
+    assert isinstance(tool_scope_events[-1], GenerationFailed)
+    assert tool_scope_events[-1].error.code == "protocol_ambiguity"
+    assert isinstance(published_tool_events[-1], GenerationFailed)
+    assert published_tool_events[-1].error.code == "protocol_ambiguity"
+    assert not any(
+        isinstance(event, ReasoningDelta) and event.text == "deferred literal"
+        for event in published_tool_events
+    )
 
 
 def test_atomic_constrained_parallel_schema_invalid_second_call_discards_entire_batch() -> None:
@@ -1995,6 +2392,79 @@ def test_validation_only_completed_tool_survives_later_length_stop() -> None:
             isinstance(event, GenerationFailed) and event.error.code == "tool_call_incomplete"
             for event in events
         )
+
+    asyncio.run(scenario())
+
+
+def test_validation_only_tool_completion_holds_trailing_text_until_commit_and_state_order() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(strict=False),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":7}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":7}', 0),
+                ToolCallCompleted("req", call),
+                TextStarted("req"),
+                TextDelta("req", " trailing text"),
+                TextCompleted("req", " trailing text"),
+            )
+        )
+        controlled = _Controlled([RuntimeTextDelta("req", "raw"), _finished()])
+        inner = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+        ).submit(_request(policy))
+        store = InMemoryResponseStore()
+        session = StatefulServingSession(
+            inner,
+            store,
+            response_id="resp_tool_then_text",
+            model="model",
+            base_context=(),
+            current_input=(MessageItem(MessageRole.USER, "go"),),
+            store_response=True,
+        )
+
+        events = [event async for event in session]
+        completed_index = events.index(ToolCallCompleted("req", call))
+        text_started_index = events.index(TextStarted("req"))
+        text_completed_index = events.index(TextCompleted("req", " trailing text"))
+        assert completed_index < text_started_index < text_completed_index
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+
+        record = await store.get("resp_tool_then_text")
+        assert record is not None
+        assert record.context_items == (
+            MessageItem(MessageRole.USER, "go"),
+            call,
+            MessageItem(MessageRole.ASSISTANT, " trailing text"),
+        )
+
+        responses = ResponsesStreamSerializer("model", response_id="resp_order", created_at=1)
+        response_wire = [payload for event in events for payload in responses.feed(event)]
+        response_types = [payload["type"] for payload in response_wire]
+        assert response_types.index("response.function_call_arguments.done") < response_types.index(
+            "response.output_text.delta"
+        )
+
+        anthropic = AnthropicMessageStreamSerializer("model", message_id="msg_order")
+        anthropic_wire = [payload for event in events for payload in anthropic.feed(event)]
+        tool_stop_index = next(
+            index
+            for index, (name, payload) in enumerate(anthropic_wire)
+            if name == "content_block_stop" and payload["index"] == 0
+        )
+        trailing_text_index = next(
+            index
+            for index, (name, payload) in enumerate(anthropic_wire)
+            if name == "content_block_delta"
+            and payload["index"] == 1
+            and payload["delta"] == {"type": "text_delta", "text": " trailing text"}
+        )
+        assert tool_stop_index < trailing_text_index
 
     asyncio.run(scenario())
 

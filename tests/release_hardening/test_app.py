@@ -1034,7 +1034,7 @@ def test_qwen_constrained_parallel_restores_runtime_constraint(tmp_path: Path) -
         constraint = runtime.submit_calls[0].generation_constraint
         assert constraint is not None
         assert (
-            '(WS? "<tool_call>" WS? function WS? "</tool_call>"){0,7}'
+            '(WS? "<tool_call>" WS? function WS? "</tool_call>"){0,3}'
             in constraint.lark_grammar
         )
 

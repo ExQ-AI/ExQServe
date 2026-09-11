@@ -21,6 +21,7 @@ from exqserve.core.events import (
     ToolCallCompleted,
     ToolCallStarted,
 )
+from exqserve.core.generation_guarantees import GenerationGuarantee
 from exqserve.core.items import (
     ImageContentPart,
     MessageItem,
@@ -578,6 +579,21 @@ class _QwenMarkerBoundaryTracker:
     def terminal_issue(self) -> ParserTerminalIssue | None:
         return self._terminal_issue
 
+    def mark_literal_fallback_committed(self) -> None:
+        issue = self._terminal_issue
+        if (
+            issue is None
+            or issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+            or issue.constraint_scope is not ParserConstraintScope.OUTSIDE_TOOL
+        ):
+            raise RuntimeError("Qwen literal fallback requires OUTSIDE_TOOL protocol ambiguity")
+        self._terminal_issue = ParserTerminalIssue(
+            issue.kind,
+            issue.ambiguity_detail,
+            issue.constraint_scope,
+            literal_fallback_committed=True,
+        )
+
     @property
     def peak_held_bytes(self) -> int:
         return self._peak_held_bytes
@@ -928,6 +944,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         if parser_context is not None and not isinstance(parser_context, ParserCreationContext):
             raise TypeError("parser_context must be a ParserCreationContext or None")
         self._parser_context = parser_context
+        self._tool_policy = tool_policy
         decoder = None if parser_context is None else parser_context.tool_region_decoder
         factory = None if parser_context is None else parser_context.tool_region_decoder_factory
         if decoder is None and factory is not None:
@@ -961,6 +978,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._had_incomplete_tool = False
         self._protocol_terminal_issue: ParserTerminalIssue | None = None
         self._marker_boundaries = _QwenMarkerBoundaryTracker()
+        self._outside_tool_literal_pending: str | None = None
         self._finished = False
 
     @property
@@ -1296,11 +1314,14 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             self._buffer = ""
         shared_result = shared.finish()
         if not shared_result.complete:
+            restore_literal = False
             if shared_result.issue_code == "raw_boundary_ambiguous":
+                restore_literal = self._tool_scope_literal_fallback_allowed(shared_result)
                 self._protocol_terminal_issue = ParserTerminalIssue(
                     ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
                     ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
                     ParserConstraintScope.TOOL,
+                    literal_fallback_committed=restore_literal,
                 )
             elif shared_result.issue_code == "compatibility_semantic_work_exceeded":
                 self._protocol_terminal_issue = ParserTerminalIssue(
@@ -1311,6 +1332,8 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             else:
                 self._had_incomplete_tool = True
             self._restore_after_tool()
+            if restore_literal:
+                self._emit_content(shared_result.raw_region, events)
             return True
         self._publish_shared_tool_result(shared_result, events)
         return False
@@ -1516,6 +1539,56 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         if chunk:
             self._pending_inline_native_chunks.append((chunk, native_token_spans))
 
+    def _outside_tool_literal_fallback_allowed(self) -> bool:
+        if self._call_index != 0 or self._mode is _QwenMode.TOOL:
+            return False
+        policy = self._tool_policy
+        return bool(
+            policy is None
+            or policy.choice.mode not in {ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED}
+        )
+
+    def _tool_scope_literal_fallback_allowed(self, result: ToolRegionDecodeResult) -> bool:
+        if (
+            self._call_index != 0
+            or self._mode is not _QwenMode.TOOL
+            or result.calls
+            or not result.raw_region
+        ):
+            return False
+        policy = self._tool_policy
+        if policy is None or policy.choice.mode is not ToolChoiceMode.AUTO:
+            return False
+        context = self._parser_context
+        return bool(
+            context is None
+            or (
+                context.hard_constraint_installed is not True
+                and context.generation_guarantee is GenerationGuarantee.NONE
+            )
+        )
+
+    def _commit_outside_tool_literal_fallback(
+        self,
+        marker: str,
+        following_text: str,
+        events: list[GenerationEvent],
+    ) -> bool:
+        issue = self._marker_boundaries.terminal_issue
+        if (
+            issue is None
+            or issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+            or issue.constraint_scope is not ParserConstraintScope.OUTSIDE_TOOL
+            or not self._outside_tool_literal_fallback_allowed()
+        ):
+            return False
+        held_text = "".join(chunk for chunk, _ in self._pending_inline_native_chunks)
+        self._pending_inline_native_chunks = []
+        self._pending_native_replay = ()
+        del events
+        self._outside_tool_literal_pending = marker + held_text + following_text
+        return True
+
     def _resolve_pending_inline_native_marker(
         self,
         events: list[GenerationEvent],
@@ -1534,6 +1607,8 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         marker, disposition = resolved
         if disposition is _QwenMarkerDisposition.PENDING:
             if self._marker_boundaries.terminal_issue is not None:
+                if self._commit_outside_tool_literal_fallback(marker, following_text, events):
+                    return False
                 self._pending_inline_native_chunks = []
                 self._pending_native_replay = ()
                 return False
@@ -1714,6 +1789,9 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             raise TypeError("native_token_spans must be a tuple or None")
 
         events: list[GenerationEvent] = []
+        if self._outside_tool_literal_pending is not None:
+            self._outside_tool_literal_pending += chunk
+            return tuple(events)
         if self._marker_boundaries.has_pending_inline_native_marker:
             self._resolve_pending_inline_native_marker(events, chunk, native_token_spans)
             return tuple(events)
@@ -1763,14 +1841,16 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                     disposition is _QwenMarkerDisposition.PENDING
                     and self._marker_boundaries.has_pending_inline_native_marker
                 ):
-                    if self._marker_boundaries.terminal_issue is not None:
-                        self._pending_inline_native_chunks = []
-                        return tuple(events)
                     suffix, suffix_spans = self._slice_native_suffix(
                         chunk,
                         native_token_spans,
                         span.end,
                     )
+                    if self._marker_boundaries.terminal_issue is not None:
+                        if self._commit_outside_tool_literal_fallback(span.text, suffix, events):
+                            return tuple(events)
+                        self._pending_inline_native_chunks = []
+                        return tuple(events)
                     self._buffer_pending_inline_native_chunk(suffix, suffix_spans)
                     return tuple(events)
             cursor = span.end
@@ -1782,8 +1862,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             raise RuntimeError("cannot feed a finished Qwen parser")
         if not isinstance(chunk, str):
             raise TypeError("chunk must be a string")
-        self._buffer += chunk
         events: list[GenerationEvent] = []
+        if self._outside_tool_literal_pending is not None:
+            self._outside_tool_literal_pending += chunk
+            return tuple(events)
+        self._buffer += chunk
 
         while True:
             progressed = (
@@ -1803,6 +1886,16 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             )
 
         events: list[GenerationEvent] = []
+        if self._outside_tool_literal_pending is not None:
+            self._emit_content(self._outside_tool_literal_pending, events)
+            self._outside_tool_literal_pending = None
+            self._close_current_channel(events)
+            self._marker_boundaries.mark_literal_fallback_committed()
+            self._finished = True
+            terminal_issue = self._marker_boundaries.terminal_issue
+            if terminal_issue is None or not terminal_issue.literal_fallback_committed:
+                raise RuntimeError("Qwen literal fallback lost terminal evidence")
+            return QwenParserFinish(tuple(events), False, terminal_issue)
         pending_prefix = self._marker_boundaries.unverified_marker_prefix
         if pending_prefix:
             self._feed_native_text_segment(pending_prefix, events)
@@ -1813,6 +1906,16 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             if self._marker_boundaries.has_pending_inline_native_marker:
                 if self._resolve_pending_inline_native_marker(events, final=True):
                     continue
+                if self._outside_tool_literal_pending is not None:
+                    self._emit_content(self._outside_tool_literal_pending, events)
+                    self._outside_tool_literal_pending = None
+                    self._close_current_channel(events)
+                    self._marker_boundaries.mark_literal_fallback_committed()
+                    self._finished = True
+                    terminal_issue = self._marker_boundaries.terminal_issue
+                    if terminal_issue is None or not terminal_issue.literal_fallback_committed:
+                        raise RuntimeError("Qwen literal fallback lost terminal evidence")
+                    return QwenParserFinish(tuple(events), False, terminal_issue)
                 terminal_issue = self._marker_boundaries.terminal_issue
                 if terminal_issue is None:
                     raise RuntimeError("Qwen semantic barrier did not resolve at end of stream")

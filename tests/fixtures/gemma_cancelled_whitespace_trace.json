@@ -1,0 +1,12 @@
+{
+  "source": ".ai-bridge/night-code-review-runs/full-recovery1-par1-20260910-0053-fdd5354/cases/exq-gemma-dsh/server-capture.jsonl",
+  "request_id": "req_767c54f62c2e4d519e849cd82d931a60",
+  "runtime_trace_count": 2048,
+  "raw_prefix": "<|tool_call>call:read{",
+  "prefix_token_ids": [48, 6639, 236787, 1399, 236782],
+  "whitespace_token_id": 167,
+  "whitespace_token_count": 10251,
+  "whitespace_chars_per_token": 31,
+  "total_token_count": 10256,
+  "raw_char_count": 317803
+}

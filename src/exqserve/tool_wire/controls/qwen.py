@@ -1183,7 +1183,7 @@ def compile_qwen_tool_wire(
     mode: ToolConstraintMode,
     *,
     budget: CompileBudget | None = None,
-    max_parallel_calls: int = 8,
+    max_parallel_calls: int = 4,
 ) -> QwenToolWireCompilation:
     """Compile the production Qwen constrained Tool path from the accepted Tool-Wire authority."""
 
@@ -1438,7 +1438,7 @@ def qwen_production_tool_constraint(
     policy: ToolPolicy,
     mode: ToolConstraintMode,
     *,
-    max_parallel_calls: int = 8,
+    max_parallel_calls: int = 4,
 ) -> ToolGenerationConstraint | None:
     """Return the production Qwen constraint from one authoritative Tool-Wire compilation."""
 

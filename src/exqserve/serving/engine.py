@@ -23,7 +23,7 @@ from exqserve.agent.structured_output import (
     validate_structured_output,
     violates_structured_constraint_guarantee,
 )
-from exqserve.agent.tools import ToolPolicy
+from exqserve.agent.tools import ToolChoiceMode, ToolPolicy
 from exqserve.agent.validation import validate_tool_calls, validate_tool_history
 from exqserve.control.request import (
     RequestInjectionConflict,
@@ -536,7 +536,7 @@ class ServingEngine:
         controller: RequestControllerLike,
         tool_constraint_factory: ToolConstraintFactory | None = None,
         tool_call_fanout_limit: int = 32,
-        constrained_parallel_tool_call_limit: int = 8,
+        constrained_parallel_tool_call_limit: int = 4,
         output_limit_resolver: OutputLimitResolver | None = None,
         reasoning_control_factory: ReasoningControlFactory | None = None,
         reasoning_control_tokenizer: ReasoningControlTokenizer | None = None,
@@ -1396,7 +1396,7 @@ class ServingSession:
         requested_stop_conditions: tuple[str | int, ...] = (),
         tool_call_fanout_limit: int = 32,
         atomic_parallel_tools: bool = False,
-        constrained_parallel_tool_call_limit: int = 8,
+        constrained_parallel_tool_call_limit: int = 4,
         reasoning_budget: _EffectiveReasoningBudget | None = None,
         tool_constraint: ToolGenerationConstraint | None = None,
         planned_generation_guarantee: GenerationGuarantee = GenerationGuarantee.NONE,
@@ -1431,6 +1431,7 @@ class ServingSession:
         self._terminal_evidence = TerminalEvidence()
         self._terminal = False
         self._parser_finished = False
+        self._deferred_parser_terminal_events: tuple[GenerationEvent, ...] = ()
         self._text_parts: list[str] = []
         self._runtime_trace: list[dict[str, object]] | None = None
         self._attempt_usage: TokenUsage | None = None
@@ -2032,6 +2033,9 @@ class ServingSession:
                 else f"{terminal_issue.kind.value}:{terminal_issue.ambiguity_detail.value}"
             )
             self._terminal_evidence.record_parser_issue(detail)
+        if terminal_issue is not None and terminal_issue.literal_fallback_committed:
+            self._deferred_parser_terminal_events = finish.events
+            return terminal_issue
         for event in finish.events:
             await self._process_semantic(event)
             if self._terminal:
@@ -2045,6 +2049,104 @@ class ServingSession:
         if issue is not None and not isinstance(issue, ParserTerminalIssue):
             raise TypeError("early_terminal_issue must be a ParserTerminalIssue or None")
         return issue
+
+    def _outside_tool_literal_staging_allowed(self, issue: ParserTerminalIssue) -> bool:
+        if (
+            issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+            or issue.constraint_scope is not ParserConstraintScope.OUTSIDE_TOOL
+        ):
+            return False
+        if self._commit_class in {SemanticCommitClass.PARTIAL_TOOL_COMMITTED, SemanticCommitClass.TOOL_COMPLETED}:
+            return False
+        if self._tool_batch.completed_calls or self._tool_batch.has_buffered_events:
+            return False
+        if self._structured_output is not None:
+            return False
+        return self._tool_policy.choice.mode not in {ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED}
+
+    def _outside_tool_literal_fallback_allowed(
+        self,
+        issue: ParserTerminalIssue,
+        runtime_event: RuntimeFinished | None,
+    ) -> bool:
+        if (
+            not self._outside_tool_literal_staging_allowed(issue)
+            or not issue.literal_fallback_committed
+            or runtime_event is None
+            or runtime_event.reason not in {RuntimeStopReason.EOS, RuntimeStopReason.FILTER}
+        ):
+            return False
+        return self._terminal_evidence.causal_owner is not TerminalPrimaryOwner.LIFECYCLE_TERMINATION
+
+    def _tool_scope_literal_fallback_allowed(
+        self,
+        issue: ParserTerminalIssue,
+        runtime_event: RuntimeFinished | None,
+    ) -> bool:
+        if (
+            issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+            or issue.ambiguity_detail is not ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+            or issue.constraint_scope is not ParserConstraintScope.TOOL
+            or not issue.literal_fallback_committed
+            or runtime_event is None
+            or runtime_event.reason is not RuntimeStopReason.EOS
+            or self._tool_policy.choice.mode is not ToolChoiceMode.AUTO
+            or self._structured_output is not None
+            or self._commit_class
+            in {SemanticCommitClass.PARTIAL_TOOL_COMMITTED, SemanticCommitClass.TOOL_COMPLETED}
+            or self._tool_batch.completed_calls
+            or self._tool_batch.has_buffered_events
+            or runtime_event.hard_constraint_installed
+            or runtime_event.hard_constraint_activated
+            or runtime_event.effective_generation_guarantee is not GenerationGuarantee.NONE
+        ):
+            return False
+        return self._terminal_evidence.causal_owner is not TerminalPrimaryOwner.LIFECYCLE_TERMINATION
+
+    def _complete_runtime_success(
+        self,
+        event: RuntimeFinished,
+        *,
+        success_reason: CompletionReason | None = None,
+    ) -> None:
+        decision = self._terminal_evidence.resolve(success_reason=success_reason)
+        if decision.disposition is not TerminalDisposition.SUCCESS:
+            self._emit_recorded_failure_or_cancellation()
+            return
+        reason = decision.completion_reason
+        if reason is None:  # pragma: no cover - TerminalDecision validates success.
+            raise RuntimeError("successful terminal decision is missing completion reason")
+
+        timing_event = timing_event_from_runtime(self._request_id, event.timing)
+        usage_event = UsageUpdated(self._request_id, event.usage)
+        exposed_stop_sequence = (
+            event.stop_sequence
+            if reason is CompletionReason.STOP
+            and event.stop_sequence in self._requested_stop_sequences
+            else None
+        )
+        completed_event = GenerationCompleted(
+            self._request_id,
+            reason,
+            event.usage,
+            exposed_stop_sequence,
+        )
+
+        pending_checkpoint = len(self._pending)
+        commit_class_checkpoint = self._commit_class
+        try:
+            self._commit_tool_batch()
+            if timing_event is not None:
+                self._pending.append(timing_event)
+            self._pending.append(usage_event)
+            self._pending.append(completed_event)
+            self._terminal_evidence.commit_decision(decision)
+        except Exception:
+            while len(self._pending) > pending_checkpoint:
+                self._pending.pop()
+            self._commit_class = commit_class_checkpoint
+            raise
+        self._terminal = True
 
     async def _handle_parser_terminal_issue(
         self,
@@ -2093,6 +2195,19 @@ class ServingSession:
             and runtime_event.effective_generation_guarantee
             in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
         )
+        if self._outside_tool_literal_fallback_allowed(
+            issue, runtime_event
+        ) or self._tool_scope_literal_fallback_allowed(issue, runtime_event):
+            assert runtime_event is not None
+            deferred = self._deferred_parser_terminal_events
+            self._deferred_parser_terminal_events = ()
+            for semantic in deferred:
+                await self._process_semantic(semantic)
+                if self._terminal:
+                    return
+            self._complete_runtime_success(runtime_event, success_reason=CompletionReason.STOP)
+            return
+        self._deferred_parser_terminal_events = ()
         if detail is ParserAmbiguityDetail.HOLD_LIMIT:
             cause = (
                 FailureCause.CONSTRAINT_FAILURE
@@ -2219,47 +2334,7 @@ class ServingSession:
                 return
 
         success_reason = CompletionReason.TOOL_CALLS if completed_calls else None
-        decision = self._terminal_evidence.resolve(success_reason=success_reason)
-        if decision.disposition is not TerminalDisposition.SUCCESS:
-            self._emit_recorded_failure_or_cancellation()
-            return
-        reason = decision.completion_reason
-        if reason is None:  # pragma: no cover - TerminalDecision validates success.
-            raise RuntimeError("successful terminal decision is missing completion reason")
-
-        timing_event = timing_event_from_runtime(self._request_id, event.timing)
-        usage_event = UsageUpdated(self._request_id, event.usage)
-        exposed_stop_sequence = (
-            event.stop_sequence
-            if reason is CompletionReason.STOP
-            and event.stop_sequence in self._requested_stop_sequences
-            else None
-        )
-        completed_event = GenerationCompleted(
-            self._request_id,
-            reason,
-            event.usage,
-            exposed_stop_sequence,
-        )
-
-        pending_checkpoint = len(self._pending)
-        commit_class_checkpoint = self._commit_class
-        try:
-            # These events remain local to this session until __anext__ returns.
-            # If authority commit fails, roll the local publication queue back before
-            # the normal UNKNOWN_INTERNAL fallback is allowed to terminate the request.
-            self._commit_tool_batch()
-            if timing_event is not None:
-                self._pending.append(timing_event)
-            self._pending.append(usage_event)
-            self._pending.append(completed_event)
-            self._terminal_evidence.commit_decision(decision)
-        except Exception:
-            while len(self._pending) > pending_checkpoint:
-                self._pending.pop()
-            self._commit_class = commit_class_checkpoint
-            raise
-        self._terminal = True
+        self._complete_runtime_success(event, success_reason=success_reason)
 
     async def _handle_runtime_failure(self, event: RuntimeFailed) -> None:
         self._record_controlled_terminal_reason()
@@ -2370,6 +2445,8 @@ class ServingSession:
                     await self._process_semantic(semantic)
                     if self._terminal:
                         return
+                if self._outside_tool_literal_staging_allowed(early_terminal_issue):
+                    return
                 await self._handle_parser_terminal_issue(early_terminal_issue)
                 return
             await self._apply_reasoning_budget(event, semantic_events)

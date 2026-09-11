@@ -694,7 +694,7 @@ def test_cli_constrained_parallel_limit_defaults_and_overrides(tmp_path: Path) -
         [str(tmp_path), "--max-constrained-parallel-tool-calls", "6"]
     )
 
-    assert default_config.constrained_parallel_tool_call_limit == 8
+    assert default_config.constrained_parallel_tool_call_limit == 4
     assert explicit_config.constrained_parallel_tool_call_limit == 6
 
 

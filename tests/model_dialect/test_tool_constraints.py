@@ -205,7 +205,7 @@ def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
     assert constraint is not None
     assert (
         'start: WS? function WS? "</tool_call>" '
-        '(WS? "<tool_call>" WS? function WS? "</tool_call>"){0,7}'
+        '(WS? "<tool_call>" WS? function WS? "</tool_call>"){0,3}'
     ) in constraint.lark_grammar
 
     strict_constraint = qwen_tool_constraint(
@@ -325,7 +325,10 @@ def test_gemma_format_constraint_requires_json_object_only() -> None:
     )
 
     assert constraint is not None
-    assert '%json {"type":"object"}' in constraint.lark_grammar
+    assert "%json " in constraint.lark_grammar
+    assert '"type":"object"' in constraint.lark_grammar
+    assert '"whitespace_pattern"' in constraint.lark_grammar
+    assert "{0,64}" in constraint.lark_grammar
     assert '"count"' not in constraint.lark_grammar
 
 
@@ -338,8 +341,27 @@ def test_gemma_constraint_has_no_unbounded_whitespace_path_before_close() -> Non
     assert constraint is not None
     assert "start: tool" in constraint.lark_grammar
     assert "WS" not in constraint.lark_grammar
-    assert '%json ' in constraint.lark_grammar
+    assert "%json " in constraint.lark_grammar
+    assert '"whitespace_pattern"' in constraint.lark_grammar
+    assert "{0,64}" in constraint.lark_grammar
     assert " <tool_call|>" in constraint.lark_grammar
+
+
+def test_gemma_constraint_preserves_other_json_guidance_while_owning_whitespace_bound() -> None:
+    schema = (
+        '{"type":"object","properties":{},"additionalProperties":false,'
+        '"x-guidance":{"coerce_one_of":true,"whitespace_pattern":"[ ]*"}}'
+    )
+    constraint = gemma4_tool_constraint(
+        _policy(_tool("save", schema), parallel=False),
+        ToolConstraintMode.SCHEMA,
+    )
+
+    assert constraint is not None
+    assert '"coerce_one_of":true' in constraint.lark_grammar
+    assert '"whitespace_pattern":"[ ]*"' not in constraint.lark_grammar
+    assert '"whitespace_pattern"' in constraint.lark_grammar
+    assert "{0,64}" in constraint.lark_grammar
 
 
 def test_named_choice_exposes_only_selected_tool() -> None:

@@ -79,6 +79,16 @@ _TOOL_OPEN = "<|tool_call>"
 _TOOL_CLOSE = "<tool_call|>"
 _STRING_DELIMITER = '<|"|>'
 _PLAIN_MARKERS = (_THOUGHT_OPEN, _THOUGHT_CLOSE, _TOOL_OPEN)
+_GEMMA_JSON_WHITESPACE_PATTERN = r"[ \t\r\n]{0,64}"
+
+
+def _gemma_schema_lark(schema: dict[str, JsonValue]) -> str:
+    constrained = dict(schema)
+    guidance = constrained.get("x-guidance")
+    guidance_options = dict(guidance) if isinstance(guidance, dict) else {}
+    guidance_options["whitespace_pattern"] = _GEMMA_JSON_WHITESPACE_PATTERN
+    constrained["x-guidance"] = guidance_options
+    return schema_lark(constrained)
 
 
 def _valid_gemma_tool_name(name: str) -> bool:
@@ -125,7 +135,7 @@ def gemma4_tool_constraint(
         )
         lines.append(
             f"tool_{index}: {lark_literal(f'call:{tool.name}')} "
-            f"{schema_lark(schema)} <tool_call|>"
+            f"{_gemma_schema_lark(schema)} <tool_call|>"
         )
     return ToolGenerationConstraint(
         trigger=_TOOL_OPEN,

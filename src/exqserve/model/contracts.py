@@ -354,20 +354,34 @@ class ParserTerminalIssue:
     kind: ParserTerminalIssueKind
     ambiguity_detail: ParserAmbiguityDetail | None = None
     constraint_scope: ParserConstraintScope = ParserConstraintScope.UNKNOWN
+    literal_fallback_committed: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ParserTerminalIssueKind):
             raise TypeError("kind must be a ParserTerminalIssueKind")
         if not isinstance(self.constraint_scope, ParserConstraintScope):
             raise TypeError("constraint_scope must be a ParserConstraintScope")
+        if not isinstance(self.literal_fallback_committed, bool):
+            raise TypeError("literal_fallback_committed must be a bool")
         if self.kind is ParserTerminalIssueKind.INCOMPLETE_TOOL:
             if self.ambiguity_detail is not None:
                 raise ValueError("incomplete_tool must not have ambiguity_detail")
+            if self.literal_fallback_committed:
+                raise ValueError("incomplete_tool cannot commit literal fallback")
             return
         if self.ambiguity_detail is None:
             raise ValueError("protocol_ambiguity requires ambiguity_detail")
         if not isinstance(self.ambiguity_detail, ParserAmbiguityDetail):
             raise TypeError("ambiguity_detail must be a ParserAmbiguityDetail or None")
+        if self.literal_fallback_committed:
+            tool_scope_unresolved = (
+                self.constraint_scope is ParserConstraintScope.TOOL
+                and self.ambiguity_detail is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+            )
+            if self.constraint_scope is not ParserConstraintScope.OUTSIDE_TOOL and not tool_scope_unresolved:
+                raise ValueError(
+                    "literal fallback is only valid for OUTSIDE_TOOL ambiguity or unresolved TOOL ambiguity"
+                )
 
 
 def incomplete_tool_terminal_issue(incomplete: bool) -> ParserTerminalIssue | None:

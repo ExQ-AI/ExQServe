@@ -178,7 +178,7 @@ class ToolCallBatchGate:
         )
 
     def _accept_event(self, event: GenerationEvent) -> BatchDecision:
-        if self._atomic_parallel_tools:
+        if self._atomic_parallel_tools or self._buffered_events:
             self._buffered_events.append(event)
             return BatchDecision()
         return BatchDecision((event,))
@@ -255,7 +255,7 @@ class ToolCallBatchGate:
         lifecycle_failure = self._ensure_open()
         if lifecycle_failure is not None:
             return BatchDecision(failure=lifecycle_failure)
-        if self._atomic_parallel_tools and self._buffered_events:
+        if self._buffered_events:
             self._buffered_events.append(event)
             return BatchDecision()
         return BatchDecision((event,))

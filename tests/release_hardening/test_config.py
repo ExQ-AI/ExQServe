@@ -91,7 +91,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     tool_serving = config.tool_serving_options()
     assert tool_serving.constraint_mode is ToolConstraintMode.OFF
     assert tool_serving.fanout_limit == 32
-    assert tool_serving.constrained_parallel_limit == 8
+    assert tool_serving.constrained_parallel_limit == 4
 
 
 def test_server_config_recovery_attempt_budget_is_bounded(tmp_path: Path) -> None:

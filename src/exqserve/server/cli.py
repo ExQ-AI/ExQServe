@@ -29,7 +29,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "model_dialect": "auto",
     "tool_constraint_mode": ToolConstraintMode.OFF.value,
     "tool_call_fanout_limit": 32,
-    "constrained_parallel_tool_call_limit": 8,
+    "constrained_parallel_tool_call_limit": 4,
     "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,

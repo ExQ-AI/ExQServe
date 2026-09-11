@@ -639,7 +639,9 @@ def test_validation_only_leading_text_keeps_rejected_opener_literal_until_real_t
         assert events[-1].reason is CompletionReason.TOOL_CALLS
     elif followup == "complete":
         assert not calls
-        assert text == literal_remainder
+        # Once the first Tool completion is pending commit, later tail content
+        # shares that transaction and is discarded if a later Tool makes it fail.
+        assert text == ""
         assert isinstance(events[-1], GenerationFailed)
         assert events[-1].error.code == "tool_policy_violation"
     else:

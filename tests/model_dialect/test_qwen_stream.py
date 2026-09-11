@@ -26,6 +26,7 @@ from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     NativeTokenProvenanceError,
     ParserAmbiguityDetail,
+    ParserConstraintScope,
     ParserCreationContext,
     ParserTerminalIssueKind,
 )
@@ -538,6 +539,46 @@ def test_shared_validation_decoder_keeps_dual_valid_raw_boundary_ambiguous() -> 
 
     assert finished.protocol_terminal_issue is not None
     assert finished.protocol_terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert finished.protocol_terminal_issue.ambiguity_detail is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+    assert finished.protocol_terminal_issue.constraint_scope is ParserConstraintScope.TOOL
+    assert finished.protocol_terminal_issue.literal_fallback_committed is True
+    assert "".join(event.text for event in events if isinstance(event, TextDelta)) == source
+    assert not any(
+        isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("mode", (ToolChoiceMode.REQUIRED, ToolChoiceMode.NAMED))
+def test_shared_validation_decoder_does_not_stage_tool_scope_literal_for_must_call_policy(
+    mode: ToolChoiceMode,
+) -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    choice = ToolChoice(mode, "write") if mode is ToolChoiceMode.NAMED else ToolChoice(mode)
+    policy = ToolPolicy((tool,), choice, False)
+    parser = _shared_validation_parser("req-shared-dual-valid-hard", policy)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        "prefix </parameter></function></tool_call> literal suffix"
+        "</parameter></function></tool_call>"
+    )
+
+    events = list(parser.feed(source))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.protocol_terminal_issue is not None
+    assert finished.protocol_terminal_issue.constraint_scope is ParserConstraintScope.TOOL
+    assert finished.protocol_terminal_issue.literal_fallback_committed is False
+    assert not any(isinstance(event, TextDelta) for event in events)
     assert not any(
         isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
         for event in events
@@ -2685,7 +2726,7 @@ def test_native_aware_open_inline_barrier_never_retroactively_promotes_marker() 
     finished = parser.finish()
     events.extend(finished.events)
 
-    assert _reasoning_text(events) == "`` source "
+    assert _reasoning_text(events) == first + second
     assert not _completed_calls(events)
     assert finished.terminal_issue is not None
     assert finished.terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
@@ -2704,7 +2745,7 @@ def test_native_aware_open_fence_reports_ambiguity_without_literal_tool_side_eff
     events.extend(finished.events)
 
     assert finished.incomplete_tool_call is False
-    assert _reasoning_text(events) == "```text\nexample\n"
+    assert _reasoning_text(events) == source
     assert not _completed_calls(events)
     assert finished.terminal_issue is not None
     assert finished.terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
@@ -2721,7 +2762,7 @@ def test_native_fence_tentative_close_same_line_tool_reports_ambiguity() -> None
     finished = parser.finish()
     events.extend(finished.events)
 
-    assert _reasoning_text(events) == "```text\nliteral\n```   "
+    assert _reasoning_text(events) == source
     assert not _completed_calls(events)
     assert finished.terminal_issue is not None
     assert finished.terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
@@ -2848,7 +2889,7 @@ def test_native_fence_tentative_close_is_chunk_invariant() -> None:
         finished = parser.finish()
         events.extend(finished.events)
 
-        assert _reasoning_text(events) == "```text\nliteral\n``` \t ", split
+        assert _reasoning_text(events) == source, split
         assert not _completed_calls(events), split
         assert finished.terminal_issue is not None, split
         assert finished.terminal_issue.ambiguity_detail is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY, split

@@ -79,7 +79,7 @@ class ServerConfig:
     draft_moe_cpu_offload_layers: int = 0
     moe_cpu_threads: int | None = None
     tool_call_fanout_limit: int = 32
-    constrained_parallel_tool_call_limit: int = 8
+    constrained_parallel_tool_call_limit: int = 4
     reasoning_budget_tokens: int | None = None
     reasoning_budget_message: str = ""
     anthropic_compatibility_profile: str | None = None

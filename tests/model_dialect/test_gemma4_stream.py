@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
+from pathlib import Path
 
 from exqserve.core.events import (
     GenerationEvent,
@@ -578,6 +580,38 @@ def test_gemma_partial_marker_eof_semantics_remain_structural_outside_presentati
     thought_open_events, thought_open_incomplete = _parse(["plain <|channel"])
     assert thought_open_incomplete is False
     assert _text(thought_open_events) == "plain "
+
+
+def test_gemma_cancelled_whitespace_trace_replay_matches_saved_shape() -> None:
+    fixture_path = Path(__file__).parents[1] / "fixtures" / "gemma_cancelled_whitespace_trace.json"
+    fixture = json.loads(fixture_path.read_text())
+    prefix = fixture["raw_prefix"]
+    whitespace = " " * (
+        fixture["whitespace_token_count"] * fixture["whitespace_chars_per_token"]
+    )
+    raw = prefix + whitespace
+
+    assert fixture["total_token_count"] == len(fixture["prefix_token_ids"]) + fixture[
+        "whitespace_token_count"
+    ]
+    assert len(raw) == fixture["raw_char_count"]
+    assert raw[:22] == "<|tool_call>call:read{"
+    assert raw[22:].isspace()
+
+    events, incomplete = _parse([prefix, whitespace])
+    assert events == []
+    assert incomplete is True
+
+
+def test_gemma_short_json_whitespace_control_completes_tool() -> None:
+    source = '<|tool_call>call:read{    "path":"/tmp/x"}<tool_call|>'
+    events, incomplete = _parse([source])
+
+    assert incomplete is False
+    completed = _completed(events)
+    assert len(completed) == 1
+    assert completed[0].call.name == "read"
+    assert completed[0].call.arguments_json == '{"path":"/tmp/x"}'
 
 
 def test_finish_is_idempotent() -> None:
