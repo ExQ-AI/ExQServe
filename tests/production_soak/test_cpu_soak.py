@@ -213,6 +213,8 @@ def test_cpu_mixed_multiclient_soak_switch_cancel_and_recovery(tmp_path: Path) -
                 calls = [item for item in tool.json()["output"] if item["type"] == "function_call"]
                 assert len(calls) == 1 and calls[0]["name"] == "ping"
 
+                await _wait_for(lambda: composed.controller.in_flight == 0)
+                previous_session_count = len(initial.sessions)
                 slow = asyncio.create_task(
                     client.post(
                         "/v1/responses",
@@ -225,6 +227,7 @@ def test_cpu_mixed_multiclient_soak_switch_cancel_and_recovery(tmp_path: Path) -
                         },
                     )
                 )
+                await _wait_for(lambda: len(initial.sessions) > previous_session_count)
                 await _wait_for(lambda: composed.controller.in_flight == 1)
                 switched = await client.post("/admin/models/switch", json={"model": "second"})
                 assert switched.status_code == 200, switched.text
