@@ -12,6 +12,7 @@ from exqserve.core.items import (
     MessageItem,
     MessageRole,
     MultimodalMessageItem,
+    ReasoningItem,
     TextContentPart,
 )
 from exqserve.core.request import CanonicalRequest
@@ -124,7 +125,13 @@ class GenericHFPromptCompiler(HFTemplatePromptCompiler):
         return True
 
 
-class AlwaysReasoningHFPromptCompiler(GenericHFPromptCompiler):
+class NativeEOSGenericHFPromptCompiler(GenericHFPromptCompiler):
+    """Generic HF template path that terminates on backend-native EOS/EOG tokens."""
+
+    use_native_eos = True
+
+
+class AlwaysReasoningHFPromptCompiler(NativeEOSGenericHFPromptCompiler):
     """Generic HF template path for a model whose saved contract always reasons."""
 
     def prepare(
@@ -135,7 +142,21 @@ class AlwaysReasoningHFPromptCompiler(GenericHFPromptCompiler):
     ) -> TemplateRequest:
         if reasoning.mode is ReasoningMode.DISABLED:
             raise ValueError("this model does not support disabling reasoning")
-        return super().prepare(request, ReasoningPolicy(), tool_policy)
+        projected = CanonicalRequest(
+            request.request_id,
+            request.model,
+            tuple(item for item in request.items if not isinstance(item, ReasoningItem)),
+        )
+        return super().prepare(projected, ReasoningPolicy(), tool_policy)
+
+    def _raw_output_is_text_only(
+        self,
+        template_request: TemplateRequest,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> bool:
+        del template_request, reasoning, tool_policy
+        return False
 
 
 @dataclass(frozen=True, slots=True)

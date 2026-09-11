@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol, Self
 
+from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.events import (
     GenerationCancelled,
     GenerationCompleted,
@@ -15,7 +16,11 @@ from exqserve.core.events import (
     ToolCallCompleted,
 )
 from exqserve.core.items import CanonicalItem, MessageItem, MessageRole, ReasoningItem
-from exqserve.state.store import ResponseRecord, ResponseStore
+from exqserve.state.store import (
+    ResponseRecord,
+    ResponseStore,
+    ResponseStoreDisposition,
+)
 
 
 class StatefulInnerSession(Protocol):
@@ -39,6 +44,7 @@ class StatefulServingSession:
         base_context: tuple[CanonicalItem, ...],
         current_input: tuple[CanonicalItem, ...],
         store_response: bool,
+        parent_response_id: str | None = None,
     ) -> None:
         if not response_id.strip():
             raise ValueError("response_id must not be empty")
@@ -51,7 +57,8 @@ class StatefulServingSession:
         self._store = store
         self._response_id = response_id
         self._model = model
-        self._base_context = base_context
+        del base_context
+        self._parent_response_id = parent_response_id
         self._current_input = current_input
         self._store_response = store_response
         self._outputs: list[CanonicalItem] = []
@@ -79,13 +86,25 @@ class StatefulServingSession:
             self._outputs.append(event.call)
         elif isinstance(event, GenerationCompleted):
             if self._store_response:
-                await self._store.put(
+                disposition = await self._store.put(
                     ResponseRecord(
                         self._response_id,
                         self._model,
-                        (*self._base_context, *self._current_input, *self._outputs),
+                        self._parent_response_id,
+                        (*self._current_input, *self._outputs),
                     )
                 )
+                if disposition is not ResponseStoreDisposition.STORED:
+                    self._terminal = True
+                    return GenerationFailed(
+                        self._response_id,
+                        CanonicalError(
+                            ErrorCategory.INTERNAL,
+                            "response_store_refused",
+                            f"Response state could not be stored ({disposition.value}).",
+                            False,
+                        ),
+                    )
             self._terminal = True
         elif isinstance(event, GenerationFailed | GenerationCancelled):
             self._terminal = True

@@ -19,8 +19,8 @@ from exqserve.core.events import (
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.usage import TokenUsage
 from exqserve.protocol.openai.api import create_openai_app
-from exqserve.protocol.openai.lifecycle import InMemoryResponseLifecycleStore
 from exqserve.serving.contracts import ServingRequest
+from exqserve.state.response_lifecycle import InMemoryResponseLifecycleStore
 
 
 class _Session:

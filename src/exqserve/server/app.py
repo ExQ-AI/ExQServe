@@ -49,7 +49,6 @@ from exqserve.observability.observer import ObservedRawServingEngine, ObservedSe
 from exqserve.plugin_api import ModelDialect
 from exqserve.protocol.anthropic.api import create_anthropic_router
 from exqserve.protocol.openai.api import create_openai_router
-from exqserve.protocol.openai.lifecycle import InMemoryResponseLifecycleStore
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
     RuntimeGenerationRequest,
@@ -84,6 +83,7 @@ from exqserve.serving.contracts import (
 from exqserve.serving.engine import RequestControllerLike, RuntimeTemplateAdapter, ServingEngine
 from exqserve.serving.preprocessing import RendererLane, RendererLanePool, await_task_termination
 from exqserve.serving.raw import RawRequestController, RawServingEngine
+from exqserve.state.response_lifecycle import InMemoryResponseLifecycleStore
 from exqserve.state.store import InMemoryResponseStore
 from exqserve.tool_wire.controls.qwen import qwen_production_tool_constraint
 

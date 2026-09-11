@@ -35,11 +35,6 @@ from exqserve.protocol.openai.completions import (
     CompletionsRequestAdapter,
     CompletionsStreamSerializer,
 )
-from exqserve.protocol.openai.lifecycle import (
-    InMemoryResponseLifecycleStore,
-    ResponseLifecycleNotCancellable,
-    ResponseLifecycleNotFound,
-)
 from exqserve.protocol.openai.models import model_not_found, model_to_wire, require_served_model
 from exqserve.protocol.openai.responses import (
     ResponsesAccumulator,
@@ -56,6 +51,16 @@ from exqserve.serving.contracts import (
     ServingRequest,
     ServingSessionLike,
     TokenCountingServingEngineLike,
+)
+from exqserve.state.response_authority import (
+    ResponseStateAuthority,
+    ResponseStateModelMismatch,
+    ResponseStateNotFound,
+)
+from exqserve.state.response_lifecycle import (
+    InMemoryResponseLifecycleStore,
+    ResponseLifecycleNotCancellable,
+    ResponseLifecycleNotFound,
 )
 from exqserve.state.session import StatefulServingSession
 from exqserve.state.store import InMemoryResponseStore, ResponseStore
@@ -261,35 +266,49 @@ async def _iter_chat_sse(
 async def _iter_responses_sse(
     session: ServingSessionLike,
     serializer: ResponsesStreamSerializer,
-    lifecycle_store: InMemoryResponseLifecycleStore | None = None,
+    state_authority: ResponseStateAuthority | None = None,
     response_id: str | None = None,
 ) -> AsyncIterator[str]:
     terminal = False
     try:
         async for event in session:
+            event_terminal = _is_terminal(event)
             for payload in serializer.feed(event):
                 response = payload.get("response")
                 if (
-                    lifecycle_store is not None
+                    state_authority is not None
                     and response_id is not None
                     and isinstance(response, dict)
                 ):
                     event_type = payload.get("type")
                     if event_type == "response.created":
-                        await lifecycle_store.update_active(response_id, response)
+                        await state_authority.update_active(response_id, response)
                     elif event_type in {
                         "response.completed",
                         "response.incomplete",
                         "response.failed",
                     }:
-                        await lifecycle_store.finish(response_id, response)
+                        committed = await state_authority.finish(response_id, response)
+                        if not committed:
+                            refusal = _response_store_refused_error()
+                            response["status"] = "failed"
+                            response["error"] = refusal.to_error_object(include_param=False)
+                            response["incomplete_details"] = None
+                            payload["type"] = "response.failed"
+                        elif response.get("status") == "cancelled":
+                            payload["type"] = "response.incomplete"
+                if event_terminal:
+                    terminal = True
                 yield responses_sse(payload)
-            terminal = terminal or _is_terminal(event)
+            terminal = terminal or event_terminal
     finally:
-        if not terminal:
+        authority_terminal = False
+        if state_authority is not None and response_id is not None:
+            authority_terminal = await state_authority.is_terminal(response_id)
+        if not terminal and not authority_terminal:
             await session.cancel()
-            if lifecycle_store is not None and response_id is not None:
-                await lifecycle_store.abandon(response_id)
+        if state_authority is not None and response_id is not None:
+            await state_authority.abandon(response_id)
 
 
 def _responses_tool_choice(policy: ToolPolicy) -> object:
@@ -299,31 +318,38 @@ def _responses_tool_choice(policy: ToolPolicy) -> object:
     return choice.mode.value
 
 
+def _response_store_refused_error() -> OpenAIProtocolError:
+    return OpenAIProtocolError(
+        500,
+        "server_error",
+        "response_store_refused",
+        "Response state could not be stored consistently.",
+    )
+
+
 async def _responses_previous_context(
-    state_store: ResponseStore,
+    state_authority: ResponseStateAuthority,
     previous_response_id: str | None,
     model: str,
 ) -> tuple[CanonicalItem, ...]:
-    if previous_response_id is None:
-        return ()
-    previous = await state_store.get(previous_response_id)
-    if previous is None:
+    try:
+        return await state_authority.resolve_previous(previous_response_id, model)
+    except ResponseStateNotFound:
         raise OpenAIProtocolError(
             404,
             "invalid_request_error",
             "response_not_found",
             "The previous response was not found.",
             "previous_response_id",
-        )
-    if previous.model != model:
+        ) from None
+    except ResponseStateModelMismatch:
         raise OpenAIProtocolError(
             400,
             "invalid_request_error",
             "response_model_mismatch",
             "The previous response was created by a different model.",
             "previous_response_id",
-        )
-    return previous.context_items
+        ) from None
 
 
 def create_openai_router(
@@ -354,6 +380,7 @@ def create_openai_router(
         if response_lifecycle_store is not None
         else InMemoryResponseLifecycleStore()
     )
+    state_authority = ResponseStateAuthority(state_store, lifecycle_store)
     router = APIRouter()
 
     if served_model is not None:
@@ -439,7 +466,7 @@ def create_openai_router(
             parsed = responses_codec.parse_count(body, request_id=request_id)
             _require_current_model(parsed.model, served_model)
             previous_context = await _responses_previous_context(
-                state_store,
+                state_authority,
                 parsed.previous_response_id,
                 parsed.model,
             )
@@ -455,7 +482,7 @@ def create_openai_router(
     @router.get("/v1/responses/{response_id}")
     async def response_retrieve(response_id: str) -> JSONResponse:
         request_id = _request_id()
-        response = await lifecycle_store.retrieve(response_id)
+        response = await state_authority.retrieve(response_id)
         if response is None:
             return _error_response(
                 OpenAIProtocolError(
@@ -473,7 +500,7 @@ def create_openai_router(
     async def response_cancel(response_id: str) -> JSONResponse:
         request_id = _request_id()
         try:
-            response = await lifecycle_store.cancel(response_id)
+            response = await state_authority.cancel(response_id)
         except ResponseLifecycleNotFound:
             return _error_response(
                 OpenAIProtocolError(
@@ -507,7 +534,7 @@ def create_openai_router(
             parsed = responses_codec.parse(body, request_id=request_id)
             _require_current_model(parsed.model, served_model)
             previous_context = await _responses_previous_context(
-                state_store,
+                state_authority,
                 parsed.previous_response_id,
                 parsed.model,
             )
@@ -518,12 +545,13 @@ def create_openai_router(
             if parsed.store:
                 session = StatefulServingSession(
                     session,
-                    state_store,
+                    state_authority,
                     response_id=response_id,
                     model=parsed.model,
                     base_context=previous_context,
                     current_input=parsed.state_input_items,
                     store_response=True,
+                    parent_response_id=parsed.previous_response_id,
                 )
             wire_choice = _responses_tool_choice(serving.tools)
             initial_response = build_response_object(
@@ -538,7 +566,7 @@ def create_openai_router(
                 previous_response_id=parsed.previous_response_id,
                 store=parsed.store,
             )
-            await lifecycle_store.register_active(
+            await state_authority.register_active(
                 initial_response,
                 session,
                 retain=parsed.store,
@@ -557,7 +585,7 @@ def create_openai_router(
                     _iter_responses_sse(
                         session,
                         serializer,
-                        lifecycle_store,
+                        state_authority,
                         response_id,
                     ),
                     media_type="text/event-stream",
@@ -578,16 +606,18 @@ def create_openai_router(
             except OpenAIProtocolError:
                 # Non-streaming failures return an HTTP error rather than a Response resource,
                 # so the client never learns response_id. Do not retain unreachable lifecycle state.
-                await lifecycle_store.abandon(response_id)
+                await state_authority.abandon(response_id)
                 raise
             except BaseException:
-                await lifecycle_store.abandon(response_id)
+                await state_authority.abandon(response_id)
                 raise
-            await lifecycle_store.finish(response_id, result)
+            if not await state_authority.finish(response_id, result):
+                raise _response_store_refused_error()
+            await state_authority.abandon(response_id)
             return JSONResponse(result, headers=_request_headers(request_id))
         except OpenAIProtocolError as exc:
             if response_id is not None:
-                await lifecycle_store.abandon(response_id)
+                await state_authority.abandon(response_id)
             return _error_response(exc, request_id)
 
     return router

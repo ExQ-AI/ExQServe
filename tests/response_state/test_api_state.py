@@ -22,6 +22,7 @@ from exqserve.core.items import MessageItem, MessageRole, ToolCallItem, ToolResu
 from exqserve.model.contracts import CompiledPrompt, TemplateRequest
 from exqserve.protocol.openai.api import create_openai_app
 from exqserve.serving.contracts import ServingRequest
+from exqserve.state.response_lifecycle import InMemoryResponseLifecycleStore
 from exqserve.state.store import InMemoryResponseStore
 
 
@@ -206,6 +207,39 @@ def test_evicted_previous_response_fails_before_engine_submit() -> None:
     asyncio.run(scenario())
 
 
+def test_lifecycle_parent_eviction_refuses_child_commit_without_dangling_state() -> None:
+    async def scenario() -> None:
+        state_store = InMemoryResponseStore(max_records=10)
+        lifecycle_store = InMemoryResponseLifecycleStore(max_records=1)
+        engine = _Engine([_text_generation("one"), _text_generation("two")])
+        app = create_openai_app(
+            engine,
+            default_max_output_tokens=8,
+            response_store=state_store,
+            response_lifecycle_store=lifecycle_store,
+        )
+
+        first = await _post(app, {"model": "m", "input": "first"})
+        assert first.status_code == 200
+        first_id = first.json()["id"]
+
+        second = await _post(
+            app,
+            {"model": "m", "input": "second", "previous_response_id": first_id},
+        )
+        assert second.status_code == 500
+        assert second.json()["error"]["code"] == "response_store_refused"
+
+        # Retaining the child would evict its lifecycle parent. The unified authority
+        # refuses that commit and invalidates the canonical subtree instead of leaving
+        # a child that can only partially resolve.
+        assert await state_store.get(first_id) is None
+        assert (await state_store.stats()).records == 0
+        assert (await lifecycle_store.stats()).retained == 0
+
+    asyncio.run(scenario())
+
+
 def test_stream_response_id_is_store_key_and_state_is_available_after_terminal_event() -> None:
     async def scenario() -> None:
         store = InMemoryResponseStore()
@@ -229,7 +263,9 @@ def test_stream_response_id_is_store_key_and_state_is_available_after_terminal_e
         assert terminal["response"]["id"] == response_id
         record = await store.get(response_id)
         assert record is not None
-        assert record.context_items[-1] == MessageItem(MessageRole.ASSISTANT, "streamed")
+        materialized = await store.materialize(response_id)
+        assert materialized is not None
+        assert materialized[-1] == MessageItem(MessageRole.ASSISTANT, "streamed")
 
     asyncio.run(scenario())
 

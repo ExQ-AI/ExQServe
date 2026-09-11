@@ -17,7 +17,7 @@ from exqserve.core.events import (
 from exqserve.core.items import MessageItem, MessageRole, ReasoningItem, ToolCallItem
 from exqserve.model.contracts import CompiledPrompt, TemplateRequest
 from exqserve.state.session import StatefulServingSession
-from exqserve.state.store import InMemoryResponseStore
+from exqserve.state.store import InMemoryResponseStore, ResponseRecord, ResponseStoreDisposition
 
 
 class _Session:
@@ -53,6 +53,10 @@ def test_state_session_persists_completed_outputs_before_terminal_delivery() -> 
         )
         store = InMemoryResponseStore()
         base = (MessageItem(MessageRole.USER, "old"),)
+        assert (
+            await store.put(ResponseRecord("resp_parent", "m", None, base))
+            is ResponseStoreDisposition.STORED
+        )
         current = (MessageItem(MessageRole.USER, "new"),)
         session = StatefulServingSession(
             inner,
@@ -62,6 +66,7 @@ def test_state_session_persists_completed_outputs_before_terminal_delivery() -> 
             base_context=base,
             current_input=current,
             store_response=True,
+            parent_response_id="resp_parent",
         )
 
         seen: list[GenerationEvent] = []
@@ -74,12 +79,16 @@ def test_state_session_persists_completed_outputs_before_terminal_delivery() -> 
         assert seen[-1] is terminal
         record = await store.get("resp_1")
         assert record is not None
-        assert record.context_items == (
-            *base,
+        assert record.parent_response_id == "resp_parent"
+        assert record.delta_items == (
             *current,
             ReasoningItem("think"),
             MessageItem(MessageRole.ASSISTANT, "answer"),
             call,
+        )
+        assert await store.materialize("resp_1") == (
+            *base,
+            *record.delta_items,
         )
 
     asyncio.run(scenario())
@@ -104,6 +113,28 @@ def test_state_session_does_not_store_when_disabled_failed_or_cancelled() -> Non
     error = CanonicalError(ErrorCategory.MODEL_FAILURE, "bad", "Bad.", False)
     asyncio.run(collect([GenerationFailed("r", error)], "failed", True))
     asyncio.run(collect([GenerationCancelled("r")], "cancelled", True))
+
+
+def test_state_session_turns_store_refusal_into_terminal_failure() -> None:
+    async def scenario() -> None:
+        terminal = GenerationCompleted("r", CompletionReason.STOP)
+        store = InMemoryResponseStore(max_total_bytes=64)
+        session = StatefulServingSession(
+            _Session([TextCompleted("r", "x" * 512), terminal]),
+            store,
+            response_id="resp_refused",
+            model="m",
+            base_context=(),
+            current_input=(MessageItem(MessageRole.USER, "request"),),
+            store_response=True,
+        )
+
+        events = [event async for event in session]
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "response_store_refused"
+        assert await store.get("resp_refused") is None
+
+    asyncio.run(scenario())
 
 
 def test_state_session_cancel_delegates_and_does_not_store() -> None:

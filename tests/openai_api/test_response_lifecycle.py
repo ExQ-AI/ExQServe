@@ -14,11 +14,15 @@ from exqserve.core.events import (
     TextDelta,
     TextStarted,
 )
+from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.usage import TokenUsage
 from exqserve.protocol.openai.api import _iter_responses_sse, create_openai_app
-from exqserve.protocol.openai.lifecycle import InMemoryResponseLifecycleStore
 from exqserve.protocol.openai.responses import ResponsesStreamSerializer, build_response_object
 from exqserve.serving.contracts import ServingRequest
+from exqserve.state.response_authority import ResponseStateAuthority, ResponseStateNotFound
+from exqserve.state.response_lifecycle import InMemoryResponseLifecycleStore
+from exqserve.state.session import StatefulServingSession
+from exqserve.state.store import InMemoryResponseStore, ResponseRecord, ResponseStoreDisposition
 
 
 class _Session:
@@ -208,7 +212,8 @@ def test_cancel_endpoint_terminates_an_active_response_stream() -> None:
             response_id=response_id,
             created_at=1,
         )
-        stream = _iter_responses_sse(session, serializer, lifecycle, response_id)
+        authority = ResponseStateAuthority(InMemoryResponseStore(), lifecycle)
+        stream = _iter_responses_sse(session, serializer, authority, response_id)
 
         first = await anext(stream)
         assert "event: response.created" in first
@@ -273,6 +278,33 @@ def test_responses_create_retrieve_store_false_and_terminal_cancel_contract() ->
     asyncio.run(scenario())
 
 
+def test_lifecycle_retention_budget_refusal_is_not_published_as_success() -> None:
+    async def scenario() -> None:
+        lifecycle = InMemoryResponseLifecycleStore(max_total_bytes=1)
+        state = InMemoryResponseStore()
+        app = create_openai_app(
+            _Engine(),
+            default_max_output_tokens=8,
+            response_store=state,
+            response_lifecycle_store=lifecycle,
+        )
+
+        response = await _request(
+            app,
+            "POST",
+            "/v1/responses",
+            json={"model": "m", "input": "hi", "store": True},
+        )
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "response_store_refused"
+        assert (await state.stats()).records == 0
+        stats = await lifecycle.stats()
+        assert stats.active == 0
+        assert stats.retained == 0
+
+    asyncio.run(scenario())
+
+
 def test_cancel_endpoint_cancels_registered_active_response_and_keeps_auth_shape() -> None:
     async def scenario() -> None:
         lifecycle = InMemoryResponseLifecycleStore()
@@ -293,5 +325,221 @@ def test_cancel_endpoint_cancels_registered_active_response_and_keeps_auth_shape
         unknown = await _request(app, "POST", "/v1/responses/resp_missing/cancel")
         assert unknown.status_code == 404
         assert unknown.json()["error"]["code"] == "response_not_found"
+
+    asyncio.run(scenario())
+
+
+def test_response_authority_stages_completion_until_lifecycle_finish() -> None:
+    async def scenario() -> None:
+        response_id = "resp_staged"
+        state = InMemoryResponseStore()
+        lifecycle = InMemoryResponseLifecycleStore()
+        authority = ResponseStateAuthority(state, lifecycle)
+        session = _Session()
+        initial = _initial(response_id)
+        await authority.register_active(initial, session, retain=True)
+        record = ResponseRecord(
+            response_id,
+            "m",
+            None,
+            (
+                MessageItem(MessageRole.USER, "go"),
+                MessageItem(MessageRole.ASSISTANT, "done"),
+            ),
+        )
+
+        assert await authority.put(record) is ResponseStoreDisposition.STORED
+        assert await state.get(response_id) is None
+        try:
+            await authority.resolve_previous(response_id, "m")
+        except ResponseStateNotFound:
+            pass
+        else:  # pragma: no cover - atomicity invariant
+            raise AssertionError("staged completion must not be visible to continuation")
+
+        completed = dict(initial)
+        completed["status"] = "completed"
+        assert await authority.finish(response_id, completed) is True
+        assert await state.get(response_id) == record
+        assert await authority.resolve_previous(response_id, "m") == record.delta_items
+
+    asyncio.run(scenario())
+
+
+def test_response_authority_cancel_winner_cannot_split_terminal_identity() -> None:
+    async def scenario() -> None:
+        for store in (True, False):
+            for terminal_status in ("completed", "incomplete", "failed"):
+                response_id = f"resp_cancel_wins_{store}_{terminal_status}"
+                state = InMemoryResponseStore()
+                lifecycle = InMemoryResponseLifecycleStore()
+                authority = ResponseStateAuthority(state, lifecycle)
+                session = _Session()
+                initial = _initial(response_id, store=store)
+                await authority.register_active(initial, session, retain=store)
+                if store and terminal_status in {"completed", "incomplete"}:
+                    assert await authority.put(
+                        ResponseRecord(
+                            response_id,
+                            "m",
+                            None,
+                            (MessageItem(MessageRole.ASSISTANT, "done"),),
+                        )
+                    ) is ResponseStoreDisposition.STORED
+
+                cancelled = await authority.cancel(response_id)
+                assert cancelled["status"] == "cancelled"
+                terminal = dict(initial)
+                terminal["status"] = terminal_status
+                assert await authority.finish(response_id, terminal) is True
+
+                assert terminal["status"] == "cancelled"
+                assert await state.get(response_id) is None
+                retained = await authority.retrieve(response_id)
+                if store:
+                    assert retained is not None
+                    assert retained["status"] == "cancelled"
+                else:
+                    assert retained is None
+                assert await authority.is_terminal(response_id) is True
+
+                await authority.abandon(response_id)
+                assert await authority.is_terminal(response_id) is False
+                assert not authority._pending_records
+                assert not authority._terminal_winners
+                assert not authority._transitions
+
+    asyncio.run(scenario())
+
+
+def test_response_authority_finish_winner_cannot_be_replaced_by_cancel() -> None:
+    async def scenario() -> None:
+        for store in (True, False):
+            for terminal_status in ("completed", "incomplete", "failed"):
+                response_id = f"resp_finish_wins_{store}_{terminal_status}"
+                state = InMemoryResponseStore()
+                lifecycle = InMemoryResponseLifecycleStore()
+                authority = ResponseStateAuthority(state, lifecycle)
+                session = _Session()
+                initial = _initial(response_id, store=store)
+                await authority.register_active(initial, session, retain=store)
+                if store and terminal_status in {"completed", "incomplete"}:
+                    assert await authority.put(
+                        ResponseRecord(
+                            response_id,
+                            "m",
+                            None,
+                            (MessageItem(MessageRole.ASSISTANT, "done"),),
+                        )
+                    ) is ResponseStoreDisposition.STORED
+
+                terminal = dict(initial)
+                terminal["status"] = terminal_status
+                assert await authority.finish(response_id, terminal) is True
+                winner = await authority.cancel(response_id)
+
+                assert winner["status"] == terminal_status
+                assert terminal["status"] == terminal_status
+                assert session.cancel_calls == 0
+                retained = await authority.retrieve(response_id)
+                if store:
+                    assert retained is not None
+                    assert retained["status"] == terminal_status
+                else:
+                    assert retained is None
+
+                await authority.abandon(response_id)
+                if store:
+                    retained = await authority.retrieve(response_id)
+                    assert retained is not None
+                    assert retained["status"] == terminal_status
+                assert not authority._pending_records
+                assert not authority._terminal_winners
+                assert not authority._transitions
+
+    asyncio.run(scenario())
+
+
+def test_responses_cancel_then_immediate_close_preserves_terminal_identity() -> None:
+    async def scenario() -> None:
+        response_id = "resp_cancel_then_close"
+        state = InMemoryResponseStore()
+        lifecycle = InMemoryResponseLifecycleStore()
+        authority = ResponseStateAuthority(state, lifecycle)
+        session = _BlockingSession("req-cancel-then-close")
+        initial = _initial(response_id)
+        await authority.register_active(initial, session, retain=True)
+        stream = _iter_responses_sse(
+            session,
+            ResponsesStreamSerializer("m", response_id=response_id, created_at=1, store=True),
+            authority,
+            response_id,
+        )
+
+        assert "event: response.created" in await anext(stream)
+        cancelled = await authority.cancel(response_id)
+        assert cancelled["status"] == "cancelled"
+        assert session.cancel_calls == 1
+        retained = await authority.retrieve(response_id)
+        assert retained is not None
+        assert retained["status"] == "cancelled"
+
+        await stream.aclose()
+
+        retained = await authority.retrieve(response_id)
+        assert retained is not None
+        assert retained["status"] == "cancelled"
+        assert session.cancel_calls == 1
+        assert not authority._pending_records
+        assert not authority._terminal_winners
+        assert not authority._transitions
+
+    asyncio.run(scenario())
+
+
+def test_responses_terminal_close_does_not_abandon_committed_state() -> None:
+    async def scenario() -> None:
+        response_id = "resp_terminal_close"
+        state = InMemoryResponseStore()
+        lifecycle = InMemoryResponseLifecycleStore()
+        authority = ResponseStateAuthority(state, lifecycle)
+        inner = _Session(
+            [
+                GenerationStarted("req-terminal-close"),
+                TextStarted("req-terminal-close"),
+                TextDelta("req-terminal-close", "done"),
+                TextCompleted("req-terminal-close", "done"),
+                GenerationCompleted("req-terminal-close", CompletionReason.STOP),
+            ]
+        )
+        session = StatefulServingSession(
+            inner,
+            authority,
+            response_id=response_id,
+            model="m",
+            base_context=(),
+            current_input=(MessageItem(MessageRole.USER, "go"),),
+            store_response=True,
+        )
+        initial = _initial(response_id)
+        await authority.register_active(initial, session, retain=True)
+        stream = _iter_responses_sse(
+            session,
+            ResponsesStreamSerializer("m", response_id=response_id, created_at=1, store=True),
+            authority,
+            response_id,
+        )
+
+        while True:
+            chunk = await anext(stream)
+            if "event: response.completed" in chunk:
+                break
+        await stream.aclose()
+
+        retained = await authority.retrieve(response_id)
+        assert retained is not None
+        assert retained["status"] == "completed"
+        assert await state.materialize(response_id) is not None
+        assert inner.cancel_calls == 0
 
     asyncio.run(scenario())

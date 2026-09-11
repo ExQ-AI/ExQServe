@@ -778,7 +778,7 @@ def test_buffered_recovery_discards_failed_attempt_from_response_state() -> None
         record = await store.get("resp_recovered")
 
         assert record is not None
-        assert record.context_items == (
+        assert await store.materialize("resp_recovered") == (
             MessageItem(MessageRole.USER, "question"),
             MessageItem(MessageRole.ASSISTANT, "kept"),
         )

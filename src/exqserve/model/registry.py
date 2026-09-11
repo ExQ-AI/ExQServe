@@ -39,6 +39,7 @@ from exqserve.model.generic_hf import (
     AlwaysReasoningHFPromptCompiler,
     GenericHFIncrementalParser,
     GenericHFPromptCompiler,
+    NativeEOSGenericHFPromptCompiler,
 )
 from exqserve.model.glm5 import (
     GLM5_CAPABILITIES,
@@ -59,6 +60,7 @@ from exqserve.model.qwen import (
     QwenIncrementalParser,
     QwenPromptCompiler,
 )
+from exqserve.model.step3p5 import Step3p5IncrementalParser
 
 _QWEN_COMPATIBILITY_DECODER_FACTORY: (
     Callable[[ToolPolicy | None], ToolRegionDecoderLike] | None
@@ -266,8 +268,11 @@ class Glm5NextDialect:
         normalized = architecture.replace(".", "_").lower()
         return normalized == "glm5nextforconditionalgeneration"
 
-    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> GenericHFPromptCompiler:
-        return GenericHFPromptCompiler(template_adapter)
+    def create_compiler(
+        self,
+        template_adapter: ChatTemplateAdapter,
+    ) -> NativeEOSGenericHFPromptCompiler:
+        return NativeEOSGenericHFPromptCompiler(template_adapter)
 
     def create_parser(
         self,
@@ -399,6 +404,12 @@ class Qwen4ExpDialect(GenericHFDialect):
         normalized = architecture.replace(".", "_").lower()
         return normalized == "qwen4expforconditionalgeneration"
 
+    def create_compiler(
+        self,
+        template_adapter: ChatTemplateAdapter,
+    ) -> NativeEOSGenericHFPromptCompiler:
+        return NativeEOSGenericHFPromptCompiler(template_adapter)
+
 
 _STEP35_CAPABILITIES = ModelCapabilities(
     reasoning=True,
@@ -441,11 +452,11 @@ class Step3p5Dialect:
         request_id: str,
         reasoning: ReasoningPolicy,
         tool_policy: ToolPolicy,
-    ) -> Glm5IncrementalParser:
+    ) -> Step3p5IncrementalParser:
         del tool_policy
         if reasoning.mode is ReasoningMode.DISABLED:
             raise ValueError("Step 3.5 does not support disabling reasoning")
-        return Glm5IncrementalParser(request_id, start_in_reasoning=True)
+        return Step3p5IncrementalParser(request_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +470,12 @@ class Step3p7Dialect(GenericHFDialect):
         if architecture is None:
             return False
         return architecture.replace(".", "_").lower() == "step3p7forconditionalgeneration"
+
+    def create_compiler(
+        self,
+        template_adapter: ChatTemplateAdapter,
+    ) -> NativeEOSGenericHFPromptCompiler:
+        return NativeEOSGenericHFPromptCompiler(template_adapter)
 
 
 def discover_model_dialect_plugins(

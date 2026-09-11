@@ -5,7 +5,9 @@ from typing import get_type_hints
 from exqserve.agent.reasoning import ReasoningMode, ReasoningPolicy
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
-from exqserve.core.events import ToolCallCompleted
+from exqserve.core.events import ReasoningCompleted, TextCompleted, ToolCallCompleted
+from exqserve.core.items import MessageItem, MessageRole, ReasoningItem
+from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import (
     IncrementalParserLike,
     PromptCompilerLike,
@@ -97,10 +99,61 @@ def test_default_registry_selects_step35_reasoning_only_architecture() -> None:
     assert dialect.capabilities.reasoning is True
     assert dialect.capabilities.tool_calling is False
     assert dialect.capabilities.vision is False
-    assert isinstance(dialect.create_compiler(_Adapter()), AlwaysReasoningHFPromptCompiler)
+    compiler = dialect.create_compiler(_Adapter())
+    assert isinstance(compiler, AlwaysReasoningHFPromptCompiler)
+    assert compiler.use_native_eos is True
     parser = dialect.create_parser("req-step35", ReasoningPolicy(), _TOOL_POLICY)
     events = [*parser.feed("<think>plan</think>answer"), *parser.finish().events]
     assert not any(isinstance(event, ToolCallCompleted) for event in events)
+
+
+def test_step35_reasoning_seam_trims_only_adjacent_newlines() -> None:
+    dialect = Step3p5Dialect()
+    parser = dialect.create_parser("req-step35-trim", ReasoningPolicy(), _TOOL_POLICY)
+    events = []
+    for chunk in ("plan\n", "</think>", "\nanswer"):
+        events.extend(parser.feed(chunk))
+    events.extend(parser.finish().events)
+
+    reasoning = [event.text for event in events if isinstance(event, ReasoningCompleted)]
+    text = [event.text for event in events if isinstance(event, TextCompleted)]
+    assert reasoning == ["plan"]
+    assert text == ["answer"]
+
+
+def test_step35_history_projection_keeps_canonical_reasoning_out_of_template_history() -> None:
+    compiler = Step3p5Dialect().create_compiler(_Adapter())
+    request = CanonicalRequest(
+        "req-step35-history",
+        "m",
+        (
+            MessageItem(MessageRole.USER, "first"),
+            ReasoningItem("private reasoning"),
+            MessageItem(MessageRole.ASSISTANT, "answer"),
+            MessageItem(MessageRole.USER, "next"),
+        ),
+    )
+
+    prepared = compiler.prepare(request, ReasoningPolicy(), _TOOL_POLICY)
+
+    assert [(message.role, message.content) for message in prepared.messages] == [
+        ("user", "first"),
+        ("assistant", "answer"),
+        ("user", "next"),
+    ]
+    assert compiler._raw_output_is_text_only(prepared, ReasoningPolicy(), _TOOL_POLICY) is False
+
+
+def test_new_model_dialects_use_runtime_native_eos() -> None:
+    registry = default_model_dialect_registry(entry_points=())
+    for architecture in (
+        "Qwen4ExpForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
+        "Step3p5ForCausalLM",
+        "Step3p7ForConditionalGeneration",
+    ):
+        compiler = registry.resolve(architecture).create_compiler(_Adapter())
+        assert compiler.use_native_eos is True, architecture
 
 
 def test_default_registry_selects_conservative_step37_architecture() -> None:

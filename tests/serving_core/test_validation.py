@@ -2437,7 +2437,7 @@ def test_validation_only_tool_completion_holds_trailing_text_until_commit_and_st
 
         record = await store.get("resp_tool_then_text")
         assert record is not None
-        assert record.context_items == (
+        assert await store.materialize("resp_tool_then_text") == (
             MessageItem(MessageRole.USER, "go"),
             call,
             MessageItem(MessageRole.ASSISTANT, " trailing text"),

@@ -25,6 +25,7 @@ from exqserve.core.usage import TokenUsage
 from exqserve.protocol.openai.api import _iter_chat_sse, create_openai_app
 from exqserve.protocol.openai.chat import ChatStreamSerializer
 from exqserve.serving.contracts import ServingRejected, ServingRequest
+from exqserve.state.response_lifecycle import InMemoryResponseLifecycleStore
 from exqserve.state.store import InMemoryResponseStore, ResponseRecord
 
 
@@ -201,6 +202,7 @@ def test_responses_input_tokens_reuses_previous_response_context_and_errors() ->
             ResponseRecord(
                 "resp-parent",
                 "qwen",
+                None,
                 (
                     MessageItem(MessageRole.USER, "old question"),
                     MessageItem(MessageRole.ASSISTANT, "old answer"),
@@ -211,13 +213,27 @@ def test_responses_input_tokens_reuses_previous_response_context_and_errors() ->
             ResponseRecord(
                 "resp-other",
                 "other-model",
+                None,
                 (MessageItem(MessageRole.USER, "other history"),),
             )
         )
+        lifecycle = InMemoryResponseLifecycleStore()
+        for response_id, model in (("resp-parent", "qwen"), ("resp-other", "other-model")):
+            session = _Session([])
+            await lifecycle.register_active(
+                {"id": response_id, "model": model, "status": "in_progress", "store": True},
+                session,
+                retain=True,
+            )
+            await lifecycle.finish(
+                response_id,
+                {"id": response_id, "model": model, "status": "completed", "store": True},
+            )
         app = create_openai_app(
             engine,
             default_max_output_tokens=8,
             response_store=store,
+            response_lifecycle_store=lifecycle,
         )
 
         counted = await _request(
