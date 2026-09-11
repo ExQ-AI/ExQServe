@@ -197,7 +197,11 @@ class RawServingEngine:
                 request.sampling,
             )
             try:
-                controlled = await lease.submit(runtime_request)
+                submit_final = getattr(lease, "submit_final", None)
+                if callable(submit_final):
+                    controlled = await submit_final(runtime_request)
+                else:
+                    controlled = await lease.submit(runtime_request)
             except RequestRejected as exc:
                 raise ServingRejected(exc.error) from exc
             except Exception as exc:

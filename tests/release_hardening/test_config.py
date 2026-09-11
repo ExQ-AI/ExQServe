@@ -18,6 +18,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.max_batch_size == 8
     assert config.max_chunk_size == 2048
     assert config.max_in_flight == 8
+    assert config.max_inference_recovery_attempts == 0
     assert config.default_api_output_tokens is None
     assert config.response_store_max_records == 1024
     assert config.response_store_ttl_seconds == 3600.0
@@ -91,6 +92,14 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert tool_serving.constraint_mode is ToolConstraintMode.OFF
     assert tool_serving.fanout_limit == 32
     assert tool_serving.constrained_parallel_limit == 8
+
+
+def test_server_config_recovery_attempt_budget_is_bounded(tmp_path: Path) -> None:
+    assert ServerConfig(tmp_path, max_inference_recovery_attempts=1).max_inference_recovery_attempts == 1
+    with pytest.raises(ValueError, match="max_inference_recovery_attempts"):
+        ServerConfig(tmp_path, max_inference_recovery_attempts=2)
+    with pytest.raises(TypeError, match="max_inference_recovery_attempts"):
+        ServerConfig(tmp_path, max_inference_recovery_attempts=True)  # type: ignore[arg-type]
 
 
 def test_server_config_snapshots_custom_chat_template_at_startup(tmp_path: Path) -> None:

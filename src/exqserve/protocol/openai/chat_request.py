@@ -30,7 +30,7 @@ from exqserve.protocol.openai.common import (
     parse_sampling,
     parse_stop,
 )
-from exqserve.serving.contracts import ServingRequest
+from exqserve.serving.contracts import ServingRequest, ServingVisibilityMode
 
 
 def _as_dict(value: object, *, code: str, param: str) -> dict[str, object]:
@@ -434,5 +434,10 @@ class ChatRequestAdapter:
             sampling,
             parse_stop(body.get("stop")),
             reasoning_budget=reasoning_budget,
+            visibility_mode=(
+                ServingVisibilityMode.STREAMING
+                if stream
+                else ServingVisibilityMode.BUFFERED
+            ),
         )
         return ParsedOpenAIRequest(serving, model, stream, OpenAIProtocol.CHAT, include_usage)

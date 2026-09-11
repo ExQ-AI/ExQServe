@@ -81,6 +81,8 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
             "36000",
             "--timeout-seconds",
             "120",
+            "--max-inference-recovery-attempts",
+            "1",
             "--default-output-tokens",
             "2048",
             "--response-store-max-records",
@@ -123,6 +125,7 @@ def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:
     assert config.max_output_tokens == 4096
     assert config.max_total_tokens == 36000
     assert config.timeout_seconds == 120.0
+    assert config.max_inference_recovery_attempts == 1
     assert config.default_api_output_tokens == 2048
     assert config.response_store_max_records == 64
     assert config.capture_mode is CaptureMode.METADATA

@@ -488,6 +488,7 @@ def _build_model_bundle(
             parser_context_factory=(
                 resolve_qwen_parser_context if type(dialect) is QwenDialect else None
             ),
+            max_extra_attempts=config.max_inference_recovery_attempts,
         )
         raw_engine = RawServingEngine(
             None,

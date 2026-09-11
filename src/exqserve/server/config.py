@@ -30,6 +30,7 @@ class ServerConfig:
     max_output_tokens: int | None = None
     max_total_tokens: int | None = None
     timeout_seconds: float | None = None
+    max_inference_recovery_attempts: int = 0
     default_api_output_tokens: int | None = None
     response_store_max_records: int = 1024
     capture_mode: CaptureMode = CaptureMode.OFF
@@ -138,6 +139,12 @@ class ServerConfig:
         object.__setattr__(self, "model_dialect", normalized_dialect)
         if not isinstance(self.tool_constraint_mode, ToolConstraintMode):
             raise TypeError("tool_constraint_mode must be a ToolConstraintMode")
+        if not isinstance(self.max_inference_recovery_attempts, int) or isinstance(
+            self.max_inference_recovery_attempts, bool
+        ):
+            raise TypeError("max_inference_recovery_attempts must be an integer")
+        if self.max_inference_recovery_attempts not in {0, 1}:
+            raise ValueError("max_inference_recovery_attempts must be 0 or 1")
         if self.reasoning_budget_tokens is not None:
             if not isinstance(self.reasoning_budget_tokens, int) or isinstance(
                 self.reasoning_budget_tokens, bool

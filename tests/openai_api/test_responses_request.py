@@ -18,6 +18,7 @@ from exqserve.core.items import (
 )
 from exqserve.protocol.openai.common import OpenAIProtocol, OpenAIProtocolError
 from exqserve.protocol.openai.responses import ResponsesRequestAdapter
+from exqserve.serving.contracts import ServingVisibilityMode
 
 
 def _full_body() -> dict[str, object]:
@@ -93,6 +94,7 @@ def test_responses_full_agent_request_maps_item_natively_to_serving_semantics() 
     assert parsed.model == "qwen"
     assert parsed.protocol is OpenAIProtocol.RESPONSES
     assert parsed.stream is True
+    assert parsed.serving.visibility_mode is ServingVisibilityMode.STREAMING
     assert parsed.serving.input.items == (
         MessageItem(MessageRole.DEVELOPER, "follow rules"),
         MessageItem(MessageRole.USER, "find file"),
@@ -124,6 +126,7 @@ def test_responses_string_input_and_default_output_limit() -> None:
     assert parsed.serving.input.items == (MessageItem(MessageRole.USER, "hello"),)
     assert parsed.serving.max_output_tokens == 23
     assert parsed.stream is False
+    assert parsed.serving.visibility_mode is ServingVisibilityMode.BUFFERED
 
     automatic = ResponsesRequestAdapter().parse(
         {"model": "m", "input": "hello"},

@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from exqserve.control.request import (
     RequestControlConfig,
     RequestController,
+    RequestRejected,
     RequestTerminalReason,
 )
 from exqserve.core.usage import TokenUsage
@@ -85,6 +86,37 @@ def test_deadline_cancels_backend_without_cancelling_runtime_iterator_task() -> 
         assert raw.cancel_calls == 1
         assert raw.next_was_cancelled is False
         assert session.terminal_reason is RequestTerminalReason.TIMEOUT
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_expired_external_lease_rejects_second_attempt_before_runtime_submit() -> None:
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(
+            runtime,
+            RequestControlConfig(max_in_flight=1, timeout_seconds=0.01),
+        )
+        lease = await controller.acquire("deadline")
+        first = await lease.submit(_request())
+        raw = runtime.sessions[0]
+        raw.release.set()
+        assert isinstance([event async for event in first][-1], RuntimeFinished)
+        assert controller.in_flight == 1
+
+        await asyncio.sleep(0.02)
+        try:
+            await lease.submit(_request())
+        except RequestRejected as exc:
+            assert exc.error.code == "request_timeout"
+            assert exc.attempt_started is False
+        else:
+            raise AssertionError("expired lease submitted a second runtime attempt")
+
+        assert len(runtime.sessions) == 1
+        assert lease.terminal_reason is RequestTerminalReason.TIMEOUT
+        await lease.release()
         assert controller.in_flight == 0
 
     asyncio.run(scenario())

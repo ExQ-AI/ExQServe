@@ -76,6 +76,124 @@ _SEMANTIC_EVENTS = (
 )
 
 
+def _enum_value(value: object, default: str) -> str:
+    candidate = getattr(value, "value", None)
+    return candidate if isinstance(candidate, str) else default
+
+
+def _attempt_record_payloads(diagnostics: object | None) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    records = getattr(diagnostics, "attempt_records", ())
+    if not isinstance(records, tuple):
+        return payloads
+    for record in records:
+        ordinal = getattr(record, "ordinal", None)
+        status_value = _enum_value(getattr(record, "status", None), "unknown")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool):
+            continue
+        error_code = getattr(record, "error_code", None)
+        usage = getattr(record, "usage", None)
+        timing = getattr(record, "timing", None)
+        payloads.append(
+            {
+                "ordinal": ordinal,
+                "status": status_value,
+                "error_code": error_code if isinstance(error_code, str) else None,
+                "failure_cause": _enum_value(getattr(record, "failure_cause", None), "") or None,
+                "discarded": bool(getattr(record, "discarded", False)),
+                "usage": None
+                if not isinstance(usage, TokenUsage)
+                else {
+                    "input_tokens": usage.input_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "output_tokens": usage.output_tokens,
+                },
+                "timing": None
+                if not isinstance(timing, GenerationTiming)
+                else {
+                    "queue_seconds": timing.queue_seconds,
+                    "prefill_seconds": timing.prefill_seconds,
+                    "generation_seconds": timing.generation_seconds,
+                },
+            }
+        )
+    return payloads
+
+
+def _execution_metadata(
+    request: ServingRequest,
+    diagnostics: object | None,
+    *,
+    publication_state: str,
+    error: CanonicalError | None,
+    constraint_guarantee: object | None = None,
+) -> dict[str, object]:
+    sampling = request.sampling
+    attempts_started = getattr(diagnostics, "attempts_started", 1)
+    recovery_attempts = getattr(diagnostics, "recovery_attempts", 0)
+    recovered = getattr(diagnostics, "recovered", False)
+    attempt_ordinal = getattr(diagnostics, "attempt_ordinal", attempts_started)
+    final_attempt = getattr(diagnostics, "final_attempt", attempt_ordinal)
+    skip_reason = getattr(diagnostics, "final_skip_reason", None)
+    diagnostic_guarantee = getattr(diagnostics, "constraint_guarantee", None)
+    if diagnostic_guarantee is not None:
+        constraint_guarantee = diagnostic_guarantee
+    return {
+        "request_id": request.input.request_id,
+        "attempt_count": attempts_started if isinstance(attempts_started, int) else 1,
+        "attempt_ordinal": attempt_ordinal if isinstance(attempt_ordinal, int) else 1,
+        "visibility_mode": request.visibility_mode.value,
+        "publication_state": publication_state,
+        "failure_code": None if error is None else error.code,
+        "failure_cause": None if error is None or error.cause is None else error.cause.value,
+        "constraint_guarantee": _enum_value(constraint_guarantee, "unknown"),
+        "recovery_kind": _enum_value(getattr(diagnostics, "recovery_kind", None), "none"),
+        "recovery_decision": getattr(diagnostics, "recovery_decision", "not_evaluated"),
+        "recovery_skip_reason": _enum_value(skip_reason, "") or None,
+        "runtime_state": getattr(diagnostics, "runtime_state", "unknown"),
+        "final_attempt": final_attempt if isinstance(final_attempt, int) else 1,
+        "seed": request.seed,
+        "temperature": None if sampling is None else sampling.temperature,
+        "recovery_attempts": recovery_attempts if isinstance(recovery_attempts, int) else 0,
+        "recovered": recovered if isinstance(recovered, bool) else False,
+        "attempts": _attempt_record_payloads(diagnostics),
+    }
+
+
+def _observe_recovery_metrics(
+    metrics: MetricsRegistry,
+    diagnostics: object | None,
+    error: CanonicalError | None,
+    *,
+    surface: str,
+    status: str,
+) -> None:
+    if diagnostics is not None:
+        recovery_attempts = getattr(diagnostics, "recovery_attempts", 0)
+        recovered = getattr(diagnostics, "recovered", False)
+        kind = _enum_value(getattr(diagnostics, "recovery_kind", None), "none")
+        records = getattr(diagnostics, "attempt_records", ())
+        original_cause = "unknown"
+        if isinstance(records, tuple):
+            for record in records:
+                if bool(getattr(record, "discarded", False)):
+                    original_cause = _enum_value(
+                        getattr(record, "failure_cause", None), "unknown"
+                    )
+                    break
+        if isinstance(recovery_attempts, int) and recovery_attempts > 0:
+            metrics.recovery_attempt(kind, original_cause)
+            if recovered is True:
+                metrics.recovery_success(kind, original_cause)
+        skip = _enum_value(getattr(diagnostics, "final_skip_reason", None), "")
+        if skip:
+            metrics.recovery_skipped(skip)
+            if skip == "attempt_budget_exhausted":
+                metrics.recovery_exhausted(kind, original_cause)
+    if status == "failed" and error is not None and error.cause is None:
+        metrics.unclassified_terminal(surface)
+
+
 class ObservedServingEngine:
     def __init__(
         self,
@@ -98,12 +216,26 @@ class ObservedServingEngine:
         try:
             session = await self._engine.submit(request)
         except ServingRejected as exc:
+            diagnostics = exc.execution_diagnostics
+            _observe_recovery_metrics(
+                self._metrics,
+                diagnostics,
+                exc.error,
+                surface="submission",
+                status="rejected",
+            )
             self._metrics.request_rejected()
-            await self._capture_unaccepted(request.input, started_at, "rejected", exc.error)
+            await self._capture_unaccepted(
+                request,
+                started_at,
+                "rejected",
+                exc.error,
+                diagnostics,
+            )
             raise
         except Exception:
             self._metrics.request_failed_before_start()
-            await self._capture_unaccepted(request.input, started_at, "failed", None)
+            await self._capture_unaccepted(request, started_at, "failed", None, None)
             raise
 
         self._metrics.request_started()
@@ -111,6 +243,7 @@ class ObservedServingEngine:
             session,
             self._metrics,
             request=request.input,
+            serving_request=request if isinstance(request, ServingRequest) else None,
             started_at=started_at,
             clock=self._clock,
             capture=self._capture,
@@ -118,16 +251,17 @@ class ObservedServingEngine:
 
     async def _capture_unaccepted(
         self,
-        request: CanonicalRequest,
+        request: ServingRequest,
         started_at: float,
         status: str,
         error: CanonicalError | None,
+        diagnostics: object | None,
     ) -> None:
         if self._capture is None or not self._capture.enabled:
             return
         try:
             await self._capture.record_terminal(
-                request=request,
+                request=request.input,
                 prompt_hash=None,
                 status=status,
                 elapsed_seconds=self._clock() - started_at,
@@ -135,6 +269,12 @@ class ObservedServingEngine:
                 timing=GenerationTiming(),
                 error=error,
                 events=(),
+                execution=_execution_metadata(
+                    request,
+                    diagnostics,
+                    publication_state="unpublished",
+                    error=error,
+                ),
             )
         except Exception:  # noqa: BLE001 - observability must not break serving
             self._metrics.capture_failed()
@@ -172,6 +312,7 @@ class ObservedRawServingEngine:
             session,
             self._metrics,
             request=request.input,
+            serving_request=request if isinstance(request, ServingRequest) else None,
             started_at=started_at,
             clock=self._clock,
             capture=self._capture,
@@ -211,11 +352,15 @@ class ObservedServingSession:
         started_at: float,
         clock: Callable[[], float],
         capture: CaptureManager | None,
+        serving_request: ServingRequest | None = None,
     ) -> None:
+        if serving_request is not None and not isinstance(serving_request, ServingRequest):
+            raise TypeError("serving_request must be ServingRequest or None")
         self._session = session
         self._iterator = session.__aiter__()
         self._metrics = metrics
         self._request = request
+        self._serving_request = serving_request
         self._started_at = started_at
         self._clock = clock
         self._capture = capture
@@ -324,7 +469,28 @@ class ObservedServingSession:
         self._terminal_error = error
         self._elapsed_seconds = self._clock() - self._started_at
         self._metrics.observe_backend(self._timing, self._usage)
+        diagnostics = getattr(self._session, "diagnostics", None)
+        _observe_recovery_metrics(
+            self._metrics,
+            diagnostics,
+            error,
+            surface="serving",
+            status=status,
+        )
         self._metrics.request_finished(status, self._elapsed_seconds)
+
+    def _execution_capture(self) -> dict[str, object] | None:
+        serving = self._serving_request
+        if serving is None:
+            return None
+        diagnostics = getattr(self._session, "diagnostics", None)
+        return _execution_metadata(
+            serving,
+            diagnostics,
+            publication_state="published" if self._first_semantic_seen else "unpublished",
+            error=self._terminal_error,
+            constraint_guarantee=getattr(self._session, "constraint_guarantee", None),
+        )
 
     async def _write_capture(self) -> None:
         if self._capture_written:
@@ -349,6 +515,7 @@ class ObservedServingSession:
                 error=self._terminal_error,
                 events=events,
                 runtime_trace=runtime_trace,
+                execution=self._execution_capture(),
             )
         except Exception:  # noqa: BLE001 - capture failure must not break serving
             self._metrics.capture_failed()

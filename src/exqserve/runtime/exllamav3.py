@@ -43,6 +43,7 @@ from exqserve.runtime.contracts import (
     RuntimeGenerationRequest,
     RuntimeInjectionUnavailable,
     RuntimeModelMetadata,
+    RuntimeReadinessResult,
     RuntimeRenderedPrompt,
     RuntimeSamplingConfig,
     RuntimeStarted,
@@ -1757,6 +1758,9 @@ class ExLlamaV3Runtime:
         vision=True,
         generation_constraints=True,
         structural_token_provenance=True,
+        fresh_attempt_replay=True,
+        recovery_readiness=True,
+        prompt_attachment_replay=False,
     )
 
     def __init__(self) -> None:
@@ -2139,6 +2143,28 @@ class ExLlamaV3Runtime:
         finally:
             if self._recovery_task is current_task:
                 self._recovery_task = None
+
+    async def wait_until_ready(self, deadline: float | None) -> RuntimeReadinessResult:
+        """Wait on the existing recovery task without starting a second recovery path."""
+        while True:
+            if self._closing or self._resources is None:
+                return RuntimeReadinessResult.CLOSED
+            if self._generator_state is _GeneratorLifecycleState.READY:
+                return RuntimeReadinessResult.READY
+            if self._generator_state is _GeneratorLifecycleState.FAILED:
+                return RuntimeReadinessResult.FAILED
+            task = self._recovery_task
+            if task is None:
+                return RuntimeReadinessResult.FAILED
+            if deadline is None:
+                return RuntimeReadinessResult.FAILED
+            remaining = float(deadline) - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return RuntimeReadinessResult.DEADLINE
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except TimeoutError:
+                return RuntimeReadinessResult.DEADLINE
 
     def _ensure_generator(self) -> Any:
         if self._generator is not None:

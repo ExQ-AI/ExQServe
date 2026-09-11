@@ -75,6 +75,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "max_output_tokens": None,
     "max_total_tokens": None,
     "timeout_seconds": None,
+    "max_inference_recovery_attempts": 0,
     "default_output_tokens": None,
     "reasoning_budget_tokens": None,
     "reasoning_budget_message": "",
@@ -372,6 +373,12 @@ def _build_parser(
     parser.add_argument("--max-output-tokens", type=int)
     parser.add_argument("--max-total-tokens", type=int)
     parser.add_argument("--timeout-seconds", type=float)
+    parser.add_argument(
+        "--max-inference-recovery-attempts",
+        type=int,
+        choices=(0, 1),
+        help="Allow one bounded internal inference recovery attempt; 0 disables Recovery V4.",
+    )
     parser.add_argument("--default-output-tokens", type=_default_output_tokens)
     parser.add_argument(
         "--reasoning-budget-tokens",
@@ -658,6 +665,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         capture_mode=CaptureMode(args.capture_mode),
         capture_path=args.capture_path,
         served_model_id=args.served_model_id,
+        max_inference_recovery_attempts=args.max_inference_recovery_attempts,
         mtp_enabled=args.mtp,
         mtp_draft_tokens=args.mtp_draft_tokens,
         mtp_cache_bits=mtp_bits,

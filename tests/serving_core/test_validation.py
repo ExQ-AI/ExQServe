@@ -473,7 +473,7 @@ def test_completed_model_tool_validation_allowlist_gets_recovery_cause_without_c
 
 
 @pytest.mark.parametrize("arguments_json", ('{"id":', '{"id":1,"id":2}', '[]'))
-def test_pre_activation_format_constraint_does_not_claim_constraint_integrity(
+def test_pre_activation_format_constraint_fails_closed_for_recovery(
     arguments_json: str,
 ) -> None:
     async def scenario() -> None:
@@ -482,7 +482,7 @@ def test_pre_activation_format_constraint_does_not_claim_constraint_integrity(
             constraint=_constraint(("lookup", ToolConstraintGuarantee.FORMAT)),
         )
         assert error.code == "tool_call_invalid"
-        assert error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
+        assert error.cause is None
 
     asyncio.run(scenario())
 
@@ -498,13 +498,13 @@ def test_format_constraint_allows_schema_failure_model_output_recovery() -> None
     asyncio.run(scenario())
 
 
-def test_pre_activation_schema_constraint_does_not_claim_constraint_integrity() -> None:
+def test_pre_activation_schema_constraint_fails_closed_for_recovery() -> None:
     async def scenario() -> None:
         error = await _completed_call_failure(
             '{"id":"bad"}',
             constraint=_constraint(("lookup", ToolConstraintGuarantee.SCHEMA)),
         )
-        assert error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
+        assert error.cause is None
 
     asyncio.run(scenario())
 
@@ -515,7 +515,7 @@ def test_unknown_legacy_constraint_metadata_fails_closed_for_model_output_recove
             '{"id":"bad"}',
             constraint=ToolGenerationConstraint("<tool>", 'start: "ok"', True),
         )
-        assert error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
+        assert error.cause is None
 
     asyncio.run(scenario())
 
@@ -546,7 +546,7 @@ def test_actual_completed_branch_controls_mixed_constraint_recovery() -> None:
             policy=policy,
         )
         assert loose_error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
-        assert strict_error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
+        assert strict_error.cause is None
 
     asyncio.run(scenario())
 
@@ -2323,7 +2323,7 @@ def test_b1_pre_activation_tool_schema_failure_has_semantic_owner() -> None:
         events = [event async for event in session]
 
         assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
+        assert events[-1].error.cause is None
         assert session.terminal_decision is not None
         assert session.terminal_decision.primary_owner is TerminalPrimaryOwner.SEMANTIC_CONTRACT
 

@@ -47,6 +47,13 @@ def _validate_finite(name: str, value: float) -> None:
         raise ValueError(f"{name} must be finite")
 
 
+class RuntimeReadinessResult(str, Enum):
+    READY = "ready"
+    FAILED = "failed"
+    DEADLINE = "deadline"
+    CLOSED = "closed"
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeCapabilities:
     cancellation: bool
@@ -58,6 +65,9 @@ class RuntimeCapabilities:
     vision: bool = False
     generation_constraints: bool = False
     structural_token_provenance: bool = False
+    fresh_attempt_replay: bool = False
+    recovery_readiness: bool = False
+    prompt_attachment_replay: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -70,6 +80,9 @@ class RuntimeCapabilities:
             "vision",
             "generation_constraints",
             "structural_token_provenance",
+            "fresh_attempt_replay",
+            "recovery_readiness",
+            "prompt_attachment_replay",
         ):
             _validate_bool(name, getattr(self, name))
 

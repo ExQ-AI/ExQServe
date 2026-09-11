@@ -108,6 +108,7 @@ class CaptureManager:
         error: CanonicalError | None,
         events: tuple[GenerationEvent, ...],
         runtime_trace: tuple[dict[str, object], ...] = (),
+        execution: dict[str, object] | None = None,
     ) -> None:
         if self.mode is CaptureMode.OFF:
             return
@@ -129,6 +130,10 @@ class CaptureManager:
             "timing": _encode_timing(timing),
             "error": _encode_error_metadata(error),
         }
+        if execution is not None:
+            if not isinstance(execution, dict):
+                raise TypeError("execution must be a dictionary or None")
+            record["execution"] = dict(execution)
         if self.mode is CaptureMode.FULL:
             record["request"] = _encode_request(request)
             record["events"] = [_encode_event(event) for event in events]

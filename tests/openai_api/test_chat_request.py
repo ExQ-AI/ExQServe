@@ -17,6 +17,7 @@ from exqserve.core.items import (
 )
 from exqserve.protocol.openai.chat import ChatRequestAdapter
 from exqserve.protocol.openai.common import OpenAIProtocol, OpenAIProtocolError
+from exqserve.serving.contracts import ServingVisibilityMode
 
 
 def _full_body() -> dict[str, object]:
@@ -96,6 +97,7 @@ def test_chat_full_agent_request_maps_directly_to_serving_semantics() -> None:
     assert parsed.model == "qwen"
     assert parsed.protocol is OpenAIProtocol.CHAT
     assert parsed.stream is True
+    assert parsed.serving.visibility_mode is ServingVisibilityMode.STREAMING
     assert parsed.include_usage is True
     assert parsed.serving.input.items == (
         MessageItem(MessageRole.DEVELOPER, "follow rules"),
@@ -136,6 +138,7 @@ def test_chat_max_tokens_alias_and_default_output_limit() -> None:
         request_id="r2",
     )
     assert defaulted.serving.max_output_tokens == 12
+    assert defaulted.serving.visibility_mode is ServingVisibilityMode.BUFFERED
 
     automatic = ChatRequestAdapter().parse(
         {"model": "m", "messages": [{"role": "user", "content": "hi"}]},

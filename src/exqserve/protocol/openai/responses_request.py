@@ -30,7 +30,7 @@ from exqserve.protocol.openai.common import (
     parse_reasoning_effort,
     parse_sampling,
 )
-from exqserve.serving.contracts import ServingRequest
+from exqserve.serving.contracts import ServingRequest, ServingVisibilityMode
 
 
 def _as_dict(value: object, *, code: str, param: str) -> dict[str, object]:
@@ -543,6 +543,7 @@ class ParsedResponsesRequest:
             self.serving.seed,
             self.serving.sampling,
             reasoning_budget=self.serving.reasoning_budget,
+            visibility_mode=self.serving.visibility_mode,
         )
 
 
@@ -596,6 +597,11 @@ class ResponsesRequestAdapter:
             seed,
             sampling,
             reasoning_budget=reasoning_budget,
+            visibility_mode=(
+                ServingVisibilityMode.STREAMING
+                if stream
+                else ServingVisibilityMode.BUFFERED
+            ),
         )
         return ParsedResponsesRequest(
             serving,

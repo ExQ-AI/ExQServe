@@ -5,7 +5,12 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from exqserve.control.request import RequestControlConfig, RequestController, RequestRejected
+from exqserve.control.request import (
+    RequestControlConfig,
+    RequestController,
+    RequestRejected,
+    RequestTerminalReason,
+)
 from exqserve.core.errors import ErrorCategory
 from exqserve.runtime.contracts import RuntimeEvent, RuntimeGenerationRequest
 
@@ -123,21 +128,33 @@ def test_capacity_full_rejects_immediately_without_second_runtime_submit() -> No
     asyncio.run(scenario())
 
 
-def test_submitted_lease_cannot_be_released_by_preprocessing_owner() -> None:
+def test_explicit_lease_spans_two_attempts_and_releases_capacity_once() -> None:
     async def scenario() -> None:
         runtime = _FakeRuntime()
-        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        controller = RequestController(
+            runtime,
+            RequestControlConfig(max_in_flight=1, timeout_seconds=30),
+        )
         request = _request()
         lease = await controller.acquire(request.request_id)
-        session = await lease.submit(request)
+        assert lease.deadline is None
+
+        first = await lease.submit(request)
+        first_deadline = lease.deadline
+        assert first_deadline is not None
+        assert [event async for event in first] == []
+        assert controller.in_flight == 1
+        assert lease.is_active is True
+
+        second = await lease.submit(request)
+        assert lease.deadline == first_deadline
+        assert [event async for event in second] == []
+        assert controller.in_flight == 1
+        assert len(runtime.requests) == 2
 
         await lease.release()
-        assert controller.in_flight == 1
-        assert runtime.sessions[0].cancel_calls == 0
-
-        await session.cancel()
         assert controller.in_flight == 0
-        assert runtime.sessions[0].cancel_calls == 1
+        assert lease.is_active is False
 
     asyncio.run(scenario())
 
@@ -180,5 +197,35 @@ def test_runtime_submit_failure_releases_reserved_capacity() -> None:
         await controller.submit(_request(prompt=2))
         assert controller.in_flight == 1
         assert len(runtime.requests) == 2
+
+    asyncio.run(scenario())
+
+
+def test_close_blocks_late_submit_but_waits_for_preprocessing_lease_owner() -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime()
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        request = _request()
+        lease = await controller.acquire(request.request_id)
+        assert controller.in_flight == 1
+
+        closing = asyncio.create_task(controller.close())
+        await asyncio.sleep(0)
+        terminal_reason = await asyncio.wait_for(lease.wait_until_terminated(), timeout=0.2)
+        assert terminal_reason is RequestTerminalReason.SERVER_SHUTDOWN
+        assert closing.done() is False
+        assert controller.in_flight == 1
+        assert lease.is_active is True
+        assert lease.terminal_reason is RequestTerminalReason.SERVER_SHUTDOWN
+
+        with pytest.raises(RequestRejected) as exc_info:
+            await lease.submit(request)
+        assert exc_info.value.error.code == "server_shutting_down"
+        assert runtime.requests == []
+
+        await lease.release()
+        await asyncio.wait_for(closing, timeout=0.2)
+        assert controller.in_flight == 0
+        assert lease.is_active is False
 
     asyncio.run(scenario())

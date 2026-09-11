@@ -343,14 +343,23 @@ class ParserAmbiguityDetail(str, Enum):
     HOLD_LIMIT = "hold_limit"
 
 
+class ParserConstraintScope(str, Enum):
+    UNKNOWN = "unknown"
+    OUTSIDE_TOOL = "outside_tool"
+    TOOL = "tool"
+
+
 @dataclass(frozen=True, slots=True)
 class ParserTerminalIssue:
     kind: ParserTerminalIssueKind
     ambiguity_detail: ParserAmbiguityDetail | None = None
+    constraint_scope: ParserConstraintScope = ParserConstraintScope.UNKNOWN
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ParserTerminalIssueKind):
             raise TypeError("kind must be a ParserTerminalIssueKind")
+        if not isinstance(self.constraint_scope, ParserConstraintScope):
+            raise TypeError("constraint_scope must be a ParserConstraintScope")
         if self.kind is ParserTerminalIssueKind.INCOMPLETE_TOOL:
             if self.ambiguity_detail is not None:
                 raise ValueError("incomplete_tool must not have ambiguity_detail")

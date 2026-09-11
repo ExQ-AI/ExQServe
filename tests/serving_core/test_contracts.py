@@ -9,7 +9,12 @@ from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.core.items import MessageItem, MessageRole
 from exqserve.core.request import CanonicalRequest
-from exqserve.serving.contracts import MidSystemPolicy, ServingRejected, ServingRequest
+from exqserve.serving.contracts import (
+    MidSystemPolicy,
+    ServingRejected,
+    ServingRequest,
+    ServingVisibilityMode,
+)
 
 
 def _input() -> CanonicalRequest:
@@ -24,7 +29,7 @@ def _tools() -> ToolPolicy:
     return ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
 
 
-def test_serving_request_is_immutable_and_contains_no_wire_stream_field() -> None:
+def test_serving_request_is_immutable_and_defaults_visibility_unknown() -> None:
     request = ServingRequest(
         input=_input(),
         reasoning=ReasoningPolicy(),
@@ -43,8 +48,10 @@ def test_serving_request_is_immutable_and_contains_no_wire_stream_field() -> Non
         "seed",
         "sampling",
         "stop_conditions",
+        "visibility_mode",
     }
     assert request.mid_system_policy is MidSystemPolicy.LEGACY_UNSPECIFIED
+    assert request.visibility_mode is ServingVisibilityMode.UNKNOWN
     with pytest.raises(FrozenInstanceError):
         request.max_output_tokens = 64  # type: ignore[misc]
 

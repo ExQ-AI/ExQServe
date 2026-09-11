@@ -16,7 +16,7 @@ from exqserve.core.items import (
 )
 from exqserve.protocol.anthropic.common import AnthropicProtocolError
 from exqserve.protocol.anthropic.messages import AnthropicMessagesRequestAdapter
-from exqserve.serving.contracts import MidSystemPolicy
+from exqserve.serving.contracts import MidSystemPolicy, ServingVisibilityMode
 
 
 def test_request_adapter_maps_system_multiturn_tools_results_and_thinking() -> None:
@@ -74,6 +74,7 @@ def test_request_adapter_maps_system_multiturn_tools_results_and_thinking() -> N
     serving = parsed.serving
     assert parsed.model == "local-qwen"
     assert parsed.stream is False
+    assert serving.visibility_mode is ServingVisibilityMode.BUFFERED
     assert serving.input.items == (
         MessageItem(MessageRole.SYSTEM, "Be concise."),
         MessageItem(MessageRole.USER, "Find item 1"),
@@ -109,6 +110,7 @@ def test_request_adapter_maps_any_none_and_disabled_thinking() -> None:
         request_id="req_any",
     )
     assert any_request.stream is True
+    assert any_request.serving.visibility_mode is ServingVisibilityMode.STREAMING
     assert any_request.serving.tools.choice.mode is ToolChoiceMode.REQUIRED
     assert any_request.serving.reasoning.mode is ReasoningMode.DISABLED
     assert any_request.serving.reasoning.effort is ReasoningEffort.LOW

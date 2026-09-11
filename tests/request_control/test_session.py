@@ -275,6 +275,67 @@ def test_controller_routes_injection_by_active_request_id_and_forgets_completed_
     asyncio.run(scenario())
 
 
+def test_accepted_injection_marks_external_lease_not_replay_safe() -> None:
+    async def scenario() -> None:
+        runtime = _FakeRuntime(lambda request: _FakeSession(request.request_id, []))
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        lease = await controller.acquire("steerable-lease")
+        await lease.submit(_request("steerable-lease"))
+
+        assert lease.replay_safe is True
+        await controller.inject_text("steerable-lease", "NEW DIRECTION")
+        assert lease.replay_safe is False
+        assert runtime.sessions[0].injected == ["NEW DIRECTION"]
+
+        await lease.release()
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_accepted_injection_and_replay_invalidation_are_atomic() -> None:
+    async def scenario() -> None:
+        injected = asyncio.Event()
+
+        class _NotifyingSession(_FakeSession):
+            def inject_text(self, text: str) -> None:
+                super().inject_text(text)
+                injected.set()
+
+        runtime = _FakeRuntime(lambda request: _NotifyingSession(request.request_id, []))
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        lease = await controller.acquire("atomic-injection")
+        await lease.submit(_request("atomic-injection"))
+
+        await controller._lock.acquire()
+        inject_task = asyncio.create_task(controller.inject_text("atomic-injection", "INJECTED"))
+        await asyncio.sleep(0)
+
+        blocker_entered = asyncio.Event()
+        blocker_release = asyncio.Event()
+
+        async def blocker() -> None:
+            async with controller._lock:
+                blocker_entered.set()
+                await blocker_release.wait()
+
+        blocker_task = asyncio.create_task(blocker())
+        await asyncio.sleep(0)
+        controller._lock.release()
+
+        await injected.wait()
+        await blocker_entered.wait()
+        assert lease.replay_safe is False
+        assert runtime.sessions[0].injected == ["INJECTED"]
+
+        blocker_release.set()
+        await blocker_task
+        await inject_task
+        await lease.release()
+
+    asyncio.run(scenario())
+
+
 def test_runtime_injection_unavailable_maps_to_request_conflict() -> None:
     async def scenario() -> None:
         class _UnavailableSession(_FakeSession):
@@ -284,16 +345,19 @@ def test_runtime_injection_unavailable_maps_to_request_conflict() -> None:
 
         runtime = _FakeRuntime(lambda request: _UnavailableSession(request.request_id, []))
         controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
-        session = await controller.submit(_request("ending"))
+        lease = await controller.acquire("ending")
+        await lease.submit(_request("ending"))
 
+        assert lease.replay_safe is True
         try:
             await controller.inject_text("ending", "forced")
         except RequestInjectionConflict as exc:
             assert "terminating" in str(exc)
         else:
             raise AssertionError("runtime terminal state was not mapped to an injection conflict")
+        assert lease.replay_safe is True
 
-        await session.cancel()
+        await lease.release()
 
     asyncio.run(scenario())
 

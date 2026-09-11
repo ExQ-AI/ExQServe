@@ -12,8 +12,8 @@ from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.control.request import RequestRejected, RequestTerminalReason
-from exqserve.core.errors import CanonicalError, ErrorCategory
-from exqserve.core.events import GenerationEvent
+from exqserve.core.errors import CanonicalError, ErrorCategory, FailureCause
+from exqserve.core.events import GenerationCompleted, GenerationEvent
 from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     ImageContentPart,
@@ -37,10 +37,12 @@ from exqserve.model.contracts import (
     incomplete_tool_terminal_issue,
 )
 from exqserve.runtime.contracts import (
+    RuntimeCapabilities,
     RuntimeConstraintUnsupported,
     RuntimeFinished,
     RuntimeGenerationConstraint,
     RuntimeGenerationRequest,
+    RuntimeReadinessResult,
     RuntimeStopReason,
     RuntimeTextDelta,
     RuntimeTiming,
@@ -51,6 +53,7 @@ from exqserve.serving.contracts import (
     MidSystemPolicy,
     ServingRejected,
     ServingRequest,
+    ServingVisibilityMode,
 )
 from exqserve.serving.engine import ServingEngine
 
@@ -197,6 +200,299 @@ def test_submit_compiles_and_builds_runtime_request_exactly_once() -> None:
                 stop_conditions=("<stop>",),
             )
         ]
+
+    asyncio.run(scenario())
+
+
+def test_recovery_compiles_once_and_rebuilds_attempt_local_state() -> None:
+    class RecoverControlled(_Controlled):
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            async def stream():  # type: ignore[no-untyped-def]
+                yield RuntimeFinished(
+                    request_id="req-1",
+                    reason=RuntimeStopReason.EOS,
+                    usage=TokenUsage(input_tokens=3, output_tokens=1),
+                    timing=RuntimeTiming(),
+                )
+
+            return stream()
+
+    class RecoverController(_Controller):
+        runtime_capabilities = RuntimeCapabilities(
+            cancellation=True,
+            template_rendering=True,
+            tokenization=True,
+            seed=True,
+            cache_usage=True,
+            quantized_kv_cache=True,
+            fresh_attempt_replay=True,
+            recovery_readiness=True,
+        )
+
+        async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+            self.requests.append(request)
+            return RecoverControlled()
+
+    class RecoverParser(_Parser):
+        def __init__(self, incomplete: bool) -> None:
+            self._incomplete = incomplete
+
+        def finish(self) -> _Finish:
+            return _Finish(incomplete_tool_call=self._incomplete)
+
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = RecoverController()
+        parser_calls = 0
+
+        def parser_factory(request_id: str, reasoning: object, tool_policy: object) -> RecoverParser:
+            nonlocal parser_calls
+            del request_id, reasoning, tool_policy
+            parser_calls += 1
+            return RecoverParser(incomplete=parser_calls == 1)
+
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            seed=None,
+            visibility_mode=ServingVisibilityMode.BUFFERED,
+        )
+        engine = ServingEngine(
+            compiler,
+            parser_factory,  # type: ignore[arg-type]
+            controller,
+            max_extra_attempts=1,
+        )
+
+        session = await engine.submit(request)
+        events = [event async for event in session]
+
+        assert len(compiler.calls) == 1
+        assert parser_calls == 2
+        assert len(controller.requests) == 2
+        assert controller.requests[0] == controller.requests[1]
+        assert isinstance(events[-1], GenerationCompleted)
+        assert session.diagnostics.attempts_started == 2  # type: ignore[union-attr]
+        assert session.diagnostics.recovered is True  # type: ignore[union-attr]
+
+    asyncio.run(scenario())
+
+
+def test_initial_runtime_recovering_ready_retries_under_same_prepared_request() -> None:
+    class RecoveringSubmitController(_Controller):
+        runtime_capabilities = RuntimeCapabilities(
+            cancellation=True,
+            template_rendering=True,
+            tokenization=True,
+            seed=True,
+            cache_usage=True,
+            quantized_kv_cache=True,
+            fresh_attempt_replay=True,
+            recovery_readiness=True,
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadline = 123.0
+            self.waits: list[float | None] = []
+
+        async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise RequestRejected(
+                    CanonicalError(
+                        ErrorCategory.RUNTIME_FAILURE,
+                        "runtime_recovering",
+                        "recovering",
+                        True,
+                        FailureCause.RUNTIME_RECOVERING,
+                    )
+                )
+            return _Controlled()
+
+        async def wait_until_runtime_ready(self, deadline: float | None) -> RuntimeReadinessResult:
+            self.waits.append(deadline)
+            return RuntimeReadinessResult.READY
+
+    async def scenario() -> None:
+        compiler = _Compiler()
+        controller = RecoveringSubmitController()
+        engine = ServingEngine(
+            compiler,
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            max_extra_attempts=1,
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            seed=base.seed,
+            visibility_mode=ServingVisibilityMode.BUFFERED,
+        )
+
+        session = await engine.submit(request)
+
+        assert len(compiler.calls) == 1
+        assert len(controller.requests) == 2
+        assert controller.requests[0] == controller.requests[1]
+        assert controller.waits == [123.0]
+        assert session.diagnostics.attempts_started == 2  # type: ignore[union-attr]
+        assert session.diagnostics.recovery_attempts == 1  # type: ignore[union-attr]
+        await session.cancel()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("readiness", "expected_code"),
+    [
+        (RuntimeReadinessResult.DEADLINE, "request_timeout"),
+        (RuntimeReadinessResult.FAILED, "runtime_recovery_unavailable"),
+        (RuntimeReadinessResult.CLOSED, "server_shutting_down"),
+    ],
+)
+def test_initial_runtime_recovering_wait_failure_preserves_terminal_precedence(
+    readiness: RuntimeReadinessResult,
+    expected_code: str,
+) -> None:
+    class RecoveringSubmitController(_Controller):
+        runtime_capabilities = RuntimeCapabilities(
+            cancellation=True,
+            template_rendering=True,
+            tokenization=True,
+            seed=True,
+            cache_usage=True,
+            quantized_kv_cache=True,
+            fresh_attempt_replay=True,
+            recovery_readiness=True,
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadline = 123.0
+
+        async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+            self.requests.append(request)
+            raise RequestRejected(
+                CanonicalError(
+                    ErrorCategory.RUNTIME_FAILURE,
+                    "runtime_recovering",
+                    "recovering",
+                    True,
+                    FailureCause.RUNTIME_RECOVERING,
+                )
+            )
+
+        async def wait_until_runtime_ready(self, deadline: float | None) -> RuntimeReadinessResult:
+            assert deadline == 123.0
+            return readiness
+
+    async def scenario() -> None:
+        controller = RecoveringSubmitController()
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            max_extra_attempts=1,
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            seed=base.seed,
+            visibility_mode=ServingVisibilityMode.BUFFERED,
+        )
+
+        with pytest.raises(ServingRejected) as exc_info:
+            await engine.submit(request)
+
+        assert exc_info.value.error.code == expected_code
+        assert len(controller.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_initial_runtime_recovery_wait_is_interrupted_by_lease_termination() -> None:
+    class RecoveringSubmitController(_Controller):
+        runtime_capabilities = RuntimeCapabilities(
+            cancellation=True,
+            template_rendering=True,
+            tokenization=True,
+            seed=True,
+            cache_usage=True,
+            quantized_kv_cache=True,
+            fresh_attempt_replay=True,
+            recovery_readiness=True,
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.deadline = 123.0
+            self.wait_entered = asyncio.Event()
+            self.terminated = asyncio.Event()
+            self.wait_cancelled = False
+
+        async def submit(self, request: RuntimeGenerationRequest) -> _Controlled:
+            self.requests.append(request)
+            raise RequestRejected(
+                CanonicalError(
+                    ErrorCategory.RUNTIME_FAILURE,
+                    "runtime_recovering",
+                    "recovering",
+                    True,
+                    FailureCause.RUNTIME_RECOVERING,
+                )
+            )
+
+        async def wait_until_runtime_ready(self, deadline: float | None) -> RuntimeReadinessResult:
+            assert deadline == 123.0
+            self.wait_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.wait_cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+        async def wait_until_terminated(self) -> RequestTerminalReason:
+            await self.terminated.wait()
+            return RequestTerminalReason.SERVER_SHUTDOWN
+
+    async def scenario() -> None:
+        controller = RecoveringSubmitController()
+        engine = ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: _Parser(),
+            controller,
+            max_extra_attempts=1,
+        )
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            seed=base.seed,
+            visibility_mode=ServingVisibilityMode.BUFFERED,
+        )
+
+        submission = asyncio.create_task(engine.submit(request))
+        await controller.wait_entered.wait()
+        controller.terminated.set()
+        with pytest.raises(ServingRejected) as exc_info:
+            await asyncio.wait_for(submission, timeout=0.2)
+
+        assert exc_info.value.error.code == "server_shutting_down"
+        assert controller.wait_cancelled is True
+        assert len(controller.requests) == 1
 
     asyncio.run(scenario())
 

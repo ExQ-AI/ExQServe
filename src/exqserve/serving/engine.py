@@ -63,13 +63,16 @@ from exqserve.core.items import (
     ToolResultItem,
 )
 from exqserve.core.request import CanonicalRequest
+from exqserve.core.timing import GenerationTiming
 from exqserve.core.tokens import NativeTokenSpan
+from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenAwareIncrementalParser,
     NativeTokenConstraintIntegrityError,
     NativeTokenProvenanceError,
     ParserAmbiguityDetail,
+    ParserConstraintScope,
     ParserCreationContext,
     ParserTerminalIssue,
     ParserTerminalIssueKind,
@@ -88,12 +91,14 @@ from exqserve.model.contracts import (
 )
 from exqserve.runtime.contracts import (
     ConstraintInstallation,
+    RuntimeCapabilities,
     RuntimeConstraintUnsupported,
     RuntimeEvent,
     RuntimeFailed,
     RuntimeFinished,
     RuntimeGenerationConstraint,
     RuntimeGenerationRequest,
+    RuntimeReadinessResult,
     RuntimeRenderedPrompt,
     RuntimeStarted,
     RuntimeStopReason,
@@ -110,6 +115,17 @@ from exqserve.serving.contracts import (
 )
 from exqserve.serving.guarantees import RequestGuaranteeResolver, guarantee_satisfies
 from exqserve.serving.preprocessing import RendererLanePool, await_task_termination
+from exqserve.serving.recovery import (
+    AttemptRecoveryEvidence,
+    AttemptRecoveryKind,
+    PublicationState,
+    RecoveringServingSession,
+    RecoveryAttemptRecord,
+    RecoveryAttemptStatus,
+    RecoveryDiagnostics,
+    RecoverySkipReason,
+    classify_attempt_recovery,
+)
 from exqserve.serving.runtime_events import timing_event_from_runtime
 from exqserve.serving.terminal import (
     TerminalDecision,
@@ -350,6 +366,15 @@ class _ReasoningBudgetState(str, Enum):
     DONE = "done"
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedServingRequest:
+    request: ServingRequest
+    compiled: CompiledPrompt
+    runtime_request: RuntimeGenerationRequest
+    tool_constraint: ToolGenerationConstraint | None
+    runtime_fallback: ConstraintFallbackPolicy
+    reasoning_budget: _EffectiveReasoningBudget | None
+
 def _safe_error(
     category: ErrorCategory,
     code: str,
@@ -522,6 +547,7 @@ class ServingEngine:
             BestEffortMidSystemLowering.MERGED_LEADING
         ),
         parser_context_factory: ParserContextFactory | None = None,
+        max_extra_attempts: int = 0,
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
@@ -533,6 +559,10 @@ class ServingEngine:
             raise TypeError("constrained_parallel_tool_call_limit must be an integer")
         if constrained_parallel_tool_call_limit <= 0:
             raise ValueError("constrained_parallel_tool_call_limit must be positive")
+        if not isinstance(max_extra_attempts, int) or isinstance(max_extra_attempts, bool):
+            raise TypeError("max_extra_attempts must be an integer")
+        if max_extra_attempts not in {0, 1}:
+            raise ValueError("max_extra_attempts must be 0 or 1")
         if compiler is None and preprocessing_pool is None:
             raise ValueError("compiler or preprocessing_pool is required")
         self._compiler = compiler
@@ -548,6 +578,7 @@ class ServingEngine:
         ):
             raise TypeError("reasoning_budget_default must be ReasoningBudgetDefault or None")
         self._constrained_parallel_tool_call_limit = constrained_parallel_tool_call_limit
+        self._max_extra_attempts = max_extra_attempts
         self._output_limit_resolver = output_limit_resolver
         self._reasoning_control_factory = reasoning_control_factory
         self._reasoning_control_tokenizer = reasoning_control_tokenizer
@@ -772,7 +803,168 @@ class ServingEngine:
         finally:
             await lease.release()
 
-    async def submit(self, request: ServingRequest) -> ServingSession:
+    def _runtime_capabilities(self) -> RuntimeCapabilities | None:
+        capabilities = getattr(self._controller, "runtime_capabilities", None)
+        return capabilities if isinstance(capabilities, RuntimeCapabilities) else None
+
+    async def _wait_until_runtime_ready(self, deadline: float | None) -> RuntimeReadinessResult:
+        waiter = getattr(self._controller, "wait_until_runtime_ready", None)
+        if not callable(waiter):
+            return RuntimeReadinessResult.FAILED
+        result = await waiter(deadline)
+        if not isinstance(result, RuntimeReadinessResult):
+            raise TypeError("request controller returned an invalid runtime readiness result")
+        return result
+
+    async def _wait_until_runtime_ready_for_lease(
+        self,
+        lease: RequestLeaseLike,
+        deadline: float | None,
+    ) -> RuntimeReadinessResult:
+        termination_waiter = getattr(lease, "wait_until_terminated", None)
+        if not callable(termination_waiter):
+            return await self._wait_until_runtime_ready(deadline)
+
+        readiness_task = asyncio.create_task(self._wait_until_runtime_ready(deadline))
+        termination_task = asyncio.create_task(termination_waiter())
+        try:
+            done, _ = await asyncio.wait(
+                {readiness_task, termination_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if readiness_task in done:
+                return await readiness_task
+            return RuntimeReadinessResult.CLOSED
+        finally:
+            if not readiness_task.done():
+                readiness_task.cancel()
+            if not termination_task.done():
+                termination_task.cancel()
+            await asyncio.gather(readiness_task, termination_task, return_exceptions=True)
+
+    async def _start_attempt(
+        self,
+        prepared: _PreparedServingRequest,
+        lease: RequestLeaseLike,
+        *,
+        final_release_on_terminal: bool = False,
+    ) -> ServingSession:
+        request = prepared.request
+        tool_constraint = prepared.tool_constraint
+        controlled: ControlledSessionLike | None = None
+        try:
+            submit_final = getattr(lease, "submit_final", None)
+            if final_release_on_terminal and callable(submit_final):
+                controlled = await submit_final(prepared.runtime_request)
+            else:
+                controlled = await lease.submit(prepared.runtime_request)
+        except RuntimeConstraintUnsupported as exc:
+            if prepared.runtime_request.output_json_schema is not None:
+                raise ServingRejected(
+                    _safe_error(
+                        ErrorCategory.INVALID_REQUEST,
+                        "structured_output_constraint_unsupported",
+                        "Requested structured-output generation guarantee is not supported by the selected model/runtime constraint path.",
+                    )
+                ) from exc
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INVALID_REQUEST,
+                    "tool_constraint_unsupported",
+                    "Tool schema or policy cannot be represented by the active constrained-generation runtime.",
+                )
+            ) from exc
+        except RequestRejected as exc:
+            raise ServingRejected(exc.error, attempt_started=exc.attempt_started) from exc
+        except Exception as exc:
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.RUNTIME_FAILURE,
+                    "runtime_submission_failed",
+                    "Inference runtime submission failed.",
+                )
+            ) from exc
+
+        try:
+            installation = getattr(controlled, "constraint_installation", None)
+            parser_context = (
+                None
+                if self._parser_context_factory is None
+                else self._parser_context_factory(
+                    tool_constraint,
+                    installation,
+                    prepared.runtime_fallback,
+                )
+            )
+            if self._parser_factory_supports_context:
+                contextual_factory = cast(ContextualParserFactory, self._parser_factory)
+                parser = contextual_factory(
+                    request.input.request_id,
+                    request.reasoning,
+                    request.tools,
+                    parser_context,
+                )
+            else:
+                legacy_factory = cast(LegacyParserFactory, self._parser_factory)
+                parser = legacy_factory(
+                    request.input.request_id,
+                    request.reasoning,
+                    request.tools,
+                )
+        except ValueError as exc:
+            await controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INTERNAL,
+                    "tool_parser_authority_invalid",
+                    "Serving could not bind the installed Tool constraint to parser authority.",
+                )
+            ) from exc
+        except asyncio.CancelledError:
+            await controlled.cancel(RequestTerminalReason.CLIENT_CANCELLED)
+            raise
+        except Exception as exc:
+            await controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            raise ServingRejected(
+                _safe_error(
+                    ErrorCategory.INTERNAL,
+                    "serving_internal_error",
+                    "Serving parser initialization failed internally.",
+                )
+            ) from exc
+
+        try:
+            session = ServingSession(
+                request.input.request_id,
+                controlled,
+                parser,
+                prepared.compiled,
+                request.tools,
+                request.structured_output,
+                request.stop_conditions,
+                self._tool_call_fanout_limit,
+                tool_constraint is not None
+                and (
+                    request.tools.allow_parallel
+                    or tool_constraint.decode_authority is not None
+                ),
+                self._constrained_parallel_tool_call_limit,
+                prepared.reasoning_budget,
+                tool_constraint=tool_constraint,
+                planned_generation_guarantee=prepared.runtime_request.generation_guarantee,
+            )
+            await session._initialize_reasoning_budget()
+        except asyncio.CancelledError:
+            await controlled.cancel(RequestTerminalReason.CLIENT_CANCELLED)
+            raise
+        except Exception:
+            await controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            raise
+        return session
+
+    async def submit(
+        self, request: ServingRequest
+    ) -> ServingSession | RecoveringServingSession:
         try:
             self._guarantee_resolver.ensure_tool_request_supported(request.tools)
         except ToolConstraintUnsupported as exc:
@@ -789,7 +981,8 @@ class ServingEngine:
         except RequestRejected as exc:
             raise ServingRejected(exc.error) from exc
 
-        controlled: ControlledSessionLike | None = None
+        external_session: RecoveringServingSession | None = None
+        lease_handed_off = False
         try:
             compiled = await self._compile_request_async(request)
             max_output_tokens = request.max_output_tokens
@@ -906,110 +1099,286 @@ class ServingEngine:
                 constraint_fallback_policy=runtime_fallback,
                 use_native_eos=compiled.use_native_eos,
             )
-            try:
-                controlled = await lease.submit(runtime_request)
-            except RuntimeConstraintUnsupported as exc:
-                if schema_hint is not None:
-                    raise ServingRejected(
-                        _safe_error(
-                            ErrorCategory.INVALID_REQUEST,
-                            "structured_output_constraint_unsupported",
-                            "Requested structured-output generation guarantee is not supported by the selected model/runtime constraint path.",
-                        )
-                    ) from exc
-                raise ServingRejected(
-                    _safe_error(
-                        ErrorCategory.INVALID_REQUEST,
-                        "tool_constraint_unsupported",
-                        "Tool schema or policy cannot be represented by the active constrained-generation runtime.",
-                    )
-                ) from exc
-            except RequestRejected as exc:
-                raise ServingRejected(exc.error) from exc
-            except Exception as exc:
-                raise ServingRejected(
-                    _safe_error(
-                        ErrorCategory.RUNTIME_FAILURE,
-                        "runtime_submission_failed",
-                        "Inference runtime submission failed.",
-                    )
-                ) from exc
+            prepared = _PreparedServingRequest(
+                request,
+                compiled,
+                runtime_request,
+                tool_constraint,
+                runtime_fallback,
+                reasoning_budget,
+            )
+            if self._max_extra_attempts == 0:
+                first_attempt = await self._start_attempt(
+                    prepared,
+                    lease,
+                    final_release_on_terminal=True,
+                )
+                lease_handed_off = True
+                return first_attempt
+
+            capabilities = self._runtime_capabilities()
+
+            async def start_attempt() -> ServingSession:
+                return await self._start_attempt(prepared, lease)
+
+            async def wait_runtime(deadline: float | None) -> RuntimeReadinessResult:
+                return await self._wait_until_runtime_ready_for_lease(lease, deadline)
+
+            initial_attempt_ordinal = 1
+            initial_attempts_started = 0
+            initial_recovery_attempts = 0
+            initial_attempt_records: tuple[RecoveryAttemptRecord, ...] = ()
+
+            planned_guarantee = prepared.runtime_request.generation_guarantee
+            pre_session_guarantee = (
+                GenerationGuarantee.NONE
+                if planned_guarantee is GenerationGuarantee.NONE
+                else GenerationGuarantee.UNKNOWN
+            )
+
+            def pre_session_diagnostics(
+                *,
+                attempts_started: int,
+                recovery_attempts: int,
+                ordinal: int,
+                records: tuple[RecoveryAttemptRecord, ...],
+                recovery_kind: AttemptRecoveryKind,
+                recovery_decision: str,
+                runtime_state: str,
+                skip_reason: RecoverySkipReason | None = None,
+            ) -> RecoveryDiagnostics:
+                return RecoveryDiagnostics(
+                    attempts_started,
+                    recovery_attempts,
+                    False,
+                    skip_reason,
+                    records,
+                    attempt_ordinal=ordinal,
+                    visibility_mode=request.visibility_mode,
+                    publication_state=PublicationState.UNPUBLISHED,
+                    constraint_guarantee=pre_session_guarantee,
+                    recovery_kind=recovery_kind,
+                    recovery_decision=recovery_decision,
+                    runtime_state=runtime_state,
+                    final_attempt=ordinal,
+                )
 
             try:
+                first_attempt = await start_attempt()
+                initial_attempts_started = 1
+            except ServingRejected as exc:
+                if not exc.attempt_started:
+                    raise
+                initial_attempts_started = 1
+                initial_attempt_records = (
+                    RecoveryAttemptRecord(
+                        1,
+                        RecoveryAttemptStatus.SUBMISSION_FAILED,
+                        error_code=exc.error.code,
+                        failure_cause=exc.error.cause,
+                        discarded=True,
+                    ),
+                )
+                decision = classify_attempt_recovery(
+                    AttemptRecoveryEvidence(
+                        error=exc.error,
+                        visibility_mode=request.visibility_mode,
+                        publication_state=PublicationState.UNPUBLISHED,
+                        attempt_ordinal=1,
+                        max_extra_attempts=self._max_extra_attempts,
+                        seed=request.seed,
+                        sampling=request.sampling,
+                        fresh_attempt_replay=(
+                            False
+                            if capabilities is None
+                            else capabilities.fresh_attempt_replay
+                        ),
+                        recovery_readiness=(
+                            False
+                            if capabilities is None
+                            else capabilities.recovery_readiness
+                        ),
+                        has_prompt_attachments=bool(compiled.runtime_attachments),
+                        prompt_attachment_replay=(
+                            False
+                            if capabilities is None
+                            else capabilities.prompt_attachment_replay
+                        ),
+                    )
+                )
+                if decision.kind is not AttemptRecoveryKind.WAIT_RUNTIME_AND_RETRY:
+                    raise ServingRejected(
+                        exc.error,
+                        attempt_started=True,
+                        execution_diagnostics=pre_session_diagnostics(
+                            attempts_started=1,
+                            recovery_attempts=0,
+                            ordinal=1,
+                            records=initial_attempt_records,
+                            recovery_kind=decision.kind,
+                            recovery_decision="skipped",
+                            runtime_state="submission_failed",
+                            skip_reason=decision.skip_reason,
+                        ),
+                    ) from exc
+                deadline = getattr(lease, "deadline", None)
+                readiness = await wait_runtime(
+                    deadline if isinstance(deadline, float | int) else None
+                )
+                if readiness is RuntimeReadinessResult.DEADLINE:
+                    timeout_error = _safe_error(
+                        ErrorCategory.RUNTIME_FAILURE,
+                        "request_timeout",
+                        "Inference request exceeded its serving deadline.",
+                        retryable=True,
+                    )
+                    raise ServingRejected(
+                        timeout_error,
+                        execution_diagnostics=pre_session_diagnostics(
+                            attempts_started=1,
+                            recovery_attempts=0,
+                            ordinal=1,
+                            records=initial_attempt_records,
+                            recovery_kind=decision.kind,
+                            recovery_decision="deadline",
+                            runtime_state=readiness.value,
+                            skip_reason=RecoverySkipReason.RUNTIME_NOT_READY,
+                        ),
+                    ) from exc
+                if readiness is RuntimeReadinessResult.CLOSED:
+                    closed_error = _safe_error(
+                        ErrorCategory.OVERLOADED,
+                        "server_shutting_down",
+                        "Server is shutting down.",
+                        retryable=True,
+                    )
+                    raise ServingRejected(
+                        closed_error,
+                        execution_diagnostics=pre_session_diagnostics(
+                            attempts_started=1,
+                            recovery_attempts=0,
+                            ordinal=1,
+                            records=initial_attempt_records,
+                            recovery_kind=decision.kind,
+                            recovery_decision="runtime_closed",
+                            runtime_state=readiness.value,
+                            skip_reason=RecoverySkipReason.RUNTIME_NOT_READY,
+                        ),
+                    ) from exc
+                if readiness is not RuntimeReadinessResult.READY:
+                    unavailable_error = CanonicalError(
+                        ErrorCategory.RUNTIME_FAILURE,
+                        "runtime_recovery_unavailable",
+                        "Inference runtime did not become ready for request recovery.",
+                        False,
+                        FailureCause.RESTART_REQUIRED,
+                    )
+                    raise ServingRejected(
+                        unavailable_error,
+                        execution_diagnostics=pre_session_diagnostics(
+                            attempts_started=1,
+                            recovery_attempts=0,
+                            ordinal=1,
+                            records=initial_attempt_records,
+                            recovery_kind=decision.kind,
+                            recovery_decision="runtime_not_ready",
+                            runtime_state=readiness.value,
+                            skip_reason=RecoverySkipReason.RUNTIME_NOT_READY,
+                        ),
+                    ) from exc
                 try:
-                    installation = getattr(controlled, "constraint_installation", None)
-                    parser_context = (
-                        None
-                        if self._parser_context_factory is None
-                        else self._parser_context_factory(
-                            tool_constraint,
-                            installation,
-                            runtime_fallback,
+                    first_attempt = await start_attempt()
+                except ServingRejected as retry_exc:
+                    second_records: tuple[RecoveryAttemptRecord, ...]
+                    if retry_exc.attempt_started:
+                        second_records = (
+                            *initial_attempt_records,
+                            RecoveryAttemptRecord(
+                                2,
+                                RecoveryAttemptStatus.SUBMISSION_FAILED,
+                                error_code=retry_exc.error.code,
+                                failure_cause=retry_exc.error.cause,
+                            ),
+                        )
+                        attempts_started = 2
+                        recovery_attempts = 1
+                        ordinal = 2
+                        retry_decision = "retry_submission_failed"
+                    else:
+                        second_records = initial_attempt_records
+                        attempts_started = 1
+                        recovery_attempts = 0
+                        ordinal = 1
+                        retry_decision = "retry_blocked_before_submit"
+                    terminal_decision = classify_attempt_recovery(
+                        AttemptRecoveryEvidence(
+                            error=retry_exc.error,
+                            visibility_mode=request.visibility_mode,
+                            publication_state=PublicationState.UNPUBLISHED,
+                            attempt_ordinal=ordinal,
+                            max_extra_attempts=self._max_extra_attempts,
+                            seed=request.seed,
+                            sampling=request.sampling,
+                            fresh_attempt_replay=(
+                                False
+                                if capabilities is None
+                                else capabilities.fresh_attempt_replay
+                            ),
+                            recovery_readiness=(
+                                False
+                                if capabilities is None
+                                else capabilities.recovery_readiness
+                            ),
+                            has_prompt_attachments=bool(compiled.runtime_attachments),
+                            prompt_attachment_replay=(
+                                False
+                                if capabilities is None
+                                else capabilities.prompt_attachment_replay
+                            ),
                         )
                     )
-                    if self._parser_factory_supports_context:
-                        contextual_factory = cast(ContextualParserFactory, self._parser_factory)
-                        parser = contextual_factory(
-                            request.input.request_id,
-                            request.reasoning,
-                            request.tools,
-                            parser_context,
-                        )
-                    else:
-                        legacy_factory = cast(LegacyParserFactory, self._parser_factory)
-                        parser = legacy_factory(
-                            request.input.request_id,
-                            request.reasoning,
-                            request.tools,
-                        )
-                except ValueError as exc:
                     raise ServingRejected(
-                        _safe_error(
-                            ErrorCategory.INTERNAL,
-                            "tool_parser_authority_invalid",
-                            "Serving could not bind the installed Tool constraint to parser authority.",
-                        )
-                    ) from exc
-                except Exception as exc:
-                    raise ServingRejected(
-                        _safe_error(
-                            ErrorCategory.INTERNAL,
-                            "serving_internal_error",
-                            "Serving parser initialization failed internally.",
-                        )
-                    ) from exc
-                session = ServingSession(
-                    request.input.request_id,
-                    controlled,
-                    parser,
-                    compiled,
-                    request.tools,
-                    request.structured_output,
-                    request.stop_conditions,
-                    self._tool_call_fanout_limit,
-                    tool_constraint is not None
-                    and (
-                        request.tools.allow_parallel
-                        or tool_constraint.decode_authority is not None
-                    ),
-                    self._constrained_parallel_tool_call_limit,
-                    reasoning_budget,
-                    tool_constraint=tool_constraint,
-                )
-                await session._initialize_reasoning_budget()
-            except asyncio.CancelledError:
-                try:
-                    await controlled.cancel(RequestTerminalReason.CLIENT_CANCELLED)
-                finally:
-                    raise
-            except Exception:  # noqa: BLE001 - runtime ownership must roll back on any wrapper failure
-                try:
-                    await controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
-                finally:
-                    raise
-            return session
+                        retry_exc.error,
+                        attempt_started=retry_exc.attempt_started,
+                        execution_diagnostics=pre_session_diagnostics(
+                            attempts_started=attempts_started,
+                            recovery_attempts=recovery_attempts,
+                            ordinal=ordinal,
+                            records=second_records,
+                            recovery_kind=decision.kind,
+                            recovery_decision=retry_decision,
+                            runtime_state=(
+                                retry_exc.error.cause.value
+                                if retry_exc.error.cause is not None
+                                else "submission_failed"
+                            ),
+                            skip_reason=terminal_decision.skip_reason,
+                        ),
+                    ) from retry_exc
+                initial_attempt_ordinal = 2
+                initial_attempts_started = 2
+                initial_recovery_attempts = 1
+
+            external_session = RecoveringServingSession(
+                first_attempt,
+                attempt_factory=start_attempt,
+                lease=lease,
+                visibility_mode=request.visibility_mode,
+                max_extra_attempts=self._max_extra_attempts,
+                seed=request.seed,
+                sampling=request.sampling,
+                capabilities=capabilities,
+                has_prompt_attachments=bool(compiled.runtime_attachments),
+                runtime_waiter=wait_runtime,
+                initial_attempt_ordinal=initial_attempt_ordinal,
+                initial_attempts_started=initial_attempts_started,
+                initial_recovery_attempts=initial_recovery_attempts,
+                initial_attempt_records=initial_attempt_records,
+            )
+            lease_handed_off = True
+            return external_session
         finally:
-            if controlled is None:
+            if not lease_handed_off:
                 await lease.release()
 
 
@@ -1030,6 +1399,7 @@ class ServingSession:
         constrained_parallel_tool_call_limit: int = 8,
         reasoning_budget: _EffectiveReasoningBudget | None = None,
         tool_constraint: ToolGenerationConstraint | None = None,
+        planned_generation_guarantee: GenerationGuarantee = GenerationGuarantee.NONE,
     ) -> None:
         self._request_id = request_id
         self._controlled = controlled
@@ -1039,6 +1409,13 @@ class ServingSession:
         self._tool_policy = tool_policy
         self._structured_output = structured_output
         self._tool_constraint = tool_constraint
+        if not isinstance(planned_generation_guarantee, GenerationGuarantee):
+            raise TypeError("planned_generation_guarantee must be a GenerationGuarantee")
+        self._effective_generation_guarantee = (
+            GenerationGuarantee.NONE
+            if planned_generation_guarantee is GenerationGuarantee.NONE
+            else GenerationGuarantee.UNKNOWN
+        )
         self._tool_constraint_activation_proven = False
         self._requested_stop_sequences = frozenset(
             condition for condition in requested_stop_conditions if isinstance(condition, str)
@@ -1056,6 +1433,8 @@ class ServingSession:
         self._parser_finished = False
         self._text_parts: list[str] = []
         self._runtime_trace: list[dict[str, object]] | None = None
+        self._attempt_usage: TokenUsage | None = None
+        self._attempt_timing: GenerationTiming | None = None
         self._reasoning_budget = reasoning_budget
         self._reasoning_budget_state = (
             _ReasoningBudgetState.COUNTING
@@ -1071,6 +1450,18 @@ class ServingSession:
     @property
     def input_token_count(self) -> int:
         return len(self._compiled_prompt.input_ids)
+
+    @property
+    def attempt_usage(self) -> TokenUsage | None:
+        return self._attempt_usage
+
+    @property
+    def attempt_timing(self) -> GenerationTiming | None:
+        return self._attempt_timing
+
+    @property
+    def constraint_guarantee(self) -> GenerationGuarantee:
+        return self._effective_generation_guarantee
 
     @property
     def commit_class(self) -> SemanticCommitClass:
@@ -1126,7 +1517,7 @@ class ServingSession:
         return decision
 
     def _tool_constraint_guarantee(self, tool_name: str) -> ToolConstraintGuarantee:
-        if self._tool_constraint is None or not self._tool_constraint_activation_proven:
+        if self._tool_constraint is None:
             return ToolConstraintGuarantee.NONE
         return self._tool_constraint.guarantee_for_tool(tool_name)
 
@@ -1536,7 +1927,8 @@ class ServingSession:
                 guarantee = self._tool_constraint_guarantee(event.call.name)
                 cause = (
                     FailureCause.CONSTRAINT_FAILURE
-                    if violates_tool_constraint_guarantee(decision.failure, guarantee)
+                    if self._tool_constraint_activation_proven
+                    and violates_tool_constraint_guarantee(decision.failure, guarantee)
                     else FailureCause.MODEL_TOOL_OUTPUT_INVALID
                     if is_model_tool_output_invalid(decision.failure, guarantee)
                     else None
@@ -1694,32 +2086,45 @@ class ServingSession:
         if issue.kind is not ParserTerminalIssueKind.PROTOCOL_AMBIGUITY:
             raise RuntimeError(f"unsupported parser terminal issue: {issue.kind.value}")
         detail = issue.ambiguity_detail
+        hard_constraint_active = (
+            runtime_event is not None
+            and runtime_event.hard_constraint_installed
+            and runtime_event.hard_constraint_activated
+            and runtime_event.effective_generation_guarantee
+            in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
+        )
         if detail is ParserAmbiguityDetail.HOLD_LIMIT:
-            cause = FailureCause.PARSER_AMBIGUITY_LIMIT
+            cause = (
+                FailureCause.CONSTRAINT_FAILURE
+                if issue.constraint_scope is ParserConstraintScope.TOOL and hard_constraint_active
+                else FailureCause.PARSER_AMBIGUITY_LIMIT
+            )
             message = "Model output exceeded the bounded protocol-ambiguity hold limit."
         else:
-            constraint_integrity_active = (
-                runtime_event is not None
-                and runtime_event.hard_constraint_installed
-                and runtime_event.hard_constraint_activated
-                and runtime_event.effective_generation_guarantee
-                in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
-            )
             reason = None if runtime_event is None else runtime_event.reason
             cause = (
                 FailureCause.OUTPUT_LENGTH
                 if reason is RuntimeStopReason.LENGTH
                 else FailureCause.CONSTRAINT_FAILURE
                 if reason in {RuntimeStopReason.EOS, RuntimeStopReason.FILTER}
-                and constraint_integrity_active
+                and hard_constraint_active
+                and issue.constraint_scope is ParserConstraintScope.TOOL
                 else FailureCause.OUTPUT_EOS
                 if reason is RuntimeStopReason.EOS
+                and (
+                    not hard_constraint_active
+                    or issue.constraint_scope is ParserConstraintScope.OUTSIDE_TOOL
+                )
                 else None
             )
             message = "Model output ended with unresolved protocol ambiguity."
         await self._model_failure("protocol_ambiguity", message, cause=cause)
 
     async def _handle_runtime_finished(self, event: RuntimeFinished) -> None:
+        self._attempt_usage = event.usage
+        attempt_timing_event = timing_event_from_runtime(self._request_id, event.timing)
+        self._attempt_timing = None if attempt_timing_event is None else attempt_timing_event.timing
+        self._effective_generation_guarantee = event.effective_generation_guarantee
         self._record_controlled_terminal_reason()
         self._terminal_evidence.record_runtime_finished(event)
         self._tool_constraint_activation_proven = (

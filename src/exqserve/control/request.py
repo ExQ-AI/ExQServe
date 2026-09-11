@@ -8,17 +8,20 @@ import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 from typing import Protocol, Self
 
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.runtime.contracts import (
     ConstraintInstallation,
     RuntimeCancelled,
+    RuntimeCapabilities,
     RuntimeEvent,
     RuntimeFailed,
     RuntimeFinished,
     RuntimeGenerationRequest,
     RuntimeInjectionUnavailable,
+    RuntimeReadinessResult,
     RuntimeSessionLike,
     RuntimeUnavailable,
 )
@@ -103,10 +106,13 @@ class RequestTerminalReason(str, Enum):
 
 
 class RequestRejected(Exception):
-    def __init__(self, error: CanonicalError) -> None:
+    def __init__(self, error: CanonicalError, *, attempt_started: bool = True) -> None:
         if not isinstance(error, CanonicalError):
             raise TypeError("error must be a CanonicalError")
+        if not isinstance(attempt_started, bool):
+            raise TypeError("attempt_started must be a bool")
         self.error = error
+        self.attempt_started = attempt_started
         super().__init__(error.message)
 
 
@@ -143,13 +149,14 @@ def _rejection(
             code=code,
             message=message,
             retryable=retryable,
-        )
+        ),
+        attempt_started=False,
     )
 
 
 class _RequestLeaseState(str, Enum):
     RESERVED = "reserved"
-    SUBMITTED = "submitted"
+    ACTIVE = "active"
     RELEASED = "released"
 
 
@@ -161,10 +168,34 @@ class RequestLease:
         self._request_id = request_id
         self._state = _RequestLeaseState.RESERVED
         self._session: ControlledSession | None = None
+        self._deadline: float | None = None
+        self._terminal_reason: RequestTerminalReason | None = None
+        self._termination_event = asyncio.Event()
+        self._replay_safe = True
 
     @property
     def request_id(self) -> str:
         return self._request_id
+
+    @property
+    def deadline(self) -> float | None:
+        return self._deadline
+
+    @property
+    def is_active(self) -> bool:
+        return self._state is not _RequestLeaseState.RELEASED
+
+    @property
+    def terminal_reason(self) -> RequestTerminalReason | None:
+        return self._terminal_reason
+
+    @property
+    def replay_safe(self) -> bool:
+        return self._replay_safe
+
+    async def wait_until_terminated(self) -> RequestTerminalReason | None:
+        await self._termination_event.wait()
+        return self._terminal_reason
 
     async def submit(self, request: RuntimeGenerationRequest) -> ControlledSession:
         if not isinstance(request, RuntimeGenerationRequest):
@@ -173,8 +204,19 @@ class RequestLease:
             raise ValueError("runtime request id must match the reserved request id")
         return await self._controller._submit_reserved(self, request)
 
+    async def submit_final(self, request: RuntimeGenerationRequest) -> ControlledSession:
+        if not isinstance(request, RuntimeGenerationRequest):
+            raise TypeError("request must be a RuntimeGenerationRequest")
+        if request.request_id != self._request_id:
+            raise ValueError("runtime request id must match the reserved request id")
+        return await self._controller._submit_reserved(
+            self,
+            request,
+            final_release_on_terminal=True,
+        )
+
     async def release(self) -> None:
-        await self._controller._release_reserved(self)
+        await self._controller._release_lease(self)
 
 
 class ControlledSession:
@@ -186,7 +228,8 @@ class ControlledSession:
         *,
         request_id: str,
         injection_allowed: bool,
-        timeout_seconds: float | None,
+        deadline: float | None = None,
+        timeout_seconds: float | None = None,
         release: _ReleaseCallback,
     ) -> None:
         if not isinstance(request_id, str):
@@ -204,8 +247,19 @@ class ControlledSession:
         self._cancel_called = False
         self._iteration_terminal = False
         self._terminal_reason: RequestTerminalReason | None = None
-        loop = asyncio.get_running_loop()
-        self._deadline = None if timeout_seconds is None else loop.time() + float(timeout_seconds)
+        self._deadline: float | None
+        if deadline is not None and timeout_seconds is not None:
+            raise ValueError("deadline and timeout_seconds are mutually exclusive")
+        if deadline is not None and not isinstance(deadline, int | float):
+            raise TypeError("deadline must be a number or None")
+        if timeout_seconds is not None and not isinstance(timeout_seconds, int | float):
+            raise TypeError("timeout_seconds must be a number or None")
+        if deadline is not None:
+            self._deadline = float(deadline)
+        elif timeout_seconds is not None:
+            self._deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+        else:
+            self._deadline = None
 
     @property
     def terminal_reason(self) -> RequestTerminalReason | None:
@@ -389,6 +443,23 @@ class RequestController:
     def in_flight(self) -> int:
         return self._in_flight
 
+    @property
+    def runtime_capabilities(self) -> RuntimeCapabilities | None:
+        capabilities = getattr(self._runtime, "capabilities", None)
+        return capabilities if isinstance(capabilities, RuntimeCapabilities) else None
+
+    async def wait_until_runtime_ready(self, deadline: float | None) -> RuntimeReadinessResult:
+        capabilities = self.runtime_capabilities
+        if capabilities is None or not capabilities.recovery_readiness:
+            return RuntimeReadinessResult.FAILED
+        waiter = getattr(self._runtime, "wait_until_ready", None)
+        if not callable(waiter):
+            return RuntimeReadinessResult.FAILED
+        result = await waiter(deadline)
+        if not isinstance(result, RuntimeReadinessResult):
+            raise TypeError("runtime readiness waiter returned an invalid result")
+        return result
+
     def _validate_limits(self, request: RuntimeGenerationRequest) -> None:
         prompt_count = len(request.input_ids)
         output_count = request.max_new_tokens
@@ -439,6 +510,7 @@ class RequestController:
         del self._leases_by_request_id[lease.request_id]
         lease._session = None
         lease._state = _RequestLeaseState.RELEASED
+        lease._termination_event.set()
         self._in_flight -= 1
         if self._in_flight < 0:  # pragma: no cover - defensive invariant
             raise RuntimeError("request-control in-flight count became negative")
@@ -480,43 +552,75 @@ class RequestController:
             self._drained.clear()
             return lease
 
-    async def _release_reserved(self, lease: RequestLease) -> None:
+    async def _release_lease(self, lease: RequestLease) -> None:
+        session: ControlledSession | None
         async with self._lock:
             if self._leases_by_request_id.get(lease.request_id) is not lease:
                 return
-            if lease._state is _RequestLeaseState.SUBMITTED:
-                return
-            self._release_lease_locked(lease)
+            session = lease._session
+        if session is not None:
+            await session.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+        async with self._lock:
+            if self._leases_by_request_id.get(lease.request_id) is lease:
+                self._release_lease_locked(lease)
 
-    async def _release(self, session: ControlledSession) -> None:
+    async def _release_attempt(
+        self,
+        session: ControlledSession,
+        *,
+        final_release: bool,
+    ) -> None:
         async with self._lock:
             lease = self._leases_by_request_id.get(session.request_id)
             if lease is None or lease._session is not session:
                 return
-            self._release_lease_locked(lease)
+            self._sessions.discard(session)
+            if self._sessions_by_request_id.get(session.request_id) is session:
+                del self._sessions_by_request_id[session.request_id]
+            lease._session = None
+            if final_release or self._closed:
+                self._release_lease_locked(lease)
 
     async def _submit_reserved(
-        self, lease: RequestLease, request: RuntimeGenerationRequest
+        self,
+        lease: RequestLease,
+        request: RuntimeGenerationRequest,
+        *,
+        final_release_on_terminal: bool = False,
     ) -> ControlledSession:
-        try:
-            self._validate_limits(request)
-        except BaseException:
-            await self._release_reserved(lease)
-            raise
+        self._validate_limits(request)
 
         runtime_session: RuntimeSessionLike | None = None
         setup_error: BaseException | None = None
         async with self._lock:
-            if self._leases_by_request_id.get(lease.request_id) is not lease:
-                raise RuntimeError("request lease is no longer active")
-            if lease._state is not _RequestLeaseState.RESERVED:
-                raise RuntimeError("request lease has already been submitted")
             if self._closed:
-                self._release_lease_locked(lease)
                 raise _rejection(
                     ErrorCategory.OVERLOADED,
                     "server_shutting_down",
                     "Server is shutting down.",
+                    retryable=True,
+                )
+            if self._leases_by_request_id.get(lease.request_id) is not lease:
+                raise RuntimeError("request lease is no longer active")
+            if lease._state is _RequestLeaseState.RELEASED:
+                raise RuntimeError("request lease is no longer active")
+            if lease._session is not None:
+                raise RuntimeError("request lease already has an active attempt")
+            if lease._deadline is None and self._config.timeout_seconds is not None:
+                lease._deadline = asyncio.get_running_loop().time() + float(
+                    self._config.timeout_seconds
+                )
+            if (
+                lease._deadline is not None
+                and asyncio.get_running_loop().time() >= lease._deadline
+            ):
+                if lease._terminal_reason is None:
+                    lease._terminal_reason = RequestTerminalReason.TIMEOUT
+                lease._termination_event.set()
+                raise _rejection(
+                    ErrorCategory.RUNTIME_FAILURE,
+                    "request_timeout",
+                    "Inference request exceeded its serving deadline.",
                     retryable=True,
                 )
 
@@ -528,17 +632,18 @@ class RequestController:
                     injection_allowed=(
                         request.output_json_schema is None and request.generation_constraint is None
                     ),
-                    timeout_seconds=self._config.timeout_seconds,
-                    release=self._release,
+                    deadline=lease._deadline,
+                    release=partial(
+                        self._release_attempt,
+                        final_release=final_release_on_terminal,
+                    ),
                 )
             except RuntimeUnavailable as exc:
-                self._release_lease_locked(lease)
-                raise RequestRejected(exc.error) from exc
+                raise RequestRejected(exc.error, attempt_started=True) from exc
             except BaseException as exc:  # noqa: BLE001 - runtime ownership rollback boundary
-                self._release_lease_locked(lease)
                 setup_error = exc
             else:
-                lease._state = _RequestLeaseState.SUBMITTED
+                lease._state = _RequestLeaseState.ACTIVE
                 lease._session = controlled
                 self._sessions.add(controlled)
                 self._sessions_by_request_id[request.request_id] = controlled
@@ -563,7 +668,11 @@ class RequestController:
             raise TypeError("request must be a RuntimeGenerationRequest")
         lease = await self.acquire(request.request_id)
         try:
-            return await lease.submit(request)
+            return await self._submit_reserved(
+                lease,
+                request,
+                final_release_on_terminal=True,
+            )
         except BaseException:
             await lease.release()
             raise
@@ -580,9 +689,12 @@ class RequestController:
 
         async with self._lock:
             session = self._sessions_by_request_id.get(request_id)
-        if session is None:
-            raise RequestInjectionNotFound(request_id)
-        session.inject_text(text)
+            if session is None:
+                raise RequestInjectionNotFound(request_id)
+            session.inject_text(text)
+            lease = self._leases_by_request_id.get(request_id)
+            if lease is not None:
+                lease._replay_safe = False
 
     async def close(
         self,
@@ -597,6 +709,10 @@ class RequestController:
                 return
             self._closed = True
             sessions = tuple(self._sessions)
+            for lease in self._leases_by_request_id.values():
+                if lease._terminal_reason is None:
+                    lease._terminal_reason = reason
+                lease._termination_event.set()
 
         if sessions:
             await asyncio.gather(*(session.cancel(reason) for session in sessions))

@@ -41,6 +41,7 @@ from exqserve.model.contracts import (
     NativeTokenConstraintIntegrityError,
     NativeTokenProvenanceError,
     ParserAmbiguityDetail,
+    ParserConstraintScope,
     ParserCreationContext,
     ParserTerminalIssue,
     ParserTerminalIssueKind,
@@ -649,6 +650,7 @@ class _QwenMarkerBoundaryTracker:
             self._terminal_issue = ParserTerminalIssue(
                 ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
                 ParserAmbiguityDetail.HOLD_LIMIT,
+                ParserConstraintScope.OUTSIDE_TOOL,
             )
 
     def _clear_unresolved(self) -> None:
@@ -665,6 +667,7 @@ class _QwenMarkerBoundaryTracker:
             self._terminal_issue = ParserTerminalIssue(
                 ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
                 ParserAmbiguityDetail.HOLD_LIMIT,
+                ParserConstraintScope.OUTSIDE_TOOL,
             )
             return False
         self._held_bytes += width
@@ -837,6 +840,7 @@ class _QwenMarkerBoundaryTracker:
                 self._terminal_issue = ParserTerminalIssue(
                     ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
                     ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+                    ParserConstraintScope.OUTSIDE_TOOL,
                 )
                 return marker, _QwenMarkerDisposition.PENDING
             return marker, _QwenMarkerDisposition.FAIL_CLOSED
@@ -1296,11 +1300,13 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 self._protocol_terminal_issue = ParserTerminalIssue(
                     ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
                     ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+                    ParserConstraintScope.TOOL,
                 )
             elif shared_result.issue_code == "compatibility_semantic_work_exceeded":
                 self._protocol_terminal_issue = ParserTerminalIssue(
                     ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
                     ParserAmbiguityDetail.HOLD_LIMIT,
+                    ParserConstraintScope.TOOL,
                 )
             else:
                 self._had_incomplete_tool = True

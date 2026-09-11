@@ -142,6 +142,36 @@ class MetricsRegistry:
             "Capture sink failures isolated from serving responses.",
             registry=self.registry,
         )
+        self._recovery_attempts = Counter(
+            "exqserve_recovery_attempts",
+            "Started bounded inference recovery attempts by kind and failure cause.",
+            ("kind", "cause"),
+            registry=self.registry,
+        )
+        self._recovery_success = Counter(
+            "exqserve_recovery_success",
+            "Successful bounded inference recoveries by kind and original failure cause.",
+            ("kind", "cause"),
+            registry=self.registry,
+        )
+        self._recovery_exhausted = Counter(
+            "exqserve_recovery_exhausted",
+            "Bounded inference recoveries that exhausted their extra-attempt budget.",
+            ("kind", "cause"),
+            registry=self.registry,
+        )
+        self._recovery_skipped = Counter(
+            "exqserve_recovery_skipped",
+            "Inference recovery opportunities skipped for a bounded policy reason.",
+            ("reason",),
+            registry=self.registry,
+        )
+        self._unclassified_terminal = Counter(
+            "exqserve_unclassified_terminal",
+            "Serving terminal failures without a typed FailureCause.",
+            ("surface",),
+            registry=self.registry,
+        )
         self._engine_state = Gauge(
             "exqserve_engine_state",
             "Current runtime Generator lifecycle state.",
@@ -238,6 +268,23 @@ class MetricsRegistry:
 
     def capture_failed(self) -> None:
         self._capture_failures.inc()
+
+    def recovery_attempt(self, kind: str, cause: str) -> None:
+        self._recovery_attempts.labels(kind=kind, cause=cause).inc()
+
+    def recovery_success(self, kind: str, cause: str) -> None:
+        self._recovery_success.labels(kind=kind, cause=cause).inc()
+
+    def recovery_exhausted(self, kind: str, cause: str) -> None:
+        self._recovery_exhausted.labels(kind=kind, cause=cause).inc()
+
+    def recovery_skipped(self, reason: str) -> None:
+        self._recovery_skipped.labels(reason=reason).inc()
+
+    def unclassified_terminal(self, surface: str) -> None:
+        if surface not in {"serving", "submission"}:
+            raise ValueError("surface must be serving or submission")
+        self._unclassified_terminal.labels(surface=surface).inc()
 
     def request_finished(self, status: str, elapsed_seconds: float) -> None:
         if status not in _TERMINAL_STATUSES - {"rejected"}:

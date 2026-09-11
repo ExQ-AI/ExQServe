@@ -9,6 +9,7 @@ from exqserve.core.errors import FailureCause
 from exqserve.runtime.contracts import (
     ExLlamaV3LoadConfig,
     RuntimeGenerationRequest,
+    RuntimeReadinessResult,
     RuntimeUnavailable,
 )
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime, RuntimeSession
@@ -151,6 +152,92 @@ def test_generator_recovery_replaces_only_generator_and_reuses_loaded_resources(
         assert failed.generator.clear_queue_calls == 1
         assert replacement.args == failed.args
         assert replacement.kwargs == failed.kwargs
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_wait_until_ready_without_deadline_is_unavailable_and_leaves_recovery_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        runtime = _make_runtime(monkeypatch)
+        _submit(runtime, "req-ready")
+        failed = _RecoveryAsyncGenerator.instances[-1]
+        failed.error = RuntimeError("shared generator failed")
+        failed.close_entered = asyncio.Event()
+        failed.close_release = asyncio.Event()
+        runtime._begin_generator_recovery(failed)
+        recovery_task = runtime._recovery_task
+        assert recovery_task is not None
+        await failed.close_entered.wait()
+
+        assert await runtime.wait_until_ready(None) is RuntimeReadinessResult.FAILED
+        assert runtime._recovery_task is recovery_task
+        assert recovery_task.done() is False
+
+        failed.close_release.set()
+        await recovery_task
+        assert runtime._recovery_task is None
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_wait_until_ready_with_finite_deadline_waits_on_existing_task_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        runtime = _make_runtime(monkeypatch)
+        _submit(runtime, "req-ready-finite")
+        failed = _RecoveryAsyncGenerator.instances[-1]
+        failed.error = RuntimeError("shared generator failed")
+        failed.close_entered = asyncio.Event()
+        failed.close_release = asyncio.Event()
+        runtime._begin_generator_recovery(failed)
+        recovery_task = runtime._recovery_task
+        assert recovery_task is not None
+        await failed.close_entered.wait()
+
+        waiter = asyncio.create_task(
+            runtime.wait_until_ready(asyncio.get_running_loop().time() + 1.0)
+        )
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+        assert runtime._recovery_task is recovery_task
+
+        failed.close_release.set()
+        assert await waiter is RuntimeReadinessResult.READY
+        assert recovery_task.done() is True
+        assert runtime._recovery_task is None
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_wait_until_ready_deadline_does_not_spawn_or_cancel_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        runtime = _make_runtime(monkeypatch)
+        _submit(runtime, "req-deadline")
+        failed = _RecoveryAsyncGenerator.instances[-1]
+        failed.error = RuntimeError("shared generator failed")
+        failed.close_entered = asyncio.Event()
+        failed.close_release = asyncio.Event()
+        runtime._begin_generator_recovery(failed)
+        recovery_task = runtime._recovery_task
+        assert recovery_task is not None
+        await failed.close_entered.wait()
+
+        deadline = asyncio.get_running_loop().time() + 0.01
+        assert await runtime.wait_until_ready(deadline) is RuntimeReadinessResult.DEADLINE
+        assert runtime._recovery_task is recovery_task
+        assert recovery_task.done() is False
+
+        failed.close_release.set()
+        await recovery_task
+        assert runtime._recovery_task is None
         await runtime.close()
 
     asyncio.run(scenario())

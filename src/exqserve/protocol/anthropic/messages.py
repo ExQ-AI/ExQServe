@@ -30,7 +30,7 @@ from exqserve.core.items import (
 from exqserve.core.request import CanonicalRequest
 from exqserve.protocol.anthropic.common import ParsedAnthropicRequest, invalid_request
 from exqserve.runtime.contracts import RuntimeSamplingConfig
-from exqserve.serving.contracts import MidSystemPolicy, ServingRequest
+from exqserve.serving.contracts import MidSystemPolicy, ServingRequest, ServingVisibilityMode
 
 CLAUDE_CODE_COMPATIBILITY_PROFILE = "claude-code"
 CLAUDE_CODE_2_1_251_COMPATIBILITY_PROFILE = "claude-code-2.1.251"
@@ -456,6 +456,11 @@ class AnthropicMessagesRequestAdapter:
             stop_conditions=_parse_stop_sequences(body.get("stop_sequences")),
             reasoning_budget=reasoning_budget,
             mid_system_policy=self._mid_system_policy,
+            visibility_mode=(
+                ServingVisibilityMode.STREAMING
+                if stream
+                else ServingVisibilityMode.BUFFERED
+            ),
         )
         return ParsedAnthropicRequest(serving, model, stream, omit_thinking)
 

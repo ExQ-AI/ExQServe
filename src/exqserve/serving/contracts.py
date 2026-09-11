@@ -27,6 +27,7 @@ __all__ = (
     "ServingRejected",
     "ServingRequest",
     "ServingSessionLike",
+    "ServingVisibilityMode",
     "TokenCountingServingEngineLike",
 )
 
@@ -47,6 +48,12 @@ class BestEffortMidSystemLowering(str, Enum):
     IN_PLACE_USER_META = "in_place_user_meta"
 
 
+class ServingVisibilityMode(str, Enum):
+    UNKNOWN = "unknown"
+    STREAMING = "streaming"
+    BUFFERED = "buffered"
+
+
 @dataclass(frozen=True, slots=True)
 class ServingRequest:
     input: CanonicalRequest
@@ -59,6 +66,7 @@ class ServingRequest:
     stop_conditions: tuple[str | int, ...] = ()
     reasoning_budget: ReasoningBudgetOverride = field(default_factory=ReasoningBudgetOverride)
     mid_system_policy: MidSystemPolicy = MidSystemPolicy.LEGACY_UNSPECIFIED
+    visibility_mode: ServingVisibilityMode = ServingVisibilityMode.UNKNOWN
 
     def __post_init__(self) -> None:
         if not isinstance(self.input, CanonicalRequest):
@@ -86,6 +94,8 @@ class ServingRequest:
             raise TypeError("reasoning_budget must be a ReasoningBudgetOverride")
         if not isinstance(self.mid_system_policy, MidSystemPolicy):
             raise TypeError("mid_system_policy must be a MidSystemPolicy")
+        if not isinstance(self.visibility_mode, ServingVisibilityMode):
+            raise TypeError("visibility_mode must be a ServingVisibilityMode")
         if not isinstance(self.stop_conditions, tuple):
             raise TypeError("stop_conditions must be a tuple")
         for condition in self.stop_conditions:
@@ -135,10 +145,20 @@ class RawServingRequest:
 
 
 class ServingRejected(Exception):
-    def __init__(self, error: CanonicalError) -> None:
+    def __init__(
+        self,
+        error: CanonicalError,
+        *,
+        attempt_started: bool = False,
+        execution_diagnostics: object | None = None,
+    ) -> None:
         if not isinstance(error, CanonicalError):
             raise TypeError("error must be a CanonicalError")
+        if not isinstance(attempt_started, bool):
+            raise TypeError("attempt_started must be a bool")
         self.error = error
+        self.attempt_started = attempt_started
+        self.execution_diagnostics = execution_diagnostics
         self.terminal_decision: TerminalDecision = request_rejection_decision(error)
         super().__init__(error.message)
 
