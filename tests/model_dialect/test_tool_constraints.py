@@ -49,6 +49,18 @@ def _qwen_schema() -> str:
     )
 
 
+def _qwen_sound_schema() -> str:
+    return (
+        '{"type":"object","properties":{'
+        '"command":{"type":"string","enum":["run","check"]},'
+        '"count":{"type":"integer","minimum":1},'
+        '"enabled":{"type":"boolean"},'
+        '"fixed":{"type":"string","const":"stable"},'
+        '"mode":{"type":"string","enum":["fast","safe"]}'
+        '},"required":["command","count","fixed","mode"],"additionalProperties":false}'
+    )
+
+
 def test_constraint_modes_are_stable() -> None:
     assert [mode.value for mode in ToolConstraintMode] == ["off", "format", "schema"]
     assert [guarantee.value for guarantee in ToolConstraintGuarantee] == [
@@ -59,9 +71,9 @@ def test_constraint_modes_are_stable() -> None:
     ]
 
 
-def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
+def test_qwen_schema_constraint_uses_native_parameter_envelope_when_sound() -> None:
     constraint = qwen_tool_constraint(
-        _policy(_tool("save", _qwen_schema()), parallel=False),
+        _policy(_tool("save", _qwen_sound_schema()), parallel=False),
         ToolConstraintMode.SCHEMA,
     )
 
@@ -73,10 +85,12 @@ def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
     assert '"<parameter=count>"' in constraint.lark_grammar
     assert '"<parameter=mode>"' in constraint.lark_grammar
     assert '"minimum":1' in constraint.lark_grammar
-    assert 'qwen_raw_string[suffix="</parameter>"]' in constraint.lark_grammar
+    assert 'qwen_raw_string[suffix="</parameter>"]' not in constraint.lark_grammar
+    assert '("check" | "run")' in constraint.lark_grammar
     assert '("fast" | "safe")' in constraint.lark_grammar
+    assert '"stable"' in constraint.lark_grammar
     assert "%json" in constraint.lark_grammar
-    assert "function_0_parameter_2?" in constraint.lark_grammar
+    assert "function_0_parameter_3" in constraint.lark_grammar
     assert "start: WS? function WS? </tool_call>" in constraint.lark_grammar
     assert '"</tool_call>"' not in constraint.lark_grammar
     assert "<tool_call> WS? function" not in constraint.lark_grammar
@@ -85,13 +99,55 @@ def test_qwen_schema_constraint_uses_native_parameter_envelope() -> None:
 
 def test_qwen_constraint_bounds_structural_whitespace() -> None:
     constraint = qwen_tool_constraint(
-        _policy(_tool("save", _qwen_schema()), parallel=False),
+        _policy(_tool("save", _qwen_sound_schema()), parallel=False),
         ToolConstraintMode.SCHEMA,
     )
 
     assert constraint is not None
     assert "WS: /[ \\t\\r\\n]{1,8}/" in constraint.lark_grammar
     assert "WS: /[ \\t\\r\\n]+/" not in constraint.lark_grammar
+
+
+def test_qwen_schema_constraint_falls_back_request_wide_for_unrestricted_raw_strings() -> None:
+    write_schema = (
+        '{"type":"object","properties":{'
+        '"content":{"type":"string"},"file_path":{"type":"string"}'
+        '},"required":["content","file_path"],"additionalProperties":false}'
+    )
+
+    assert (
+        qwen_tool_constraint(
+            _policy(_tool("write", write_schema), parallel=False),
+            ToolConstraintMode.SCHEMA,
+        )
+        is None
+    )
+
+
+def test_qwen_strict_raw_string_schema_is_unsupported() -> None:
+    with pytest.raises(ToolConstraintUnsupported, match="unrestricted raw string"):
+        qwen_tool_constraint(
+            _policy(_tool("write", _qwen_schema(), strict=True), parallel=False),
+            ToolConstraintMode.SCHEMA,
+        )
+
+
+def test_qwen_mixed_sound_and_raw_string_tools_fall_back_request_wide() -> None:
+    safe_schema = (
+        '{"type":"object","properties":{"count":{"type":"integer"}},'
+        '"required":["count"],"additionalProperties":false}'
+    )
+    assert (
+        qwen_tool_constraint(
+            _policy(
+                _tool("safe", safe_schema),
+                _tool("write", _qwen_schema()),
+                parallel=True,
+            ),
+            ToolConstraintMode.SCHEMA,
+        )
+        is None
+    )
 
 
 def test_qwen_schema_mode_rejects_unrepresentable_native_string_keywords() -> None:
@@ -127,7 +183,7 @@ def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
     mode: ToolConstraintMode,
 ) -> None:
     constraint = qwen_tool_constraint(
-        _policy(_tool("save", _qwen_schema()), parallel=True),
+        _policy(_tool("save", _qwen_sound_schema()), parallel=True),
         mode,
     )
 
@@ -138,7 +194,7 @@ def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
     ) in constraint.lark_grammar
 
     strict_constraint = qwen_tool_constraint(
-        _policy(_tool("save", _qwen_schema(), strict=True), parallel=True),
+        _policy(_tool("save", _qwen_sound_schema(), strict=True), parallel=True),
         ToolConstraintMode.OFF,
     )
     assert strict_constraint is not None
@@ -155,7 +211,7 @@ def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
 
 def test_qwen_strict_tool_escalates_off_baseline_to_schema() -> None:
     constraint = qwen_tool_constraint(
-        _policy(_tool("save", _qwen_schema(), strict=True), parallel=False),
+        _policy(_tool("save", _qwen_sound_schema(), strict=True), parallel=False),
         ToolConstraintMode.OFF,
     )
 
@@ -367,7 +423,7 @@ def test_gemma_constraint_rejects_every_name_the_native_parser_rejects(name: str
 def test_constraint_lark_grammars_compile_when_llguidance_is_installed() -> None:
     llguidance = pytest.importorskip("llguidance")
     policy = _policy(_tool("save", _schema()))
-    qwen_policy = _policy(_tool("qwen_save", _qwen_schema()))
+    qwen_policy = _policy(_tool("qwen_save", _qwen_sound_schema()))
     ref_policy = _policy(
         _tool(
             "ref_save",

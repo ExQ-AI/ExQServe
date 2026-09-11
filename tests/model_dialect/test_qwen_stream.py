@@ -5,7 +5,7 @@ from collections.abc import Iterable
 
 import pytest
 
-from exqserve.agent._json import canonical_json_dumps
+from exqserve.agent._json import canonical_json_dumps, parse_json_strict
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.events import (
@@ -345,7 +345,7 @@ def test_truncated_tool_after_safe_parameter_never_fabricates_completion() -> No
     )
 
     assert incomplete is True
-    assert sum(isinstance(event, ToolCallStarted) for event in events) == 1
+    assert not any(isinstance(event, ToolCallStarted) for event in events)
     assert not any(isinstance(event, ToolCallCompleted) for event in events)
 
 
@@ -717,6 +717,120 @@ def test_back_to_back_tool_calls_keep_order_across_splits() -> None:
         assert [(call.call.name, call.call.arguments_json) for call in calls] == [
             ("a", '{"x":1}'),
             ("b", '{"y":2}'),
+        ], split
+
+
+@pytest.mark.parametrize(
+    ("second_name", "second_parameters", "second_json"),
+    (
+        ("Grep", "<parameter=a>3</parameter>", '{"a":3}'),
+        (
+            "Grep",
+            "<parameter=a>3</parameter><parameter=b>content</parameter>",
+            '{"a":3,"b":"content"}',
+        ),
+        (
+            "Grep",
+            (
+                "<parameter=a>3</parameter><parameter=b>content</parameter>"
+                "<parameter=c>/p</parameter><parameter=d>z</parameter>"
+            ),
+            '{"a":3,"b":"content","c":"/p","d":"z"}',
+        ),
+        (
+            "Glob",
+            (
+                "<parameter=pattern>y</parameter><parameter=offset>2</parameter>"
+                "<parameter=limit>4</parameter><parameter=kind>py</parameter>"
+            ),
+            '{"pattern":"y","offset":2,"limit":4,"kind":"py"}',
+        ),
+    ),
+)
+def test_back_to_back_tool_boundary_is_independent_of_later_parameter_arity_across_splits(
+    second_name: str,
+    second_parameters: str,
+    second_json: str,
+) -> None:
+    first = "<tool_call><function=Glob><parameter=pattern>x</parameter></function></tool_call>"
+    second = f"<tool_call><function={second_name}>{second_parameters}</function></tool_call>"
+    source = first + second
+
+    for split in range(len(source) + 1):
+        events, incomplete = _parse([source[:split], source[split:]])
+        assert incomplete is False, split
+        assert [(call.call.name, call.call.arguments_json) for call in _completed_calls(events)] == [
+            ("Glob", '{"pattern":"x"}'),
+            (second_name, second_json),
+        ], split
+
+
+def test_back_to_back_disjoint_exhaustive_schemas_do_not_cross_tool_boundaries() -> None:
+    glob = FunctionTool(
+        "Glob",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"pattern":{"type":"string"}},'
+            '"required":["pattern"],"additionalProperties":false}'
+        ),
+    )
+    grep = FunctionTool(
+        "Grep",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"a":{"type":"integer"},"b":{"type":"string"},'
+            '"c":{"type":"string"},"d":{"type":"string"}},'
+            '"required":["a","b","c","d"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((glob, grep), ToolChoice(ToolChoiceMode.AUTO), True)
+    source = (
+        "<tool_call><function=Glob><parameter=pattern>x</parameter></function></tool_call>"
+        "<tool_call><function=Grep><parameter=a>3</parameter><parameter=b>content</parameter>"
+        "<parameter=c>/p</parameter><parameter=d>z</parameter></function></tool_call>"
+    )
+
+    for split in range(len(source) + 1):
+        events, incomplete = _parse(
+            [source[:split], source[split:]],
+            tool_policy=policy,
+        )
+        assert incomplete is False, split
+        assert [(call.call.name, call.call.arguments_json) for call in _completed_calls(events)] == [
+            ("Glob", '{"pattern":"x"}'),
+            ("Grep", '{"a":3,"b":"content","c":"/p","d":"z"}'),
+        ], split
+
+
+def test_back_to_back_same_name_overlapping_exhaustive_schema_keeps_indices_across_splits() -> None:
+    read_tool = FunctionTool(
+        "read",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"file_path":{"type":"string"},"offset":{"type":"integer"}},'
+            '"required":["file_path","offset"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((read_tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    source = (
+        "<tool_call><function=read><parameter=file_path>/a</parameter>"
+        "<parameter=offset>701</parameter></function></tool_call>"
+        "<tool_call><function=read><parameter=file_path>/b</parameter>"
+        "<parameter=offset>702</parameter></function></tool_call>"
+    )
+
+    for split in range(len(source) + 1):
+        events, incomplete = _parse(
+            [source[:split], source[split:]],
+            tool_policy=policy,
+        )
+        calls = _completed_calls(events)
+        assert incomplete is False, split
+        assert [(call.call.index, call.call.arguments_json) for call in calls] == [
+            (0, '{"file_path":"/a","offset":701}'),
+            (1, '{"file_path":"/b","offset":702}'),
         ], split
 
 
@@ -1095,6 +1209,19 @@ def _native_tool_spans(text: str) -> tuple[NativeTokenSpan, ...]:
         cursor = start + len(marker)
 
 
+def _native_tool_boundary_spans(text: str) -> tuple[NativeTokenSpan, ...]:
+    spans: list[NativeTokenSpan] = []
+    for marker, token_id in (("<tool_call>", 248058), ("</tool_call>", 248059)):
+        cursor = 0
+        while True:
+            start = text.find(marker, cursor)
+            if start < 0:
+                break
+            spans.append(NativeTokenSpan(start, start + len(marker), token_id, marker))
+            cursor = start + len(marker)
+    return tuple(sorted(spans, key=lambda span: span.start))
+
+
 def test_native_aware_marker_is_candidate_with_backtick_literal_veto() -> None:
     parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
     first = "The format is `</think>` and still reasoning.\n"
@@ -1322,6 +1449,361 @@ def test_native_aware_back_to_back_tool_calls_preserve_verified_second_opener() 
     ]
     assert "<tool_call>" not in _text(events)
     assert "<function=" not in _text(events)
+
+
+def test_native_verified_close_and_next_opener_commit_first_multiparam_tool_before_second_finishes() -> None:
+    parser = QwenIncrementalParser("req-native-multiparam-boundary")
+    first = (
+        "<tool_call><function=read><parameter=file_path>/a</parameter>"
+        "<parameter=offset>701</parameter></function></tool_call>"
+    )
+    second_prefix = "\n<tool_call><function=read><parameter=file_path>/b</parameter><parameter=offset>"
+
+    first_events = list(
+        parser.feed_with_native_tokens(first, _native_tool_boundary_spans(first))
+    )
+    assert first_events == []
+
+    second_events = list(
+        parser.feed_with_native_tokens(
+            second_prefix,
+            _native_tool_boundary_spans(second_prefix),
+        )
+    )
+    first_calls = _completed_calls(second_events)
+    assert [(call.call.index, call.call.name, call.call.arguments_json) for call in first_calls] == [
+        (0, "read", '{"file_path":"/a","offset":701}'),
+    ]
+    assert [event.index for event in second_events if isinstance(event, ToolCallStarted)] == [0]
+
+    finished = parser.finish()
+    all_events = [*first_events, *second_events, *finished.events]
+    assert finished.incomplete_tool_call is True
+    assert [call.call.index for call in _completed_calls(all_events)] == [0]
+    assert [event.index for event in all_events if isinstance(event, ToolCallStarted)] == [0]
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    (
+        (
+            "<tool_call><function=read><parameter=file_path>/a</parameter>",
+            "<parameter=offset>701</parameter></function></tool_call>\n<tool_call>",
+            "<function=read><parameter=file_path>/b</parameter><parameter=offset>702</parameter>",
+            "</function></tool_call>",
+        ),
+        (
+            "<tool_call><function=read><parameter=file_path>/a</parameter><parameter=offset>701",
+            "</parameter></function></tool_call>\n",
+            "<tool_call><function=read><parameter=file_path>/b</parameter>",
+            "<parameter=offset>702</parameter></function></tool_call>",
+        ),
+    ),
+)
+def test_native_verified_multiparam_back_to_back_is_chunk_invariant(
+    chunks: tuple[str, ...],
+) -> None:
+    parser = QwenIncrementalParser("req-native-multiparam-chunks")
+    events: list[GenerationEvent] = []
+    for chunk in chunks:
+        events.extend(
+            parser.feed_with_native_tokens(chunk, _native_tool_boundary_spans(chunk))
+        )
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.incomplete_tool_call is False
+    assert [(call.call.index, call.call.arguments_json) for call in _completed_calls(events)] == [
+        (0, '{"file_path":"/a","offset":701}'),
+        (1, '{"file_path":"/b","offset":702}'),
+    ]
+    assert [event.index for event in events if isinstance(event, ToolCallStarted)] == [0, 1]
+
+
+def test_frozen_dsh_night_record10_commits_first_read_without_duplicate_second_start() -> None:
+    read_tool = FunctionTool(
+        "read",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"file_path":{"type":"string"},"offset":{"type":"number"},'
+            '"limit":{"type":"number"}},"required":["file_path"]}'
+        ),
+    )
+    policy = ToolPolicy((read_tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    parser = QwenIncrementalParser(
+        "req_a250bbf935f647aeaf3941c6c56852b4",
+        start_in_reasoning=True,
+        tool_policy=policy,
+    )
+    chunks = (
+        (
+            "This is a massive parser. Let me keep reading qwen.py. This is",
+            (),
+        ),
+        (
+            " probably the core of the incremental parser. Let me continue reading through the rest.",
+            (),
+        ),
+        (
+            "\n</think>\n\n<tool_call>\n<function=read>\n<parameter=file_path>\n",
+            (
+                NativeTokenSpan(1, 9, 248069, "</think>"),
+                NativeTokenSpan(11, 22, 248058, "<tool_call>"),
+            ),
+        ),
+        ("/root/workspace/.ai-bridge/night-code-review-runs/night-review-", ()),
+        ("20260903-154041/target", ()),
+        ("/src/exqserve/model/qwen.py\n</parameter>\n<parameter=", ()),
+        ("offset>\n701\n</parameter>\n</function>\n  \n", ()),
+        (
+            "  \n\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=file_path>\n",
+            (
+                NativeTokenSpan(4, 16, 248059, "</tool_call>"),
+                NativeTokenSpan(17, 28, 248058, "<tool_call>"),
+            ),
+        ),
+        ("/root/workspace/.ai-bridge/night-code-review-runs/night-review-", ()),
+        ("20260903-154041/target", ()),
+        ("/src/exqserve/model/qwen.py\n</parameter>\n<parameter=", ()),
+        ("offset>\n701\n</parameter>\n</function>\n  \n", ()),
+    )
+
+    events: list[GenerationEvent] = []
+    for chunk, spans in chunks:
+        events.extend(parser.feed_with_native_tokens(chunk, spans))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    calls = _completed_calls(events)
+    assert finished.incomplete_tool_call is True
+    assert [(call.call.index, call.call.name, call.call.arguments_json) for call in calls] == [
+        (
+            0,
+            "read",
+            canonical_json_dumps(
+                {
+                    "file_path": (
+                        "/root/workspace/.ai-bridge/night-code-review-runs/"
+                        "night-review-20260903-154041/target/src/exqserve/model/qwen.py"
+                    ),
+                    "offset": 701,
+                }
+            ),
+        )
+    ]
+    assert [event.index for event in events if isinstance(event, ToolCallStarted)] == [0]
+
+
+def test_native_verified_literal_close_and_fake_opener_do_not_commit_tool_boundary() -> None:
+    parser = QwenIncrementalParser("req-native-literal-boundary-veto")
+    prefix = (
+        "<tool_call><function=bash><parameter=command>before `"
+        "</parameter></function></tool_call><tool_call>"
+    )
+    events = list(
+        parser.feed_with_native_tokens(prefix, _native_tool_boundary_spans(prefix))
+    )
+
+    assert _completed_calls(events) == []
+    assert not any(isinstance(event, ToolCallStarted) for event in events)
+
+
+def test_native_verified_dual_valid_quoted_raw_boundary_fails_explicit_ambiguity() -> None:
+    write_tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"content":{"type":"string"},"file_path":{"type":"string"}},'
+            '"required":["content","file_path"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((write_tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    content_prefix = (
+        'sources = {"single": "'
+        "<tool_call><function=list_files><parameter=path>/tmp</parameter>"
+        "<parameter=file_path>\n</parameter></function>\n</tool_call>\n<tool_call>\n"
+    )
+    prefix = "<tool_call><function=write><parameter=content>" + content_prefix
+    suffix = (
+        '"}</parameter><parameter=file_path>/tmp/harness.py</parameter>'
+        "</function></tool_call>"
+    )
+    parser = QwenIncrementalParser("req-native-quoted-raw-boundary", tool_policy=policy)
+
+    events = list(parser.feed_with_native_tokens(prefix, _native_tool_boundary_spans(prefix)))
+    assert parser.early_terminal_issue is None
+    assert _completed_calls(events) == []
+    assert not any(isinstance(event, ToolCallStarted) for event in events)
+
+    events.extend(parser.feed_with_native_tokens(suffix, _native_tool_boundary_spans(suffix)))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.incomplete_tool_call is False
+    assert finished.protocol_terminal_issue is not None
+    assert finished.protocol_terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert (
+        finished.protocol_terminal_issue.ambiguity_detail
+        is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+    )
+    assert not any(
+        isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        (
+            "source = '<tool_call><function=fake><parameter=x>1</parameter>"
+            "</function></tool_call><tool_call>'"
+        ),
+        (
+            "source = '''<tool_call><function=fake><parameter=x>1</parameter>"
+            "</function></tool_call><tool_call>'''"
+        ),
+    ),
+)
+def test_native_fake_boundary_inside_non_json_quote_raw_parameter_stays_data(
+    literal: str,
+) -> None:
+    write_tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"content":{"type":"string"},"file_path":{"type":"string"}},'
+            '"required":["content","file_path"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((write_tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        + literal
+        + "</parameter><parameter=file_path>/tmp/harness.py</parameter>"
+        "</function></tool_call>"
+    )
+    parser = QwenIncrementalParser("req-native-non-json-quote", tool_policy=policy)
+
+    events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    calls = _completed_calls(events)
+    assert finished.terminal_issue is None
+    assert len(calls) == 1
+    assert calls[0].call.arguments_json == canonical_json_dumps(
+        {"content": literal, "file_path": "/tmp/harness.py"}
+    )
+    assert [event.index for event in events if isinstance(event, ToolCallStarted)] == [0]
+
+
+def test_unmatched_double_quote_inside_raw_string_does_not_hide_real_tool_close() -> None:
+    edit_tool = FunctionTool(
+        "edit",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"file_path":{"type":"string"},"old_string":{"type":"string"},'
+            '"new_string":{"type":"string"}},'
+            '"required":["file_path","old_string","new_string"],'
+            '"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((edit_tool,), ToolChoice(ToolChoiceMode.AUTO), True)
+    new_string = "cases.append(('unbalanced-quote', 'say \"hi'))"
+    source = (
+        "<tool_call><function=edit>"
+        "<parameter=file_path>/tmp/fuzz.py</parameter>"
+        "<parameter=old_string>old</parameter>"
+        f"<parameter=new_string>{new_string}</parameter>"
+        "</function></tool_call>"
+    )
+    parser = QwenIncrementalParser("req-unmatched-double", tool_policy=policy)
+
+    events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    calls = _completed_calls(events)
+    assert finished.terminal_issue is None
+    assert len(calls) == 1
+    assert parse_json_strict(calls[0].call.arguments_json) == {
+        "file_path": "/tmp/fuzz.py",
+        "old_string": "old",
+        "new_string": new_string,
+    }
+
+
+def test_dual_valid_raw_tool_decompositions_fail_explicit_ambiguity_without_side_effects() -> None:
+    write_tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((write_tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        "prefix </parameter></function></tool_call> literal suffix"
+        "</parameter></function></tool_call>"
+    )
+    parser = QwenIncrementalParser("req-dual-valid", tool_policy=policy)
+
+    events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.incomplete_tool_call is False
+    assert finished.protocol_terminal_issue is not None
+    assert finished.protocol_terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert (
+        finished.protocol_terminal_issue.ambiguity_detail
+        is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+    )
+    assert not any(
+        isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+        for event in events
+    )
+
+
+def test_dual_valid_lexically_contained_candidate_is_not_preferred_away() -> None:
+    write_tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy((write_tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    source = (
+        '<tool_call><function=write><parameter=content>'
+        'prefix "</parameter></function></tool_call>" suffix'
+        '</parameter></function></tool_call>'
+    )
+    parser = QwenIncrementalParser("req-dual-valid-lexical", tool_policy=policy)
+
+    events = list(parser.feed(source))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.incomplete_tool_call is False
+    assert finished.protocol_terminal_issue is not None
+    assert finished.protocol_terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert (
+        finished.protocol_terminal_issue.ambiguity_detail
+        is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+    )
+    assert not any(
+        isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+        for event in events
+    )
 
 
 def test_native_aware_tool_text_tool_preserves_verified_second_opener() -> None:

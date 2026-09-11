@@ -1188,7 +1188,7 @@ def test_qwen_ambiguous_full_close_never_publishes_shortened_executable_call() -
             for event in events
         )
         assert isinstance(events[-1], GenerationFailed)
-        assert events[-1].error.code == "tool_call_incomplete"
+        assert events[-1].error.code == "protocol_ambiguity"
 
     asyncio.run(scenario())
 

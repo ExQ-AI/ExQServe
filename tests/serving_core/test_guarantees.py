@@ -6,7 +6,12 @@ from exqserve.agent.schema import JsonSchema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
-from exqserve.model.contracts import ToolConstraintUnsupported, ToolGenerationConstraint
+from exqserve.model.contracts import (
+    ToolConstraintMode,
+    ToolConstraintUnsupported,
+    ToolGenerationConstraint,
+)
+from exqserve.model.qwen import qwen_tool_constraint
 from exqserve.serving.guarantees import (
     GenerationCapabilitySnapshot,
     RequestGuaranteeResolver,
@@ -152,6 +157,28 @@ def test_tool_resolver_homogeneous_constraint_reports_exact_runtime_guarantee() 
     assert plan.requested_guarantee is GenerationGuarantee.NONE
     assert plan.runtime_guarantee is GenerationGuarantee.FORMAT
     assert plan.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+
+
+def test_qwen_unsound_raw_string_schema_reuses_validation_only_fallback() -> None:
+    write = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"content":{"type":"string"},"file_path":{"type":"string"}'
+            '},"required":["content","file_path"],"additionalProperties":false}'
+        ),
+    )
+    resolver = RequestGuaranteeResolver(
+        lambda policy: qwen_tool_constraint(policy, ToolConstraintMode.SCHEMA)
+    )
+
+    plan = resolver.resolve_tool_policy(_policy(write))
+
+    assert plan.requested_guarantee is GenerationGuarantee.NONE
+    assert plan.runtime_guarantee is GenerationGuarantee.NONE
+    assert plan.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+    assert plan.constraint is None
 
 
 def test_required_and_named_non_strict_tools_do_not_request_schema_guarantee() -> None:

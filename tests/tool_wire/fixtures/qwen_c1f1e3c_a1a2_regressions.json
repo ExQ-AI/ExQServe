@@ -1,0 +1,19 @@
+{
+  "source_commit": "c1f1e3cc9988291a21e8e04904b780801fc567af",
+  "status": "stabilization_snapshot_not_final_parser_correctness",
+  "production_patch_authorized": false,
+  "cases": [
+    {
+      "id": "unique_valid_late_tool_hidden_by_lexical_pruning",
+      "required_phases": ["A1", "A2"],
+      "expected_property": "a complete unique canonical-valid late Tool interpretation must not be rejected by lexical candidate pruning",
+      "source": ".ai-bridge/QWEN-C1F1E3C-STATUS-RECONCILIATION-2026-09-04.md"
+    },
+    {
+      "id": "early_tool_commit_before_later_competing_valid_interpretation_resolves",
+      "required_phases": ["A1", "A2"],
+      "expected_property": "Tool semantics must not be committed before a competing later canonical-valid one-Tool interpretation is resolved",
+      "source": ".ai-bridge/QWEN-C1F1E3C-STATUS-RECONCILIATION-2026-09-04.md"
+    }
+  ]
+}

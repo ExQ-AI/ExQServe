@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from exqserve.agent._json import parse_json_strict
 from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode, ReasoningPolicy
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
@@ -23,6 +24,15 @@ from exqserve.model.contracts import (
     TemplateTool,
 )
 from exqserve.model.qwen import QwenPromptCompiler
+from exqserve.tool_wire import (
+    DeterministicToolWireEngine,
+    admit_tool_sequence,
+    certify_prompt_template_parity,
+)
+from exqserve.tool_wire.controls.qwen import (
+    compile_qwen_a2a_shadow,
+    qwen_a2a_prompt_observation,
+)
 
 _MODEL_ENV = "EXQSERVE_QWEN_MODEL_DIR"
 
@@ -95,6 +105,17 @@ def _tool() -> FunctionTool:
         description="List files",
         parameters=JsonSchema(
             '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}'
+        ),
+    )
+
+
+def _mixed_tool() -> FunctionTool:
+    return FunctionTool(
+        name="write",
+        description="Write content",
+        parameters=JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"},"count":{"type":"integer"}},'
+            '"required":["content","count"],"additionalProperties":false}'
         ),
     )
 
@@ -200,3 +221,143 @@ def test_qwen38_real_template_disabled_reasoning_uses_empty_think_block() -> Non
 
     assert "<think>\n\n</think>" in compiled.text
     assert compiled.input_ids
+
+
+def test_qwen38_real_template_and_tokenizer_match_a2a_shadow_facts() -> None:
+    adapter = _TransformersTemplateAdapter(_model_directory())
+    compiler = QwenPromptCompiler(adapter)
+    function = _tool()
+    policy = ToolPolicy(
+        tools=(function,),
+        choice=ToolChoice(ToolChoiceMode.AUTO),
+        allow_parallel=False,
+    )
+    request = CanonicalRequest(
+        request_id="compat-qwen38-a2a-parity",
+        model="qwen",
+        items=(
+            MessageItem(MessageRole.USER, "List /tmp"),
+            ToolCallItem("call-1", "list_files", '{"path":"/tmp"}', 0),
+            ToolResultItem("call-1", "a.txt"),
+            MessageItem(MessageRole.USER, "Continue"),
+        ),
+    )
+
+    compiled = compiler.compile(request, ReasoningPolicy(ReasoningMode.DISABLED), policy)
+    bundle = compile_qwen_a2a_shadow(policy, {"list_files": ("path",)})
+    parity = certify_prompt_template_parity(
+        bundle.spec,
+        qwen_a2a_prompt_observation(bundle.plan),
+        bundle.plan,
+    )
+
+    assert bundle.constrained
+    assert parity.is_valid
+    for marker in (
+        "<tool_call>",
+        "<function=list_files>",
+        "<parameter=path>",
+        "</parameter>",
+        "</function>",
+        "</tool_call>",
+    ):
+        assert marker in compiled.text
+    trigger_ids = adapter._codec.encode("<tool_call>", add_special_tokens=False)
+    assert trigger_ids == [248058]
+    assert bundle.spec.tool_open.native_token_ids == (248058,)
+
+
+def test_qwen38_real_template_roundtrips_a2a_raw_and_structured_semantics() -> None:
+    adapter = _TransformersTemplateAdapter(_model_directory())
+    compiler = QwenPromptCompiler(adapter)
+    function = _mixed_tool()
+    policy = ToolPolicy(
+        tools=(function,),
+        choice=ToolChoice(ToolChoiceMode.AUTO),
+        allow_parallel=False,
+    )
+    original_arguments = {"content": "hello<world", "count": 3}
+    request = CanonicalRequest(
+        request_id="compat-qwen38-a2a-semantic-roundtrip",
+        model="qwen",
+        items=(
+            MessageItem(MessageRole.USER, "Write it"),
+            ToolCallItem(
+                "call-1",
+                "write",
+                json.dumps(original_arguments, separators=(",", ":")),
+                0,
+            ),
+            ToolResultItem("call-1", "ok"),
+            MessageItem(MessageRole.USER, "Continue"),
+        ),
+    )
+
+    compiled = compiler.compile(request, ReasoningPolicy(ReasoningMode.DISABLED), policy)
+    function_start = compiled.text.index("<function=write>")
+    tool_start = compiled.text.rfind("<tool_call>", 0, function_start)
+    tool_end = compiled.text.index("</tool_call>", function_start) + len("</tool_call>")
+    tool_wire = compiled.text[tool_start:tool_end]
+    assert "<parameter=content>\nhello<world\n</parameter>" in tool_wire
+    assert "<parameter=count>\n3\n</parameter>" in tool_wire
+
+    bundle = compile_qwen_a2a_shadow(policy, {"write": ("content", "count")})
+    engine = DeterministicToolWireEngine(bundle.spec, bundle.plan)
+    for character in tool_wire:
+        engine.feed(character)
+    result = engine.finish()
+
+    assert result.is_complete and result.sequence is not None
+    assert admit_tool_sequence(bundle.spec, bundle.plan, result.sequence).is_valid
+    recovered = {
+        occurrence.name: parse_json_strict(occurrence.canonical_value_json)
+        for occurrence in result.sequence.calls[0].occurrences
+    }
+    assert recovered == original_arguments
+
+
+def test_qwen38_real_template_roundtrips_a2a_finite_raw_const() -> None:
+    adapter = _TransformersTemplateAdapter(_model_directory())
+    compiler = QwenPromptCompiler(adapter)
+    function = FunctionTool(
+        name="list_files",
+        description="List files",
+        parameters=JsonSchema(
+            '{"type":"object","properties":{"path":{"type":"string","const":"/tmp"}},'
+            '"required":["path"],"additionalProperties":false}'
+        ),
+    )
+    policy = ToolPolicy(
+        tools=(function,),
+        choice=ToolChoice(ToolChoiceMode.AUTO),
+        allow_parallel=False,
+    )
+    request = CanonicalRequest(
+        request_id="compat-qwen38-a2a-finite-roundtrip",
+        model="qwen",
+        items=(
+            MessageItem(MessageRole.USER, "List /tmp"),
+            ToolCallItem("call-1", "list_files", '{"path":"/tmp"}', 0),
+            ToolResultItem("call-1", "a.txt"),
+            MessageItem(MessageRole.USER, "Continue"),
+        ),
+    )
+
+    compiled = compiler.compile(request, ReasoningPolicy(ReasoningMode.DISABLED), policy)
+    function_start = compiled.text.index("<function=list_files>")
+    tool_start = compiled.text.rfind("<tool_call>", 0, function_start)
+    tool_end = compiled.text.index("</tool_call>", function_start) + len("</tool_call>")
+    tool_wire = compiled.text[tool_start:tool_end]
+    assert "<parameter=path>\n/tmp\n</parameter>" in tool_wire
+
+    bundle = compile_qwen_a2a_shadow(policy, {"list_files": ("path",)})
+    argument = bundle.plan.tool("list_files").arguments[0]
+    assert argument.admitted_values_json == ('"/tmp"',)
+    engine = DeterministicToolWireEngine(bundle.spec, bundle.plan)
+    engine.feed(tool_wire)
+    result = engine.finish()
+
+    assert result.is_complete and result.sequence is not None
+    assert admit_tool_sequence(bundle.spec, bundle.plan, result.sequence).is_valid
+    recovered = parse_json_strict(result.sequence.calls[0].occurrences[0].canonical_value_json)
+    assert recovered == "/tmp"
