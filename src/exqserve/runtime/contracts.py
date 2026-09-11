@@ -440,6 +440,7 @@ class RuntimeGenerationConstraint:
     trigger: str
     lark_grammar: str
     eos_after_completed: bool
+    constraint_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("trigger", "lark_grammar"):
@@ -449,6 +450,50 @@ class RuntimeGenerationConstraint:
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
         _validate_bool("eos_after_completed", self.eos_after_completed)
+        if self.constraint_fingerprint is not None:
+            if not isinstance(self.constraint_fingerprint, str):
+                raise TypeError("constraint_fingerprint must be a string or None")
+            if not self.constraint_fingerprint.strip():
+                raise ValueError("constraint_fingerprint must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ConstraintInstallation:
+    """Immutable submit-time truth about one requested hard generation constraint."""
+
+    installed: bool
+    constraint_fingerprint: str | None
+    trigger_token_ids: tuple[int, ...]
+    guarantee: GenerationGuarantee
+
+    def __post_init__(self) -> None:
+        _validate_bool("installed", self.installed)
+        if not isinstance(self.trigger_token_ids, tuple):
+            raise TypeError("trigger_token_ids must be a tuple")
+        for token_id in self.trigger_token_ids:
+            if not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0:
+                raise TypeError("trigger_token_ids must contain non-negative integers")
+        if len(set(self.trigger_token_ids)) != len(self.trigger_token_ids):
+            raise ValueError("trigger_token_ids must not contain duplicates")
+        if not isinstance(self.guarantee, GenerationGuarantee):
+            raise TypeError("guarantee must be a GenerationGuarantee")
+        if self.constraint_fingerprint is not None:
+            if not isinstance(self.constraint_fingerprint, str):
+                raise TypeError("constraint_fingerprint must be a string or None")
+            if not self.constraint_fingerprint.strip():
+                raise ValueError("constraint_fingerprint must not be empty")
+        if self.installed:
+            if self.constraint_fingerprint is None:
+                raise ValueError("installed constraints require a constraint_fingerprint")
+            if self.guarantee is GenerationGuarantee.NONE:
+                raise ValueError("installed constraints require a non-NONE guarantee")
+        else:
+            if self.trigger_token_ids:
+                raise ValueError("uninstalled constraints must not expose trigger_token_ids")
+            if self.constraint_fingerprint is not None:
+                raise ValueError("uninstalled constraints must not expose a constraint_fingerprint")
+            if self.guarantee is not GenerationGuarantee.NONE:
+                raise ValueError("uninstalled constraints must have NONE guarantee")
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,6 +749,10 @@ class RuntimeInjectionUnavailable(RuntimeError):
 
 
 class RuntimeSessionLike(Protocol):
+    @property
+    def constraint_installation(self) -> ConstraintInstallation | None:
+        ...
+
     def __aiter__(self) -> AsyncIterator[RuntimeEvent]:
         ...
 

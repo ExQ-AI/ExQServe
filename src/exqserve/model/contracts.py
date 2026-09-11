@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import string
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
@@ -390,12 +391,20 @@ class NativeTokenProvenanceError(RuntimeError):
     """Raised when Qwen structural intent cannot be resolved without guessing."""
 
 
+class NativeTokenConstraintIntegrityError(RuntimeError):
+    """Raised when native token evidence contradicts an installed constraint identity."""
+
+
 class NativeTokenAwareIncrementalParser:
     """Nominal internal opt-in for parsers that consume verified token provenance."""
 
     @property
     def early_terminal_issue(self) -> ParserTerminalIssue | None:
         return None
+
+    @property
+    def requires_native_token_provenance(self) -> bool:
+        return False
 
     def feed_with_native_tokens(
         self,
@@ -426,6 +435,8 @@ class ToolGenerationConstraint:
     lark_grammar: str
     eos_after_completed: bool
     branch_guarantees: tuple[tuple[str, ToolConstraintGuarantee], ...] | None = None
+    constraint_fingerprint: str | None = None
+    decode_authority: object | None = None
 
     def __post_init__(self) -> None:
         for name in ("trigger", "lark_grammar"):
@@ -435,6 +446,8 @@ class ToolGenerationConstraint:
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
         _validate_bool("eos_after_completed", self.eos_after_completed)
+        if self.constraint_fingerprint is not None:
+            _validate_non_empty("constraint_fingerprint", self.constraint_fingerprint)
         if self.branch_guarantees is None:
             return
         if not isinstance(self.branch_guarantees, tuple):
@@ -471,6 +484,108 @@ class ReasoningControlSpec:
     def __post_init__(self) -> None:
         _validate_non_empty("close_sequence", self.close_sequence)
         _validate_bool("initially_in_reasoning", self.initially_in_reasoning)
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedToolRegionCall:
+    name: str
+    arguments_json: str
+
+    def __post_init__(self) -> None:
+        _validate_non_empty("name", self.name)
+        _validate_non_empty("arguments_json", self.arguments_json)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRegionDecodeResult:
+    complete: bool
+    calls: tuple[DecodedToolRegionCall, ...] = ()
+    remainder: str = ""
+    raw_region: str = ""
+    issue_code: str | None = None
+    # Exact remainder-relative Tool opener positions already disproven by the decoder.
+    literal_tool_open_offsets: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_bool("complete", self.complete)
+        if not isinstance(self.calls, tuple) or not all(
+            isinstance(call, DecodedToolRegionCall) for call in self.calls
+        ):
+            raise TypeError("calls must contain DecodedToolRegionCall values")
+        if not isinstance(self.remainder, str) or not isinstance(self.raw_region, str):
+            raise TypeError("remainder and raw_region must be strings")
+        if self.issue_code is not None:
+            _validate_non_empty("issue_code", self.issue_code)
+        if self.complete and self.issue_code is not None:
+            raise ValueError("complete Tool regions must not expose issue_code")
+        offsets = self.literal_tool_open_offsets
+        if not isinstance(offsets, tuple) or not all(
+            isinstance(offset, int) and not isinstance(offset, bool) for offset in offsets
+        ):
+            raise TypeError("literal_tool_open_offsets must contain integer offsets")
+        if tuple(sorted(set(offsets))) != offsets:
+            raise ValueError("literal_tool_open_offsets must be strictly increasing and unique")
+        for offset in offsets:
+            if offset < 0 or not self.remainder.startswith("<tool_call>", offset):
+                raise ValueError("literal Tool opener offsets must point at exact remainder markers")
+
+
+@runtime_checkable
+class ToolRegionDecoderLike(Protocol):
+    def feed(self, chunk: str) -> None:
+        ...
+
+    def finish(self) -> ToolRegionDecodeResult:
+        ...
+
+    def fresh(self, completed_calls: int) -> ToolRegionDecoderLike:
+        ...
+
+
+@runtime_checkable
+class CompatibilityToolRegionDecoderLike(ToolRegionDecoderLike, Protocol):
+    def can_probe_compatibility_finish(self) -> bool:
+        ...
+
+    def probe_compatibility_finish(self) -> ToolRegionDecodeResult | None:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ParserCreationContext:
+    """Protocol-light parser context; Tool-Wire-specific authority remains opaque here."""
+
+    hard_constraint_installed: bool | None = None
+    constraint_identity: str | None = None
+    trigger_token_ids: tuple[int, ...] = ()
+    generation_guarantee: GenerationGuarantee = GenerationGuarantee.NONE
+    tool_region_decoder: ToolRegionDecoderLike | None = None
+    tool_region_decoder_factory: Callable[[ToolPolicy | None], ToolRegionDecoderLike | None] | None = None
+
+    def __post_init__(self) -> None:
+        if self.hard_constraint_installed is not None:
+            _validate_bool("hard_constraint_installed", self.hard_constraint_installed)
+        if self.constraint_identity is not None:
+            _validate_non_empty("constraint_identity", self.constraint_identity)
+        if not isinstance(self.trigger_token_ids, tuple):
+            raise TypeError("trigger_token_ids must be a tuple")
+        for token_id in self.trigger_token_ids:
+            if not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0:
+                raise TypeError("trigger_token_ids must contain non-negative integers")
+        if not isinstance(self.generation_guarantee, GenerationGuarantee):
+            raise TypeError("generation_guarantee must be a GenerationGuarantee")
+
+
+@runtime_checkable
+class ContextualParserProvider(Protocol):
+    def create_parser_with_context(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+        context: ParserCreationContext | None,
+    ) -> IncrementalParserLike:
+        ...
 
 
 @runtime_checkable

@@ -5,10 +5,9 @@ from dataclasses import replace
 
 import pytest
 
-from exqserve.core.errors import SemanticCommitClass
 from exqserve.core.generation_guarantees import GenerationGuarantee
 from exqserve.model.contracts import ToolConstraintMode
-from exqserve.tool_wire import (
+from tests.tool_wire._legacy_api import (
     ActivationTriggerSpec,
     ArgumentFramingSelector,
     ArgumentFramingSelectorRule,
@@ -17,27 +16,14 @@ from exqserve.tool_wire import (
     ArgumentOrderingMode,
     CloseLanguage,
     CompileBudget,
-    ConstraintActivationEvidence,
-    ConstraintActivationProof,
     ConstraintCompilerCapabilities,
-    IrreversiblePublication,
     LiteralTerminal,
     NameCodec,
     NamedTerminal,
-    NonEmptinessStatus,
     PlanCompileDisposition,
-    PromptArgumentWireObservation,
-    PromptWireObservation,
     SchemaSemanticAuthority,
-    SemanticTransducerCase,
-    ServingToolPolicySnapshot,
     ToolMultiplicity,
-    ToolWireExecutionMode,
-    ToolWireFailureClass,
-    ToolWireFailureEvidence,
-    ToolWireSemanticFailure,
     ToolWireSpec,
-    ToolWireStopCause,
     ValueCodecKind,
     ValueFraming,
     ValueFramingKind,
@@ -45,11 +31,7 @@ from exqserve.tool_wire import (
     WireChannel,
     WireToolCall,
     WireToolSequence,
-    certify_constraint_activation,
-    certify_prompt_template_parity,
-    certify_semantic_transducer,
-    certify_tool_sequence_publication,
-    classify_tool_wire_failure,
+    admit_tool_sequence,
     compile_tool_wire_plan,
 )
 from tests.tool_wire._support import policy, schema_plan, structured_spec, tool
@@ -141,7 +123,7 @@ def test_qwen_mixed_string_and_integer_framing_is_one_constrained_plan() -> None
     assert all(argument.generated for argument in branch.arguments)
 
 
-def test_deepseek_per_argument_string_attribute_and_prompt_parity_are_resolved_from_plan() -> None:
+def test_deepseek_per_argument_string_attribute_is_resolved_from_plan() -> None:
     fn = tool(
         "write",
         '{"type":"object","properties":{"content":{"type":"string"},'
@@ -154,44 +136,6 @@ def test_deepseek_per_argument_string_attribute_and_prompt_parity_are_resolved_f
     content, offset = plan.tool("write").arguments
     assert spec.framing_variant(content.framing_variant_id or "").argument_open.suffix == ' string="true">'
     assert spec.framing_variant(offset.framing_variant_id or "").argument_open.suffix == ' string="false">'
-
-    observation = PromptWireObservation(
-        source_id="deepseek-template",
-        tool_open="<tool_call>",
-        tool_close="</tool_call>",
-        function_open_prefix="<function=",
-        function_open_suffix=">",
-        function_close="</function>",
-        encoded_tool_names=(("write", "write"),),
-        arguments=(
-            PromptArgumentWireObservation(
-                "write", "content", "raw-string", "<parameter=", ' string="true">',
-                "</parameter>", "content"
-            ),
-            PromptArgumentWireObservation(
-                "write", "offset", "json-value", "<parameter=", ' string="false">',
-                "</parameter>", "offset"
-            ),
-        ),
-    )
-    assert certify_prompt_template_parity(spec, observation, plan).is_valid
-
-    wrong = replace(
-        observation,
-        arguments=(
-            observation.arguments[0],
-            replace(observation.arguments[1], argument_open_suffix=' string="true">'),
-        ),
-    )
-    assert {issue.code for issue in certify_prompt_template_parity(spec, wrong, plan).issues} == {
-        "argument_open_mismatch"
-    }
-
-    incomplete = replace(observation, arguments=(observation.arguments[0],))
-    incomplete_codes = {
-        issue.code for issue in certify_prompt_template_parity(spec, incomplete, plan).issues
-    }
-    assert "argument_framing_observation_missing" in incomplete_codes
 
 
 def test_structural_name_terminators_make_tool_or_argument_non_authoritative() -> None:
@@ -207,7 +151,7 @@ def test_structural_name_terminators_make_tool_or_argument_non_authoritative() -
     assert spec.argument_name_codec.is_losslessly_representable("valid_arg")
     assert spec.argument_name_codec.decode(spec.argument_name_codec.encode("valid_arg")) == "valid_arg"
     tool_plan = _mixed_plan(spec, bad_tool)
-    assert tool_plan.tool("bad>name").name_representable is False
+    assert tool_plan.tool("bad>name").representable is False
     assert tool_plan.disposition is PlanCompileDisposition.REJECTED
     assert tool_plan.activation is None
 
@@ -218,7 +162,7 @@ def test_structural_name_terminators_make_tool_or_argument_non_authoritative() -
         strict=True,
     )
     arg_plan = _mixed_plan(spec, bad_arg)
-    assert arg_plan.tool("ok").arguments[0].name_representable is False
+    assert arg_plan.tool("ok").arguments[0].generated is False
     assert arg_plan.disposition is PlanCompileDisposition.REJECTED
     assert arg_plan.activation is None
 
@@ -233,13 +177,13 @@ def test_unsatisfiable_supported_integer_schema_is_proven_empty_not_schema_safe_
     plan = schema_plan(structured_spec(), policy(fn), {"measure": ("count",)})
     argument = plan.tool("measure").arguments[0]
 
-    assert argument.proof.non_empty is not NonEmptinessStatus.PROVEN_NON_EMPTY
     assert argument.generated is False
+    assert argument.guarantee is GenerationGuarantee.NONE
     assert plan.disposition is not PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     assert plan.activation is None
 
 
-def test_compiled_finite_raw_language_is_publication_authority_before_toolpolicy() -> None:
+def test_compiled_finite_raw_language_rejects_values_outside_plan() -> None:
     fn = tool(
         "choose",
         '{"type":"object","properties":{"value":{"type":"string","enum":['
@@ -248,28 +192,17 @@ def test_compiled_finite_raw_language_is_publication_authority_before_toolpolicy
     from tests.tool_wire._support import raw_spec
 
     spec = raw_spec()
-    tool_policy = policy(fn)
-    plan = schema_plan(spec, tool_policy, {"choose": ("value",)})
+    plan = schema_plan(spec, policy(fn), {"choose": ("value",)})
     sequence = WireToolSequence(
         (WireToolCall("choose", 0, (WireArgumentOccurrence("value", '"bad</parameter>"'),)),)
     )
-    decision = certify_tool_sequence_publication(
-        spec, plan, sequence, tool_policy, ServingToolPolicySnapshot(8, 8)
-    )
+    admission = admit_tool_sequence(spec, plan, sequence)
 
-    assert decision.published_events == ()
-    publication_codes = {issue.code for issue in decision.structural_issues}
-    assert publication_codes >= {
+    assert admission.is_valid is False
+    assert {issue.code for issue in admission.issues} >= {
         "value_not_admitted_by_plan",
         "forbidden_close_in_value",
     }
-    certification = certify_semantic_transducer(
-        spec,
-        plan,
-        (SemanticTransducerCase("wire", sequence),),
-        lambda _wire, _plan: sequence,
-    )[0]
-    assert {issue.code for issue in certification.result.issues} == publication_codes
 
 
 def test_non_generated_optional_occurrence_is_rejected_before_object_collapse() -> None:
@@ -282,8 +215,7 @@ def test_non_generated_optional_occurrence_is_rejected_before_object_collapse() 
     from tests.tool_wire._support import raw_spec
 
     spec = replace(raw_spec(), ordering=ArgumentOrderingMode.DECLARATION_ORDER)
-    tool_policy = policy(fn)
-    plan = schema_plan(spec, tool_policy, {"search": ("query", "hint")})
+    plan = schema_plan(spec, policy(fn), {"search": ("query", "hint")})
     assert plan.disposition is PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     assert plan.tool("search").arguments[1].generated is False
     sequence = WireToolSequence(
@@ -298,14 +230,12 @@ def test_non_generated_optional_occurrence_is_rejected_before_object_collapse() 
             ),
         )
     )
-    decision = certify_tool_sequence_publication(
-        spec, plan, sequence, tool_policy, ServingToolPolicySnapshot(8, 8)
-    )
-    assert decision.published_events == ()
-    assert "argument_not_generated_by_plan" in {issue.code for issue in decision.structural_issues}
+    admission = admit_tool_sequence(spec, plan, sequence)
+    assert admission.is_valid is False
+    assert "argument_not_generated_by_plan" in {issue.code for issue in admission.issues}
 
 
-def test_rejected_and_validation_only_plans_have_no_activation_or_constraint_integrity_authority() -> None:
+def test_rejected_and_validation_only_plans_have_no_activation_metadata() -> None:
     fn = tool(
         "write",
         '{"type":"object","properties":{"content":{"type":"string"}},'
@@ -320,28 +250,12 @@ def test_rejected_and_validation_only_plans_have_no_activation_or_constraint_int
         compiler_capabilities=_mixed_capabilities(),
         presentation_orders={"write": ("content",)},
         budget=tiny_budget,
-        parser_branch_id="tiny",
         constraint_fingerprint="constraint-v1",
         activation_trigger_ids=("tool-open",),
     )
     assert rejected.disposition is PlanCompileDisposition.REJECTED
     assert rejected.budget_result.within_budget is False
     assert rejected.activation is None and rejected.constraint_fingerprint is None
-
-    proof, activation_result = certify_constraint_activation(
-        rejected,
-        ConstraintActivationEvidence(
-            rejected.fingerprint,
-            rejected.spec_fingerprint,
-            "constraint-v1",
-            "tiny",
-            True,
-            True,
-            "tool-open",
-        ),
-    )
-    assert proof is None
-    assert "plan_not_constrained_executable" in {issue.code for issue in activation_result.issues}
 
     unsupported = tool(
         "search",
@@ -352,27 +266,6 @@ def test_rejected_and_validation_only_plans_have_no_activation_or_constraint_int
     validation_only = _mixed_plan(spec, unsupported)
     assert validation_only.disposition is PlanCompileDisposition.VALIDATION_ONLY
     assert validation_only.activation is None and validation_only.constraint_fingerprint is None
-
-    with pytest.raises(TypeError, match="certifier-owned"):
-        ConstraintActivationProof(
-            validation_only.fingerprint,
-            validation_only.spec_fingerprint,
-            "fabricated",
-            validation_only.parser_branch_id,
-            "tool-open",
-        )
-    disposition = classify_tool_wire_failure(
-        validation_only,
-        ToolWireFailureEvidence(
-            ToolWireStopCause.EOS,
-            ToolWireSemanticFailure.MALFORMED,
-            SemanticCommitClass.NO_SEMANTIC_COMMIT,
-            irreversible_publication=IrreversiblePublication.NONE,
-            execution_mode=ToolWireExecutionMode.BUFFERED,
-            observed_wire_outside_enforced_language=True,
-        ),
-    )
-    assert disposition.failure_class is not ToolWireFailureClass.CONSTRAINT_INTEGRITY
 
 
 def test_constrained_executable_plan_constructor_requires_activation_authority() -> None:
@@ -417,7 +310,6 @@ def test_global_compile_work_budget_is_reserved_across_multiple_tools() -> None:
             max_estimated_bytes=10_000_000,
             max_work_units=800,
         ),
-        parser_branch_id="global-budget",
         constraint_fingerprint="constraint-v1",
         activation_trigger_ids=("tool-open",),
     )
@@ -443,15 +335,15 @@ def test_global_compile_work_budget_is_reserved_across_multiple_tools() -> None:
             max_estimated_bytes=10_000_000,
             max_work_units=6000,
         ),
-        parser_branch_id="global-budget-richer",
         constraint_fingerprint="constraint-v1",
         activation_trigger_ids=("tool-open",),
     )
     assert richer.disposition is PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     assert richer.budget_result.within_budget is True
     assert richer.budget_result.work_units <= 6000
-    assert richer.tool("first").order_plan.full_order_count == 720
-    assert richer.tool("first").order_plan.narrowed is False
+    assert richer.tool("first").order_plan.full_order_count is None
+    assert richer.tool("first").order_plan.narrowed is True
+    assert richer.budget_result.work_units == plan.budget_result.work_units
     assert richer.tool("second").order_plan.narrowed is True
     assert richer.tool("second").order_plan.orders == (order,)
 
@@ -483,7 +375,6 @@ def test_optional_order_expansion_cannot_starve_later_mandatory_order_work() -> 
             compiler_capabilities=_mixed_capabilities(),
             presentation_orders=orders,
             budget=CompileBudget(permutations, rules, byte_count, work),
-            parser_branch_id="order-expansion-monotonicity",
             constraint_fingerprint="constraint-v1",
             activation_trigger_ids=("tool-open",),
         )
@@ -526,15 +417,15 @@ def test_plan_level_permutation_budget_is_consumed_across_tools(tool_count: int)
         compiler_capabilities=_mixed_capabilities(),
         presentation_orders=orders,
         budget=CompileBudget(full_permutations, 1_000_000, 100_000_000, 1_000_000),
-        parser_branch_id="aggregate-permutations-exact",
         constraint_fingerprint="constraint-v1",
         activation_trigger_ids=("tool-open",),
     )
     assert exact.disposition is PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     assert exact.budget_result.within_budget is True
-    assert exact.budget_result.permutations_reserved == full_permutations
-    assert exact.budget_result.narrowed_permutations is False
-    assert [len(branch.order_plan.orders) for branch in exact.tools] == [3] * tool_count
+    assert exact.budget_result.permutations_reserved == tool_count
+    assert exact.budget_result.narrowed_permutations is True
+    assert [len(branch.order_plan.orders) for branch in exact.tools] == [1] * tool_count
+    assert all(branch.order_plan.optional_names == frozenset({"o"}) for branch in exact.tools)
 
     under = compile_tool_wire_plan(
         spec,
@@ -543,7 +434,6 @@ def test_plan_level_permutation_budget_is_consumed_across_tools(tool_count: int)
         compiler_capabilities=_mixed_capabilities(),
         presentation_orders=orders,
         budget=CompileBudget(full_permutations - 1, 1_000_000, 100_000_000, 1_000_000),
-        parser_branch_id="aggregate-permutations-under",
         constraint_fingerprint="constraint-v1",
         activation_trigger_ids=("tool-open",),
     )
@@ -555,45 +445,3 @@ def test_plan_level_permutation_budget_is_consumed_across_tools(tool_count: int)
     assert under.budget_result.permutations_reserved <= full_permutations - 1
     assert under.budget_result.narrowed_permutations is True
     assert any(branch.order_plan.narrowed for branch in under.tools)
-
-
-def test_buffered_internal_commit_is_distinct_from_streaming_irreversible_publication() -> None:
-    fn = tool(
-        "write",
-        '{"type":"object","properties":{"content":{"type":"string"}},'
-        '"required":["content"],"additionalProperties":false}',
-    )
-    plan = _mixed_plan(_mixed_spec(), fn)
-    buffered = classify_tool_wire_failure(
-        plan,
-        ToolWireFailureEvidence(
-            ToolWireStopCause.EOS,
-            ToolWireSemanticFailure.AMBIGUOUS,
-            SemanticCommitClass.PARTIAL_TOOL_COMMITTED,
-            irreversible_publication=IrreversiblePublication.NONE,
-            execution_mode=ToolWireExecutionMode.BUFFERED,
-        ),
-    )
-    streaming = classify_tool_wire_failure(
-        plan,
-        ToolWireFailureEvidence(
-            ToolWireStopCause.EOS,
-            ToolWireSemanticFailure.AMBIGUOUS,
-            SemanticCommitClass.NO_SEMANTIC_COMMIT,
-            irreversible_publication=IrreversiblePublication.CONTENT,
-            execution_mode=ToolWireExecutionMode.STREAMING,
-        ),
-    )
-    validated_tool = classify_tool_wire_failure(
-        plan,
-        ToolWireFailureEvidence(
-            ToolWireStopCause.EOS,
-            ToolWireSemanticFailure.AMBIGUOUS,
-            SemanticCommitClass.TOOL_COMPLETED,
-            irreversible_publication=IrreversiblePublication.VALIDATED_TOOL,
-            execution_mode=ToolWireExecutionMode.STREAMING,
-        ),
-    )
-    assert buffered.recovery_precondition_no_publication is True
-    assert streaming.recovery_precondition_no_publication is False
-    assert validated_tool.recovery_precondition_no_publication is False

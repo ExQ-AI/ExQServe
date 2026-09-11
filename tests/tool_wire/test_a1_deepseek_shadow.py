@@ -7,14 +7,14 @@ import pytest
 from exqserve.agent._json import canonical_json_dumps, parse_json_strict
 from exqserve.core.events import ToolCallCompleted
 from exqserve.model.deepseek_v4 import DeepSeekV4IncrementalParser, DeepSeekV4ParserContext
-from exqserve.tool_wire import (
+from tests.tool_wire._deepseek_fixture import deepseek_v4_structured_dsml_spec
+from tests.tool_wire._legacy_api import (
     ToolWireEngineStatus,
     WireArgumentOccurrence,
     WireToolCall,
     WireToolSequence,
     certify_engine_shadow,
 )
-from exqserve.tool_wire.controls.deepseek_v4 import deepseek_v4_structured_dsml_spec
 from tests.tool_wire._support import policy, schema_plan, tool
 
 
@@ -147,9 +147,11 @@ def test_a1_deepseek_multiple_arguments_and_invokes_shadow_parity() -> None:
         reference_decoder=reference,
     )
     assert shadow.engine_result.is_complete
-    assert shadow.admission is not None and shadow.admission.is_valid
+    # The reference parser still decodes permuted arguments; compact generation uses declaration order.
+    assert shadow.admission is not None and not shadow.admission.is_valid
+    assert {issue.code for issue in shadow.admission.issues} == {"argument_order_invalid"}
     assert shadow.semantic_match
-    assert shadow.is_certified
+    assert not shadow.is_certified
     assert shadow.engine_result.sequence is not None
     assert [tuple(occ.name for occ in call.occurrences) for call in shadow.engine_result.sequence.calls] == list(orders)
 

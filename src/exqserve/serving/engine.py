@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, Self
+from typing import Protocol, Self, cast
 
 from exqserve.agent._json import InvalidJsonError, parse_json_strict
 from exqserve.agent.reasoning import (
@@ -66,8 +67,10 @@ from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenAwareIncrementalParser,
+    NativeTokenConstraintIntegrityError,
     NativeTokenProvenanceError,
     ParserAmbiguityDetail,
+    ParserCreationContext,
     ParserTerminalIssue,
     ParserTerminalIssueKind,
     ReasoningControlSpec,
@@ -84,6 +87,7 @@ from exqserve.model.contracts import (
     ToolGenerationConstraint,
 )
 from exqserve.runtime.contracts import (
+    ConstraintInstallation,
     RuntimeConstraintUnsupported,
     RuntimeEvent,
     RuntimeFailed,
@@ -258,6 +262,10 @@ class RuntimeTemplateAdapter:
 class ControlledSessionLike(Protocol):
     terminal_reason: RequestTerminalReason | None
 
+    @property
+    def constraint_installation(self) -> ConstraintInstallation | None:
+        ...
+
     def __aiter__(self) -> AsyncIterator[RuntimeEvent]:
         ...
 
@@ -284,11 +292,37 @@ class RequestControllerLike(Protocol):
         ...
 
 
-type ParserFactory = Callable[[str, ReasoningPolicy, ToolPolicy], IncrementalParserLike]
+type LegacyParserFactory = Callable[[str, ReasoningPolicy, ToolPolicy], IncrementalParserLike]
+type ContextualParserFactory = Callable[
+    [str, ReasoningPolicy, ToolPolicy, ParserCreationContext | None],
+    IncrementalParserLike,
+]
+type ParserFactory = LegacyParserFactory | ContextualParserFactory
+type ParserContextFactory = Callable[
+    [ToolGenerationConstraint | None, ConstraintInstallation | None, ConstraintFallbackPolicy],
+    ParserCreationContext | None,
+]
 type ToolConstraintFactory = Callable[[ToolPolicy], ToolGenerationConstraint | None]
 type ReasoningControlFactory = Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None]
 type ReasoningControlTokenizer = Callable[[str], tuple[int, ...]]
 type OutputLimitResolver = Callable[[int, int | None], int]
+
+
+def _parser_factory_accepts_context(factory: ParserFactory) -> bool:
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError):
+        return False
+    positional = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            positional += 1
+    return positional >= 4
 
 
 class _ReasoningBudgetSource(str, Enum):
@@ -487,6 +521,7 @@ class ServingEngine:
         best_effort_mid_system_lowering: BestEffortMidSystemLowering = (
             BestEffortMidSystemLowering.MERGED_LEADING
         ),
+        parser_context_factory: ParserContextFactory | None = None,
     ) -> None:
         if not isinstance(tool_call_fanout_limit, int) or isinstance(tool_call_fanout_limit, bool):
             raise TypeError("tool_call_fanout_limit must be an integer")
@@ -503,6 +538,8 @@ class ServingEngine:
         self._compiler = compiler
         self._preprocessing_pool = preprocessing_pool
         self._parser_factory = parser_factory
+        self._parser_factory_supports_context = _parser_factory_accepts_context(parser_factory)
+        self._parser_context_factory = parser_context_factory
         self._controller = controller
         self._guarantee_resolver = RequestGuaranteeResolver(tool_constraint_factory)
         self._tool_call_fanout_limit = tool_call_fanout_limit
@@ -773,19 +810,6 @@ class ServingEngine:
                     raise ServingRejected(exc.error) from exc
 
             try:
-                parser = self._parser_factory(
-                    request.input.request_id, request.reasoning, request.tools
-                )
-            except Exception as exc:
-                raise ServingRejected(
-                    _safe_error(
-                        ErrorCategory.INTERNAL,
-                        "serving_internal_error",
-                        "Serving parser initialization failed internally.",
-                    )
-                ) from exc
-
-            try:
                 tool_plan = self._guarantee_resolver.resolve_tool_policy(request.tools)
             except ToolConstraintUnsupported as exc:
                 logger.warning(
@@ -875,6 +899,7 @@ class ServingEngine:
                         tool_constraint.trigger,
                         tool_constraint.lark_grammar,
                         tool_constraint.eos_after_completed,
+                        tool_constraint.constraint_fingerprint,
                     )
                 ),
                 generation_guarantee=runtime_guarantee,
@@ -911,6 +936,48 @@ class ServingEngine:
                 ) from exc
 
             try:
+                try:
+                    installation = getattr(controlled, "constraint_installation", None)
+                    parser_context = (
+                        None
+                        if self._parser_context_factory is None
+                        else self._parser_context_factory(
+                            tool_constraint,
+                            installation,
+                            runtime_fallback,
+                        )
+                    )
+                    if self._parser_factory_supports_context:
+                        contextual_factory = cast(ContextualParserFactory, self._parser_factory)
+                        parser = contextual_factory(
+                            request.input.request_id,
+                            request.reasoning,
+                            request.tools,
+                            parser_context,
+                        )
+                    else:
+                        legacy_factory = cast(LegacyParserFactory, self._parser_factory)
+                        parser = legacy_factory(
+                            request.input.request_id,
+                            request.reasoning,
+                            request.tools,
+                        )
+                except ValueError as exc:
+                    raise ServingRejected(
+                        _safe_error(
+                            ErrorCategory.INTERNAL,
+                            "tool_parser_authority_invalid",
+                            "Serving could not bind the installed Tool constraint to parser authority.",
+                        )
+                    ) from exc
+                except Exception as exc:
+                    raise ServingRejected(
+                        _safe_error(
+                            ErrorCategory.INTERNAL,
+                            "serving_internal_error",
+                            "Serving parser initialization failed internally.",
+                        )
+                    ) from exc
                 session = ServingSession(
                     request.input.request_id,
                     controlled,
@@ -920,7 +987,11 @@ class ServingEngine:
                     request.structured_output,
                     request.stop_conditions,
                     self._tool_call_fanout_limit,
-                    request.tools.allow_parallel and tool_constraint is not None,
+                    tool_constraint is not None
+                    and (
+                        request.tools.allow_parallel
+                        or tool_constraint.decode_authority is not None
+                    ),
                     self._constrained_parallel_tool_call_limit,
                     reasoning_budget,
                     tool_constraint=tool_constraint,
@@ -968,6 +1039,7 @@ class ServingSession:
         self._tool_policy = tool_policy
         self._structured_output = structured_output
         self._tool_constraint = tool_constraint
+        self._tool_constraint_activation_proven = False
         self._requested_stop_sequences = frozenset(
             condition for condition in requested_stop_conditions if isinstance(condition, str)
         )
@@ -1054,7 +1126,7 @@ class ServingSession:
         return decision
 
     def _tool_constraint_guarantee(self, tool_name: str) -> ToolConstraintGuarantee:
-        if self._tool_constraint is None:
+        if self._tool_constraint is None or not self._tool_constraint_activation_proven:
             return ToolConstraintGuarantee.NONE
         return self._tool_constraint.guarantee_for_tool(tool_name)
 
@@ -1444,8 +1516,6 @@ class ServingSession:
             return
         if isinstance(event, TextDelta):
             self._text_parts.append(event.text)
-            self._queue_event(event)
-            return
         if isinstance(event, ToolCallStarted):
             decision = self._tool_batch.on_started(event)
             if decision.failure is not None:
@@ -1479,7 +1549,11 @@ class ServingSession:
                 return
             self._queue_events(decision.events)
             return
-        self._queue_event(event)
+        decision = self._tool_batch.on_passthrough(event)
+        if decision.failure is not None:
+            await self._model_failure(decision.failure.code, decision.failure.message)
+            return
+        self._queue_events(decision.events)
 
     async def _parser_integrity_failure(
         self,
@@ -1505,6 +1579,30 @@ class ServingSession:
                     self._request_id,
                 )
 
+    async def _fail_constraint_trigger_integrity(self) -> None:
+        if self._terminal:
+            return
+        error = self._committed_error(
+            _safe_error(
+                ErrorCategory.INTERNAL,
+                "tool_constraint_integrity_failed",
+                "Native Tool opener identity contradicted the installed generation constraint.",
+                retryable=False,
+            )
+        )
+        self._record_controlled_terminal_reason()
+        self._terminal_evidence.record_parser_issue("constraint_trigger_identity")
+        self._terminal_evidence.record_constraint_failure(error)
+        decision = self._emit_recorded_failure_or_cancellation()
+        if decision.primary_owner is TerminalPrimaryOwner.CONSTRAINT_INTEGRITY:
+            try:
+                await self._controlled.cancel(RequestTerminalReason.APPLICATION_CANCELLED)
+            except Exception:
+                logger.exception(
+                    "runtime cancellation failed after constraint integrity failure request_id=%s",
+                    self._request_id,
+                )
+
     async def _fail_native_token_provenance(self) -> None:
         await self._parser_integrity_failure(
             category=ErrorCategory.RUNTIME_FAILURE,
@@ -1519,6 +1617,9 @@ class ServingSession:
         self._parser_finished = True
         try:
             finish = self._parser.finish()
+        except NativeTokenConstraintIntegrityError:
+            await self._fail_constraint_trigger_integrity()
+            return None
         except NativeTokenProvenanceError:
             await self._fail_native_token_provenance()
             return None
@@ -1621,6 +1722,9 @@ class ServingSession:
     async def _handle_runtime_finished(self, event: RuntimeFinished) -> None:
         self._record_controlled_terminal_reason()
         self._terminal_evidence.record_runtime_finished(event)
+        self._tool_constraint_activation_proven = (
+            event.hard_constraint_installed and event.hard_constraint_activated
+        )
 
         terminal_issue = await self._finish_parser_events()
         if self._terminal:
@@ -1637,6 +1741,19 @@ class ServingSession:
         )
 
         completed_calls = self._tool_batch.completed_calls
+        if (
+            completed_calls
+            and event.reason is RuntimeStopReason.LENGTH
+            and hard_constraint_active
+            and self._tool_constraint is not None
+            and self._tool_constraint.decode_authority is not None
+        ):
+            await self._model_failure(
+                "tool_call_incomplete",
+                "Model output reached the output token limit before confirming the Tool sequence.",
+                cause=FailureCause.OUTPUT_LENGTH,
+            )
+            return
         final_tool_validation = validate_tool_calls(completed_calls, self._tool_policy)
         if not final_tool_validation.is_valid:
             logger.warning(
@@ -1806,14 +1923,20 @@ class ServingSession:
             try:
                 if (
                     isinstance(self._parser, NativeTokenAwareIncrementalParser)
-                    and event.native_token_provenance
+                    and (
+                        event.native_token_provenance
+                        or self._parser.requires_native_token_provenance
+                    )
                 ):
                     semantic_events = self._parser.feed_with_native_tokens(
                         event.text,
-                        event.native_token_spans,
+                        event.native_token_spans if event.native_token_provenance else None,
                     )
                 else:
                     semantic_events = self._parser.feed(event.text)
+            except NativeTokenConstraintIntegrityError:
+                await self._fail_constraint_trigger_integrity()
+                return
             except NativeTokenProvenanceError:
                 await self._fail_native_token_provenance()
                 return

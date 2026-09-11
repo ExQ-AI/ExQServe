@@ -9,8 +9,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from itertools import combinations, permutations
-from math import comb
 
 from exqserve.agent._json import JsonValue, canonical_json_dumps, parse_json_strict
 from exqserve.agent.tools import FunctionTool, ToolChoiceMode, ToolPolicy
@@ -22,7 +20,6 @@ from exqserve.tool_wire.contracts import (
     ArgumentFramingVariant,
     ArgumentOrderingMode,
     ArgumentOrderPlan,
-    BranchGuaranteeProof,
     CompileBudget,
     CompileBudgetResult,
     CompiledToolWirePlan,
@@ -42,9 +39,6 @@ from exqserve.tool_wire.contracts import (
 from exqserve.tool_wire.semantic_authority import (
     exact_finite_non_emptiness,
     find_exact_witness,
-    find_exact_witness_metered,
-    schema_value_is_valid,
-    schema_values_equal,
 )
 
 _ANNOTATION_KEYWORDS = frozenset(
@@ -99,7 +93,6 @@ _HARD_MAX_OBJECT_REQUIRED = 1024
 _HARD_MAX_FINITE_CARDINALITY = 8192
 _HARD_MAX_FINITE_WIRE_PAYLOAD_BYTES_TOTAL = 8_388_608
 _HARD_MAX_FINAL_ARTIFACT_BYTES = 16_777_216
-_MAX_EXHAUSTIVE_PERMUTABLE_WIDTH = 6
 _SCHEMA_NODE_LIMIT_CONTEXT: ContextVar[int | None] = ContextVar(
     "tool_wire_schema_node_limit",
     default=None,
@@ -133,21 +126,8 @@ class _CompileBudgetLedger:
         self.permutations_reserved = 0
         self.narrowed_permutations = False
 
-    @property
-    def remaining_rules(self) -> int:
-        return self.budget.max_estimated_rules - self.estimated_rules
 
-    @property
-    def remaining_bytes(self) -> int:
-        return self.budget.max_estimated_bytes - self.estimated_bytes
 
-    @property
-    def remaining_work(self) -> int:
-        return self.budget.max_work_units - self.work_units
-
-    @property
-    def remaining_permutations(self) -> int:
-        return self.budget.max_permutations - self.permutations_reserved
 
     @property
     def within_budget(self) -> bool:
@@ -188,14 +168,9 @@ class _CompileBudgetLedger:
                 work_units=attempted_work,
             )
 
-    def charge_work(self, units: int = 1) -> None:
-        self.reserve(work=units)
-
     def charge_bytes(self, byte_count: int) -> None:
         self.reserve(byte_count=byte_count)
 
-    def charge_rules(self, rules: int) -> None:
-        self.reserve(rules=rules)
 
     def mark_narrowed(self) -> None:
         self.narrowed_permutations = True
@@ -211,73 +186,19 @@ class _CompileBudgetLedger:
         )
 
 
-class _SemanticBudgetMeter:
-    """Branch-local view whose authoritative charges flow through the plan ledger."""
-
-    def __init__(
-        self,
-        *,
-        max_bytes: int | None = None,
-        max_work_units: int | None = None,
-        owner: _CompileBudgetLedger | None = None,
-    ) -> None:
-        if owner is None:
-            if max_bytes is None or max_work_units is None:
-                raise TypeError("standalone semantic meter requires max_bytes and max_work_units")
-            self.max_bytes = max_bytes
-            self.max_work_units = max_work_units
-        else:
-            self.max_bytes = (
-                max_bytes if max_bytes is not None else owner.budget.max_estimated_bytes
-            )
-            self.max_work_units = (
-                max_work_units if max_work_units is not None else owner.budget.max_work_units
-            )
-        self._owner = owner
-        self.bytes_used = 0
-        self.work_units = 0
-        self._pending_schema_json: str | None = None
-        self._hard_wire_payload_limit: int | None = None
-
-    def provide_schema_json(self, schema_json: str) -> None:
-        self._pending_schema_json = schema_json
-
-    def take_schema_json(self) -> str | None:
-        schema_json = self._pending_schema_json
-        self._pending_schema_json = None
-        return schema_json
-
-    def charge_work(self, units: int = 1) -> None:
-        attempted = self.work_units + units
-        self.work_units = attempted
-        if self._owner is None and attempted > self.max_work_units:
-            raise _BranchBudgetExceeded(
-                estimated_rules=0,
-                estimated_bytes=self.bytes_used,
-                work_units=attempted,
-            )
-        # V3 owner mode treats this meter as bounded helper-local telemetry only. Authoritative
-        # max_work_units is scored from admitted semantic products (Tool/schema/order/artifact), not
-        # from individual Python traversal/hash/serialization operations.
-
-    def charge_bytes(self, byte_count: int) -> None:
-        attempted = self.bytes_used + byte_count
-        self.bytes_used = attempted
-        if self._owner is not None:
-            self._owner.charge_bytes(byte_count)
-        elif attempted > self.max_bytes:
-            raise _BranchBudgetExceeded(estimated_rules=0, estimated_bytes=attempted, work_units=self.work_units)
-
-
 @dataclass(slots=True)
 class _PreparedTool:
     tool: FunctionTool
     schema: dict[str, JsonValue]
     order_evidence: tuple[str, ...]
     property_schemas: dict[str, dict[str, JsonValue]]
+    resolved_property_schemas: dict[str, dict[str, JsonValue]]
+    property_resolution_cache: dict[str, dict[str, JsonValue]]
+    property_schema_resolver: Callable[
+        [dict[str, JsonValue], dict[str, JsonValue], int, int], dict[str, JsonValue]
+    ] | None
     property_names: frozenset[str]
     required_names: frozenset[str]
-    minimum_order_bytes: int
 
 
 @dataclass(slots=True)
@@ -286,13 +207,9 @@ class _CompiledToolSemantics:
     mode: ToolConstraintMode
     name_representable: bool
     object_schema_safe: bool
-    object_schema_detail: str
     arguments: tuple[ArgumentBranchPlan, ...]
     optional_argument_candidates: dict[str, ArgumentBranchPlan]
-    generated_order: tuple[str, ...]
     wire_required_names: frozenset[str]
-    representable: bool
-    guarantee: GenerationGuarantee
 
 
 @dataclass(slots=True)
@@ -301,7 +218,6 @@ class _PreparedOrderState:
     required_names: frozenset[str]
     required: tuple[str, ...]
     optional: tuple[str, ...]
-    minimum_order_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +297,55 @@ def _json_node_count(value: JsonValue) -> int:
     return nodes
 
 
+def _resolved_prepared_property_schema(
+    prepared: _PreparedTool,
+    name: str,
+    hard_envelope: _HardEnvelopeBudget,
+) -> dict[str, JsonValue]:
+    """Resolve one property lazily under the shared hard materialization authority.
+
+    Source schema nodes are already charged during Layer-1 admission. Detached resolver products
+    are additional materialization, so only cache misses consume remaining aggregate schema-node
+    authority. Identical source property schemas share one resolved representation per Tool.
+    """
+
+    existing = prepared.resolved_property_schemas.get(name)
+    if existing is not None:
+        return existing
+
+    source_property = prepared.property_schemas[name]
+    resolver = prepared.property_schema_resolver
+    if resolver is None:
+        prepared.resolved_property_schemas[name] = source_property
+        return source_property
+
+    cache_key = canonical_json_dumps(source_property)
+    cached = prepared.property_resolution_cache.get(cache_key)
+    if cached is not None:
+        prepared.resolved_property_schemas[name] = cached
+        return cached
+
+    remaining_nodes = hard_envelope.remaining_schema_nodes
+    resolved = resolver(
+        prepared.schema,
+        source_property,
+        remaining_nodes,
+        _HARD_MAX_SCHEMA_DEPTH,
+    )
+    if not isinstance(resolved, dict):
+        raise ToolWireCompileError("property_schema_resolver must return a schema object")
+    if resolved is not source_property:
+        context_handle = _SCHEMA_NODE_LIMIT_CONTEXT.set(remaining_nodes)
+        try:
+            resolved_stats = _validate_schema_hard_envelope(resolved)
+        finally:
+            _SCHEMA_NODE_LIMIT_CONTEXT.reset(context_handle)
+        hard_envelope.consume_schema_nodes(resolved_stats.nodes)
+    prepared.property_resolution_cache[cache_key] = resolved
+    prepared.resolved_property_schemas[name] = resolved
+    return resolved
+
+
 def _semantic_schema_product_cost(
     prepared: _PreparedTool,
     included_names: frozenset[str],
@@ -390,8 +355,18 @@ def _semantic_schema_product_cost(
     if not included_names <= prepared.property_names:
         raise ValueError("semantic product names must be declared Tool properties")
     work_units = _json_node_count(prepared.schema)
+    source_properties = prepared.schema.get("properties", {})
+    if not isinstance(source_properties, dict):
+        raise TypeError("prepared Tool properties must remain an object")
     for name in prepared.property_names - included_names:
-        work_units -= _json_node_count(prepared.property_schemas[name])
+        # The root product physically contains the source property branch, not the detached
+        # resolver product. A resolved local $ref can be much larger than its tiny source node;
+        # subtracting that expanded branch from the root made shared targets drive the score
+        # negative. Subtract exactly the source subtree actually present in the root.
+        source_property = source_properties[name]
+        if not isinstance(source_property, dict):
+            raise TypeError("prepared Tool properties must map names to schema objects")
+        work_units -= _json_node_count(source_property)
     return _SemanticProductCost(
         estimated_rules=2 * len(included_names),
         work_units=work_units,
@@ -551,38 +526,6 @@ def _candidate_products_fit(
     )
 
 
-def _reserve_json_traversal(
-    value: JsonValue,
-    semantic_budget: _SemanticBudgetMeter,
-) -> None:
-    """Reserve each request-sized JSON container before traversing its children."""
-
-    stack: list[JsonValue] = [value]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, dict):
-            semantic_budget.charge_work(len(current))
-            stack.extend(current.values())
-        elif isinstance(current, list):
-            semantic_budget.charge_work(len(current))
-            stack.extend(current)
-
-
-def _metered_canonical_json_dumps(
-    value: JsonValue,
-    semantic_budget: _SemanticBudgetMeter,
-) -> str:
-    """Serialize one scalable schema/value only after the owner authorizes the operation."""
-
-    semantic_budget.charge_work()
-    _reserve_json_traversal(value, semantic_budget)
-    return canonical_json_dumps(value)
-
-
-def _text_scan_work_units(value: str) -> int:
-    return max(1, (len(value) + 255) // 256)
-
-
 def _utf8_len_or_hard_reject(value: str, *, label: str) -> int:
     """Return strict UTF-8 size or convert a non-scalar Python string into fail-closed admission."""
 
@@ -594,117 +537,23 @@ def _utf8_len_or_hard_reject(value: str, *, label: str) -> int:
         ) from exc
 
 
-def _metered_utf8_owner_bytes(
-    value: str,
-    ledger: _CompileBudgetLedger,
-) -> int:
-    """Reserve exact UTF-8 bytes without performing the scalable encode before a lower-bound gate."""
+def _argument_semantic_product_bytes(argument: ArgumentBranchPlan) -> int:
+    """Score only generated semantic products retained by the final argument branch."""
 
-    char_lower_bound = len(value)
-    exact_bytes = _utf8_len_or_hard_reject(value, label="Tool-Wire request string")
-    ledger.charge_bytes(char_lower_bound)
-    ledger.charge_work(_text_scan_work_units(value))
-    if exact_bytes > char_lower_bound:
-        ledger.charge_bytes(exact_bytes - char_lower_bound)
-    return exact_bytes
-
-
-def _metered_utf8_output_bytes(
-    value: str,
-    semantic_budget: _SemanticBudgetMeter,
-) -> int:
-    """Account a scalable UTF-8 measurement before performing the encoding pass."""
-
-    char_lower_bound = len(value)
-    exact_bytes = _utf8_len_or_hard_reject(value, label="Tool-Wire generated string")
-    semantic_budget.charge_bytes(char_lower_bound)
-    semantic_budget.charge_work(_text_scan_work_units(value))
-    if exact_bytes > char_lower_bound:
-        semantic_budget.charge_bytes(exact_bytes - char_lower_bound)
-    return exact_bytes
-
-
-def _metered_canonical_json_values(
-    values: tuple[JsonValue, ...],
-    semantic_budget: _SemanticBudgetMeter,
-) -> tuple[str, ...]:
-    """Materialize finite semantic products only after work/byte authorization."""
-
-    result: list[str] = []
-    for value in values:
-        encoded = _metered_canonical_json_dumps(value, semantic_budget)
-        _metered_utf8_output_bytes(encoded, semantic_budget)
-        result.append(encoded)
-    return tuple(result)
-
-
-def _json_string_utf8_size(value: str) -> int:
-    """Return canonical-json UTF-8 bytes for one string without materializing that string."""
-
-    total = 2
-    for character in value:
-        if character in {'"', "\\", "\b", "\f", "\n", "\r", "\t"}:
-            total += 2
-        elif ord(character) < 0x20:
-            total += 6
-        else:
-            total += _utf8_len_or_hard_reject(character, label="finite string scalar")
+    if not argument.generated:
+        return 0
+    total = 0
+    if argument.generation_schema_json is not None:
+        total += _utf8_len_or_hard_reject(
+            argument.generation_schema_json,
+            label="generation schema",
+        )
+    if argument.admitted_wire_payloads is not None:
+        total += sum(
+            _utf8_len_or_hard_reject(value, label="finite wire payload")
+            for value in argument.admitted_wire_payloads
+        )
     return total
-
-
-def _boundary_safe_json_string_utf8_size(value: str, close_forms: tuple[str, ...]) -> int:
-    """Return the exact boundary-safe JSON-string byte size without building the escaped product."""
-
-    close_leads = {close[0] for close in close_forms if close}
-    total = 2
-    for character in value:
-        if character in close_leads:
-            total += 6 if ord(character) <= 0xFFFF else 12
-        elif character in {'"', "\\", "\b", "\f", "\n", "\r", "\t"}:
-            total += 2
-        elif ord(character) < 0x20:
-            total += 6
-        else:
-            total += _utf8_len_or_hard_reject(character, label="finite string scalar")
-    return total
-
-
-def _json_unicode_escape_fragment(character: str) -> str:
-    codepoint = ord(character)
-    if codepoint <= 0xFFFF:
-        return f"\\u{codepoint:04x}"
-    codepoint -= 0x10000
-    high = 0xD800 + (codepoint >> 10)
-    low = 0xDC00 + (codepoint & 0x3FF)
-    return f"\\u{high:04x}\\u{low:04x}"
-
-
-def _boundary_safe_json_string_literal(value: str, close_forms: tuple[str, ...]) -> str:
-    close_leads = {close[0] for close in close_forms if close}
-    pieces = ['"']
-    for character in value:
-        if character in close_leads:
-            pieces.append(_json_unicode_escape_fragment(character))
-        elif character == '"':
-            pieces.append('\\"')
-        elif character == "\\":
-            pieces.append("\\\\")
-        elif character == "\b":
-            pieces.append("\\b")
-        elif character == "\f":
-            pieces.append("\\f")
-        elif character == "\n":
-            pieces.append("\\n")
-        elif character == "\r":
-            pieces.append("\\r")
-        elif character == "\t":
-            pieces.append("\\t")
-        elif ord(character) < 0x20:
-            pieces.append(_json_unicode_escape_fragment(character))
-        else:
-            pieces.append(character)
-    pieces.append('"')
-    return "".join(pieces)
 
 
 def _encode_lossless_raw_string_bounded(
@@ -714,45 +563,16 @@ def _encode_lossless_raw_string_bounded(
 ) -> str | None:
     """Encode one RAW string without materializing a wire product beyond its hard allowance."""
 
-    if max_utf8_bytes is None:
-        return encode_lossless_raw_string(value, framing)
-    if max_utf8_bytes < 0:
+    if max_utf8_bytes is not None and max_utf8_bytes < 0:
         raise ValueError("max_utf8_bytes must be non-negative")
-    forbidden = framing.forbidden_close_language
-    if forbidden is None:
-        raise ValueError("bounded raw-string encoding requires a forbidden close language")
-    closes = forbidden.texts
-    codec = framing.codec
-
-    raw_safe = not any(close in value for close in closes)
-    if raw_safe and codec.decode_raw_payload(value) == value:
-        if _utf8_len_or_hard_reject(value, label="finite RAW value") > max_utf8_bytes:
-            raise _HardComplexityExceeded(
-                "finite wire payload aggregate exceeds hard compiler envelope"
-            )
-        return value
-
-    if codec is ValueCodecKind.RAW_STRING:
-        return None
-
-    canonical_size = _json_string_utf8_size(value)
-    if canonical_size > max_utf8_bytes:
+    encoded = encode_lossless_raw_string(value, framing)
+    if encoded is None or max_utf8_bytes is None:
+        return encoded
+    if _utf8_len_or_hard_reject(encoded, label="finite RAW value") > max_utf8_bytes:
         raise _HardComplexityExceeded(
             "finite wire payload aggregate exceeds hard compiler envelope"
         )
-    canonical = canonical_json_dumps(value)
-    if not any(close in canonical for close in closes) and codec.decode_raw_payload(canonical) == value:
-        return canonical
-
-    boundary_size = _boundary_safe_json_string_utf8_size(value, closes)
-    if boundary_size > max_utf8_bytes:
-        raise _HardComplexityExceeded(
-            "finite wire payload aggregate exceeds hard compiler envelope"
-        )
-    boundary_safe = _boundary_safe_json_string_literal(value, closes)
-    if not any(close in boundary_safe for close in closes) and codec.decode_raw_payload(boundary_safe) == value:
-        return boundary_safe
-    return None
+    return encoded
 
 
 def _finite_wire_payload_bytes(arguments: tuple[ArgumentBranchPlan, ...]) -> int:
@@ -779,9 +599,14 @@ def compile_tool_wire_plan(
     compiler_capabilities: ConstraintCompilerCapabilities,
     presentation_orders: Mapping[str, tuple[str, ...]],
     budget: CompileBudget,
-    parser_branch_id: str,
     constraint_fingerprint: str | None = None,
     activation_trigger_ids: tuple[str, ...] | None = None,
+    effective_tool_modes: Mapping[str, ToolConstraintMode] | None = None,
+    allow_format_fallback_tools: frozenset[str] | None = None,
+    property_schema_resolver: Callable[
+        [dict[str, JsonValue], dict[str, JsonValue], int, int], dict[str, JsonValue]
+    ]
+    | None = None,
     constraint_artifact_builder: Callable[
         [ToolWireSpec, tuple[ToolBranchPlan, ...], tuple[str, ...]], _ConstraintArtifactCandidate
     ]
@@ -804,10 +629,23 @@ def compile_tool_wire_plan(
         raise TypeError("compiler_capabilities must be ConstraintCompilerCapabilities")
     if not isinstance(presentation_orders, Mapping):
         raise TypeError("presentation_orders must be a mapping")
+    if effective_tool_modes is not None:
+        if not isinstance(effective_tool_modes, Mapping):
+            raise TypeError("effective_tool_modes must be a mapping or None")
+        for tool_name, effective_mode in effective_tool_modes.items():
+            if not isinstance(tool_name, str) or not tool_name:
+                raise ValueError("effective_tool_modes keys must be non-empty strings")
+            if not isinstance(effective_mode, ToolConstraintMode):
+                raise TypeError("effective_tool_modes values must be ToolConstraintMode")
+    if allow_format_fallback_tools is not None and (
+        not isinstance(allow_format_fallback_tools, frozenset)
+        or not all(isinstance(name, str) and name for name in allow_format_fallback_tools)
+    ):
+        raise TypeError("allow_format_fallback_tools must be a frozenset of non-empty strings or None")
+    if property_schema_resolver is not None and not callable(property_schema_resolver):
+        raise TypeError("property_schema_resolver must be callable or None")
     if not isinstance(budget, CompileBudget):
         raise TypeError("budget must be a CompileBudget")
-    if not isinstance(parser_branch_id, str) or not parser_branch_id:
-        raise ValueError("parser_branch_id must be a non-empty string")
     if constraint_artifact_builder is not None and constraint_fingerprint is not None:
         raise ValueError(
             "constraint_fingerprint must be produced by the artifact finalizer, not supplied twice"
@@ -816,15 +654,28 @@ def compile_tool_wire_plan(
         raise ValueError("constraint artifact builder and finalizer must be supplied together")
 
     exposed_count = _exposed_tool_count(policy)
+    exposed_names = _exposed_tool_names(policy)
+    if effective_tool_modes is not None and set(effective_tool_modes) != set(exposed_names):
+        raise ToolWireCompileError("effective_tool_modes must cover exactly the exposed Tool branches")
+    format_fallback_tools = allow_format_fallback_tools or frozenset()
+    if not format_fallback_tools <= set(exposed_names):
+        raise ToolWireCompileError("format fallback may name only exposed Tool branches")
+
+    def effective_mode_for(tool_name: str) -> ToolConstraintMode:
+        if effective_tool_modes is None:
+            return mode
+        return effective_tool_modes[tool_name]
+
+    constraint_enabled = any(
+        effective_mode_for(tool_name) is not ToolConstraintMode.OFF for tool_name in exposed_names
+    )
     ledger = _CompileBudgetLedger(budget)
-    if len(policy.tools) > _HARD_MAX_EXPOSED_TOOLS or exposed_count > _HARD_MAX_EXPOSED_TOOLS:
+    if exposed_count > _HARD_MAX_EXPOSED_TOOLS:
         return _rejected_budget_plan(
             spec,
             policy,
             mode,
-            compiler_capabilities,
             budget,
-            parser_branch_id,
             ledger,
         )
     try:
@@ -840,19 +691,16 @@ def compile_tool_wire_plan(
             spec,
             policy,
             mode,
-            compiler_capabilities,
             budget,
-            parser_branch_id,
             ledger,
         )
 
     try:
         trigger_ids = _activation_ids(
             spec,
-            mode,
+            constraint_enabled,
             constraint_fingerprint,
             activation_trigger_ids,
-            ledger,
             artifact_emission=constraint_artifact_builder is not None,
         )
     except _BranchBudgetExceeded:
@@ -860,9 +708,7 @@ def compile_tool_wire_plan(
             spec,
             policy,
             mode,
-            compiler_capabilities,
             budget,
-            parser_branch_id,
             ledger,
         )
     order_count = len(presentation_orders)
@@ -877,7 +723,7 @@ def compile_tool_wire_plan(
     aggregate_source_chars = 0
     hard_envelope = _HardEnvelopeBudget()
     try:
-        for tool in _iter_exposed_tools(policy, ledger):
+        for tool in _iter_exposed_tools(policy):
             source_json = tool.parameters.canonical_json
             if len(tool.name) > _HARD_MAX_NAME_CHARS:
                 raise _HardComplexityExceeded("Tool name exceeds hard compiler envelope")
@@ -930,7 +776,7 @@ def compile_tool_wire_plan(
                 tool,
                 schema_value,
                 order_evidence,
-                ledger,
+                property_schema_resolver=property_schema_resolver,
             )
             minimal_names = (
                 prepared.required_names
@@ -950,9 +796,10 @@ def compile_tool_wire_plan(
                     spec,
                     compiler_capabilities,
                     prepared,
-                    mode,
+                    effective_mode_for(prepared.tool.name),
                     ledger,
                     hard_envelope,
+                    allow_format_fallback=prepared.tool.name in format_fallback_tools,
                 )
             )
 
@@ -961,46 +808,25 @@ def compile_tool_wire_plan(
             spec,
             policy,
             mode,
-            compiler_capabilities,
             budget,
-            parser_branch_id,
             ledger,
         )
 
     # Minimal-language-first V3: bounded order inspection is ordinary implementation work; one
     # deterministic minimal order per Tool is selected before any optional enrichment is considered.
-    prepared_orders: list[_PreparedOrderState] = []
-    try:
-        for semantics in compiled_semantics:
-            prepared_orders.append(
-                _prepare_orders_metered(
-                    semantics.prepared.order_evidence,
-                    semantics.wire_required_names,
-                    semantics.prepared.minimum_order_bytes,
-                    ledger,
-                )
-            )
-    except _BranchBudgetExceeded:
-        return _rejected_budget_plan(
-            spec,
-            policy,
-            mode,
-            compiler_capabilities,
-            budget,
-            parser_branch_id,
-            ledger,
+    prepared_orders = [
+        _prepare_orders(
+            semantics.prepared.order_evidence,
+            semantics.wire_required_names,
         )
+        for semantics in compiled_semantics
+    ]
 
-    # V3 first commits a deterministic minimal language: exactly one stable order per Tool. Only
-    # after that minimal product is proven affordable do we consider bounded exhaustive enrichment.
+    # Reserve mandatory parameters for every Tool before attempting optional schemas.
     selected_tools = [
         _materialize_tool_branch(semantics, _minimal_order_plan(prepared_order, spec))
         for semantics, prepared_order in zip(compiled_semantics, prepared_orders, strict=True)
     ]
-    materialized_orders = tuple(
-        (semantics.prepared.tool.name, semantics.prepared.order_evidence)
-        for semantics in compiled_semantics
-    )
     selected_artifact: _ConstraintArtifactCandidate | None = None
     selected_optional_semantic_costs = [
         _SemanticProductCost() for _ in compiled_semantics
@@ -1031,34 +857,49 @@ def compile_tool_wire_plan(
             spec,
             policy,
             mode,
-            compiler_capabilities,
             budget,
-            parser_branch_id,
             ledger,
         )
 
     # Enrich one Tool at a time in stable presentation order. Candidate construction is bounded by
     # Layer 1 and does not mutate authoritative telemetry; only an actually fitting product commits.
     for tool_index, prepared_order in enumerate(prepared_orders):
-        full_order_plan = _full_order_candidate_v3(
-            spec,
-            prepared_order,
-            budget.max_permutations,
-        )
-        if full_order_plan is None or len(full_order_plan.orders) <= 1:
+        if not prepared_order.optional:
             continue
+        full_order_plan = _declared_order_plan(prepared_order, spec)
         semantics = compiled_semantics[tool_index]
+        prepared = semantics.prepared
         selected_wire_payload_bytes = _tool_finite_wire_payload_bytes(tuple(selected_tools))
-        candidate_semantic_cost = _compile_optional_argument_candidates(
-            spec,
-            compiler_capabilities,
-            semantics,
-            mode,
-            wire_payload_limit=(
-                _HARD_MAX_FINITE_WIRE_PAYLOAD_BYTES_TOTAL - selected_wire_payload_bytes
-            ),
-        )
+        base_schema_nodes = hard_envelope.schema_nodes_used
+        base_resolved_schemas = dict(prepared.resolved_property_schemas)
+        base_resolution_cache = dict(prepared.property_resolution_cache)
+        candidate_semantic_cost: _SemanticProductCost | None = None
+        candidate_schema_nodes = 0
+        candidate_resolved_schemas = base_resolved_schemas
+        candidate_resolution_cache = base_resolution_cache
+        try:
+            candidate_semantic_cost = _compile_optional_argument_candidates(
+                spec,
+                compiler_capabilities,
+                semantics,
+                semantics.mode,
+                wire_payload_limit=(
+                    _HARD_MAX_FINITE_WIRE_PAYLOAD_BYTES_TOTAL - selected_wire_payload_bytes
+                ),
+                hard_envelope=hard_envelope,
+            )
+            if candidate_semantic_cost is not None:
+                candidate_schema_nodes = hard_envelope.schema_nodes_used - base_schema_nodes
+                candidate_resolved_schemas = dict(prepared.resolved_property_schemas)
+                candidate_resolution_cache = dict(prepared.property_resolution_cache)
+        finally:
+            # Optional enrichment is speculative. A rejected/failed candidate must not consume
+            # Layer-1 schema authority or leave resolver cache state visible to later Tools.
+            hard_envelope.schema_nodes_used = base_schema_nodes
+            prepared.resolved_property_schemas = base_resolved_schemas
+            prepared.property_resolution_cache = base_resolution_cache
         if candidate_semantic_cost is None:
+            semantics.optional_argument_candidates = {}
             continue
         try:
             candidate_tools_list = list(selected_tools)
@@ -1082,6 +923,9 @@ def compile_tool_wire_plan(
                 finite_wire_payload_bytes=candidate_wire_payload_bytes,
                 semantic_cost=total_candidate_semantic_cost,
             ):
+                hard_envelope.consume_schema_nodes(candidate_schema_nodes)
+                prepared.resolved_property_schemas = candidate_resolved_schemas
+                prepared.property_resolution_cache = candidate_resolution_cache
                 selected_tools = candidate_tools_list
                 selected_artifact = candidate_artifact
                 selected_optional_semantic_costs = candidate_semantic_costs
@@ -1126,9 +970,7 @@ def compile_tool_wire_plan(
             spec,
             policy,
             mode,
-            compiler_capabilities,
             budget,
-            parser_branch_id,
             ledger,
         )
     if any(tool.order_plan.narrowed for tool in materialized_tools):
@@ -1167,20 +1009,14 @@ def compile_tool_wire_plan(
     return CompiledToolWirePlan(
         spec_id=spec.spec_id,
         spec_fingerprint=spec.fingerprint,
-        compiler_capabilities_fingerprint=compiler_capabilities.fingerprint,
-        schema_semantic_authority=compiler_capabilities.schema_semantic_authority,
         constraint_mode=mode,
-        tool_choice_mode=policy.choice.mode.value,
-        named_tool_choice=policy.choice.name,
         allow_parallel=policy.allow_parallel,
         tools=materialized_tools,
-        presentation_orders=materialized_orders,
         disposition=disposition,
         compile_budget=budget,
         budget_result=budget_result,
         constraint_fingerprint=effective_constraint_fingerprint,
         activation=activation,
-        parser_branch_id=parser_branch_id,
     )
 
 
@@ -1193,13 +1029,17 @@ def _exposed_tool_count(policy: ToolPolicy) -> int:
     return len(policy.tools)
 
 
-def _iter_exposed_tools(
-    policy: ToolPolicy,
-    ledger: _CompileBudgetLedger,
-) -> Iterator[FunctionTool]:
-    """Yield exposed Tools from a hard-bounded ToolPolicy without duplicating the collection."""
+def _exposed_tool_names(policy: ToolPolicy) -> tuple[str, ...]:
+    if policy.choice.mode is ToolChoiceMode.NONE:
+        return ()
+    if policy.choice.mode is ToolChoiceMode.NAMED:
+        assert policy.choice.name is not None
+        return (policy.choice.name,)
+    return tuple(tool.name for tool in policy.tools)
 
-    del ledger
+
+def _iter_exposed_tools(policy: ToolPolicy) -> Iterator[FunctionTool]:
+    """Yield exposed Tools from a hard-bounded ToolPolicy without duplicating the collection."""
     if policy.choice.mode is ToolChoiceMode.NONE:
         return
     if policy.choice.mode is ToolChoiceMode.NAMED:
@@ -1217,7 +1057,11 @@ def _prepare_tool_for_compile(
     tool: FunctionTool,
     schema: dict[str, JsonValue],
     presentation_order: tuple[str, ...],
-    ledger: _CompileBudgetLedger,
+    *,
+    property_schema_resolver: Callable[
+        [dict[str, JsonValue], dict[str, JsonValue], int, int], dict[str, JsonValue]
+    ]
+    | None = None,
 ) -> _PreparedTool:
     """Validate and retain one Tool's request-sized state under the plan ledger."""
 
@@ -1234,9 +1078,7 @@ def _prepare_tool_for_compile(
     if max(property_count, len(required), len(presentation_order)) > _HARD_MAX_OBJECT_PROPERTIES:
         raise _HardComplexityExceeded("Tool property/order cardinality exceeds hard compiler envelope")
 
-    # The V3 hard envelope bounds name/cardinality scans. Keep the exact one-order byte fact for
-    # compatibility/diagnostics, but do not treat measuring it as an instruction-level work charge.
-    minimum_order_bytes = 0
+    # Validate names before schema materialization; product bytes are charged on the selected order.
     if spec.occurrence.optional_omission:
         required_name_values: list[str] = []
         for name in required:
@@ -1244,7 +1086,7 @@ def _prepare_tool_for_compile(
                 raise ToolWireCompileError(f"tool {tool.name!r} required must contain property names")
             if len(name) > _HARD_MAX_NAME_CHARS:
                 raise _HardComplexityExceeded("required argument name exceeds hard compiler envelope")
-            minimum_order_bytes += _utf8_len_or_hard_reject(
+            _utf8_len_or_hard_reject(
                 name,
                 label="required argument name",
             )
@@ -1258,7 +1100,7 @@ def _prepare_tool_for_compile(
                 )
             if len(name) > _HARD_MAX_NAME_CHARS:
                 raise _HardComplexityExceeded("presentation argument name exceeds hard compiler envelope")
-            minimum_order_bytes += _utf8_len_or_hard_reject(
+            _utf8_len_or_hard_reject(
                 name,
                 label="presentation argument name",
             )
@@ -1267,7 +1109,6 @@ def _prepare_tool_for_compile(
         required_names = frozenset(name for name in required if isinstance(name, str))
 
     # V3 permits ordinary bounded hash/set validation after hard-envelope admission.
-    del ledger
     for evidence_name in presentation_order:
         if not isinstance(evidence_name, str):
             raise ToolWireCompileError(
@@ -1298,24 +1139,29 @@ def _prepare_tool_for_compile(
         schema=schema,
         order_evidence=presentation_order,
         property_schemas=property_schemas,
+        resolved_property_schemas={},
+        property_resolution_cache={},
+        property_schema_resolver=property_schema_resolver,
         property_names=property_names,
         required_names=required_names,
-        minimum_order_bytes=minimum_order_bytes,
     )
 
 
 def _activation_ids(
     spec: ToolWireSpec,
-    mode: ToolConstraintMode,
+    constraint_enabled: bool,
     constraint_fingerprint: str | None,
     activation_trigger_ids: tuple[str, ...] | None,
-    ledger: _CompileBudgetLedger,
     *,
     artifact_emission: bool = False,
 ) -> tuple[str, ...] | None:
-    if mode is ToolConstraintMode.OFF:
+    if not isinstance(constraint_enabled, bool):
+        raise TypeError("constraint_enabled must be a bool")
+    if not constraint_enabled:
         if constraint_fingerprint is not None or activation_trigger_ids is not None:
-            raise ToolWireCompileError("OFF Tool-wire plans cannot claim a constraint activation")
+            raise ToolWireCompileError(
+                "OFF Tool-wire plans / validation-only branches cannot claim a constraint activation"
+            )
         return None
     if not artifact_emission and (constraint_fingerprint is None or not constraint_fingerprint):
         raise ToolWireCompileError("constrained Tool-wire plan requires a constraint fingerprint")
@@ -1323,7 +1169,6 @@ def _activation_ids(
         raise ToolWireCompileError("constrained Tool-wire plan requires activation trigger ids")
     if len(activation_trigger_ids) > len(spec.activation_triggers):
         raise ToolWireCompileError("activation trigger ids must be unique and declared")
-    del ledger
     declared = {trigger.trigger_id for trigger in spec.activation_triggers}
     seen: set[str] = set()
     for trigger_id in activation_trigger_ids:
@@ -1341,9 +1186,7 @@ def _rejected_budget_plan(
     spec: ToolWireSpec,
     policy: ToolPolicy,
     mode: ToolConstraintMode,
-    compiler_capabilities: ConstraintCompilerCapabilities,
     budget: CompileBudget,
-    parser_branch_id: str,
     ledger: _CompileBudgetLedger,
 ) -> CompiledToolWirePlan:
     """Materialize bounded rejection diagnostics directly from the authoritative ledger."""
@@ -1351,20 +1194,14 @@ def _rejected_budget_plan(
     return CompiledToolWirePlan(
         spec_id=spec.spec_id,
         spec_fingerprint=spec.fingerprint,
-        compiler_capabilities_fingerprint=compiler_capabilities.fingerprint,
-        schema_semantic_authority=compiler_capabilities.schema_semantic_authority,
         constraint_mode=mode,
-        tool_choice_mode=policy.choice.mode.value,
-        named_tool_choice=policy.choice.name,
         allow_parallel=policy.allow_parallel,
         tools=(),
-        presentation_orders=(),
         disposition=PlanCompileDisposition.REJECTED,
         compile_budget=budget,
         budget_result=ledger.snapshot(),
         constraint_fingerprint=None,
         activation=None,
-        parser_branch_id=parser_branch_id,
     )
 
 
@@ -1375,12 +1212,21 @@ def _compile_disposition(
 ) -> PlanCompileDisposition:
     if not within_budget:
         return PlanCompileDisposition.REJECTED
-    if mode is ToolConstraintMode.OFF or not tools:
+    if not tools:
         return PlanCompileDisposition.VALIDATION_ONLY
-    if all(branch.representable and branch.guarantee is not GenerationGuarantee.NONE for branch in tools):
-        return PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     if any(branch.strict and not branch.representable for branch in tools):
         return PlanCompileDisposition.REJECTED
+    if any(branch.strict for branch in tools):
+        if all(
+            branch.representable
+            and branch.guarantee in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
+            and (not branch.strict or branch.guarantee is GenerationGuarantee.SCHEMA)
+            for branch in tools
+        ):
+            return PlanCompileDisposition.CONSTRAINED_EXECUTABLE
+        return PlanCompileDisposition.REJECTED
+    if all(branch.representable and branch.guarantee is not GenerationGuarantee.NONE for branch in tools):
+        return PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     return PlanCompileDisposition.VALIDATION_ONLY
 
 
@@ -1395,17 +1241,7 @@ def _unselected_optional_argument(
     schema_type_value = property_schema.get("type")
     schema_type = schema_type_value if isinstance(schema_type_value, str) else None
     framing_variant_id = spec.framing_selector.select(schema_type)
-    variant = spec.framing_variant(framing_variant_id) if framing_variant_id is not None else None
-    name_representable = (
-        variant is not None
-        and spec.argument_name_codec.is_losslessly_representable_for_terminal(
-            name,
-            variant.argument_open,
-        )
-    )
-    status, value_mode, admitted, proof = _unsupported_proof(
-        "optional argument is not selected by the minimal constrained language"
-    )
+    _, value_mode, guarantee = _unsupported_proof()
     return ArgumentBranchPlan(
         name=name,
         required=False,
@@ -1415,12 +1251,9 @@ def _unselected_optional_argument(
         generation_schema_json=None,
         presentation_index=presentation_index,
         framing_variant_id=framing_variant_id,
-        name_representable=name_representable,
-        representability=status,
         value_mode=value_mode,
-        admitted_values_json=admitted,
         admitted_wire_payloads=None,
-        proof=proof,
+        guarantee=guarantee,
     )
 
 
@@ -1431,6 +1264,8 @@ def _compile_tool_semantics(
     mode: ToolConstraintMode,
     ledger: _CompileBudgetLedger,
     hard_envelope: _HardEnvelopeBudget,
+    *,
+    allow_format_fallback: bool = False,
 ) -> _CompiledToolSemantics:
     """Compile only semantics required by the deterministic minimal Tool language."""
 
@@ -1439,24 +1274,35 @@ def _compile_tool_semantics(
     presentation_order = prepared.order_evidence
     property_schemas = prepared.property_schemas
     required_names = prepared.required_names
+    wire_required_source_names = frozenset(
+        name
+        for name in presentation_order
+        if name in required_names or not spec.occurrence.optional_omission
+    )
+    resolved_wire_required_schemas = {
+        name: _resolved_prepared_property_schema(prepared, name, hard_envelope)
+        for name in presentation_order
+        if name in wire_required_source_names
+    }
 
     tool_name_representable = spec.function_name_codec.is_losslessly_representable_for_terminal(
         tool.name,
         spec.function_open,
     )
-    semantic_budget = _SemanticBudgetMeter(owner=ledger)
     if (
         compiler_capabilities.decoder_safe_generation_schema
         and mode is ToolConstraintMode.FORMAT
     ):
         object_schema_safe = False
-        object_schema_detail = "FORMAT mode does not require object-level SCHEMA witness proof"
     else:
-        object_schema_safe, object_schema_detail = _object_schema_proof(
+        witness_schema: dict[str, JsonValue] = dict(schema)
+        witness_properties: dict[str, JsonValue] = dict(resolved_wire_required_schemas)
+        witness_schema["properties"] = witness_properties
+        object_schema_safe = _object_schema_proof(
             schema,
             compiler_capabilities,
             schema_json=tool.parameters.canonical_json,
-            semantic_budget=semantic_budget,
+            witness_schema=witness_schema,
         )
 
     arguments_list: list[ArgumentBranchPlan] = []
@@ -1467,17 +1313,18 @@ def _compile_tool_semantics(
                 spec,
                 compiler_capabilities,
                 name,
-                property_schemas[name],
+                resolved_wire_required_schemas[name],
                 required=name in required_names,
                 wire_required=True,
                 presentation_index=index,
                 mode=mode,
-                semantic_budget=semantic_budget,
                 wire_payload_limit=hard_envelope.remaining_finite_wire_payload_bytes,
+                allow_format_fallback=allow_format_fallback,
             )
             hard_envelope.consume_finite_wire_payload_bytes(
                 _finite_wire_payload_bytes((argument,))
             )
+            ledger.charge_bytes(_argument_semantic_product_bytes(argument))
         else:
             argument = _unselected_optional_argument(
                 spec,
@@ -1491,32 +1338,30 @@ def _compile_tool_semantics(
     wire_required_names = frozenset(
         argument.name for argument in arguments if argument.wire_required
     )
-    generated_order = tuple(
-        name for name in presentation_order if name in wire_required_names
-    )
     representable = tool_name_representable and all(
-        argument.generated and argument.name_representable
-        for argument in arguments
-        if argument.wire_required
+        argument.generated for argument in arguments if argument.wire_required
     )
     guarantee = _tool_guarantee(arguments, mode, object_schema_safe=object_schema_safe)
     if not tool_name_representable:
         guarantee = GenerationGuarantee.NONE
-    if tool.strict and guarantee is not GenerationGuarantee.SCHEMA:
-        representable = False
+    selected_mode = mode
+    if (
+        mode is ToolConstraintMode.SCHEMA
+        and allow_format_fallback
+        and not tool.strict
+        and representable
+        and guarantee is GenerationGuarantee.FORMAT
+    ):
+        selected_mode = ToolConstraintMode.FORMAT
 
     return _CompiledToolSemantics(
         prepared=prepared,
-        mode=mode,
+        mode=selected_mode,
         name_representable=tool_name_representable,
         object_schema_safe=object_schema_safe,
-        object_schema_detail=object_schema_detail,
         arguments=arguments,
         optional_argument_candidates={},
-        generated_order=generated_order,
         wire_required_names=wire_required_names,
-        representable=representable,
-        guarantee=guarantee,
     )
 
 
@@ -1527,6 +1372,7 @@ def _compile_optional_argument_candidates(
     mode: ToolConstraintMode,
     *,
     wire_payload_limit: int,
+    hard_envelope: _HardEnvelopeBudget,
 ) -> _SemanticProductCost | None:
     """Build one Tool's bounded optional candidates for the current enrichment attempt only."""
 
@@ -1542,21 +1388,16 @@ def _compile_optional_argument_candidates(
     for index, name in enumerate(prepared.order_evidence):
         if name in semantics.wire_required_names:
             continue
-        temporary_budget = _SemanticBudgetMeter(
-            max_bytes=1_000_000_000,
-            max_work_units=1_000_000_000,
-        )
         try:
             candidate = _compile_argument(
                 spec,
                 compiler_capabilities,
                 name,
-                prepared.property_schemas[name],
+                _resolved_prepared_property_schema(prepared, name, hard_envelope),
                 required=False,
                 wire_required=False,
                 presentation_index=index,
                 mode=mode,
-                semantic_budget=temporary_budget,
                 wire_payload_limit=wire_payload_limit - candidate_wire_bytes,
             )
         except (_BranchBudgetExceeded, _HardComplexityExceeded):
@@ -1566,7 +1407,7 @@ def _compile_optional_argument_candidates(
             semantics.optional_argument_candidates = {}
             return None
         candidate_wire_bytes += _finite_wire_payload_bytes((candidate,))
-        candidate_semantic_bytes += temporary_budget.bytes_used
+        candidate_semantic_bytes += _argument_semantic_product_bytes(candidate)
         candidates[name] = candidate
 
     if len(candidates) != len(optional_names):
@@ -1599,9 +1440,7 @@ def _materialize_tool_branch(
         for argument in semantics.arguments
     )
     representable = semantics.name_representable and all(
-        argument.generated and argument.name_representable
-        for argument in arguments
-        if argument.wire_required
+        argument.generated for argument in arguments if argument.wire_required
     )
     guarantee = _tool_guarantee(
         arguments,
@@ -1610,16 +1449,14 @@ def _materialize_tool_branch(
     )
     if not semantics.name_representable:
         guarantee = GenerationGuarantee.NONE
+    if semantics.mode is ToolConstraintMode.SCHEMA and guarantee is not GenerationGuarantee.SCHEMA:
+        representable = False
     if tool.strict and guarantee is not GenerationGuarantee.SCHEMA:
         representable = False
     return ToolBranchPlan(
         tool_name=tool.name,
-        schema_json=tool.parameters.canonical_json,
         strict=tool.strict,
-        name_representable=semantics.name_representable,
         representable=representable,
-        object_schema_safe=semantics.object_schema_safe,
-        object_schema_detail=semantics.object_schema_detail,
         arguments=arguments,
         order_plan=order_plan,
         guarantee=guarantee,
@@ -1631,45 +1468,21 @@ def _object_schema_proof(
     compiler_capabilities: ConstraintCompilerCapabilities,
     *,
     schema_json: str | None = None,
-    semantic_budget: _SemanticBudgetMeter | None = None,
-) -> tuple[bool, str]:
+    witness_schema: dict[str, JsonValue] | None = None,
+) -> bool:
     supported = frozenset(compiler_capabilities.supported_object_keywords)
-    if semantic_budget is None:
-        semantic_keys = set(schema) - _ANNOTATION_KEYWORDS
-        unsupported = semantic_keys - supported
-        if unsupported:
-            return False, f"unsupported object schema keyword: {min(unsupported)}"
-    else:
-        semantic_budget.charge_work(len(schema))
-        unsupported_name: str | None = None
-        for keyword in schema:
-            if (
-                keyword not in _ANNOTATION_KEYWORDS
-                and keyword not in supported
-                and (unsupported_name is None or keyword < unsupported_name)
-            ):
-                unsupported_name = keyword
-        if unsupported_name is not None:
-            return False, f"unsupported object schema keyword: {unsupported_name}"
+    semantic_keys = set(schema) - _ANNOTATION_KEYWORDS
+    if semantic_keys - supported:
+        return False
     if compiler_capabilities.schema_semantic_authority is SchemaSemanticAuthority.NONE:
-        return False, "compiler capability has no exact schema semantic authority"
+        return False
     exact_schema_json = schema_json if schema_json is not None else canonical_json_dumps(schema)
-    witness = (
-        find_exact_witness_metered(
-            compiler_capabilities.schema_semantic_authority,
-            exact_schema_json,
-            semantic_budget.charge_work,
-            parsed_schema=schema,
-        )
-        if semantic_budget is not None
-        else find_exact_witness(
-            compiler_capabilities.schema_semantic_authority,
-            exact_schema_json,
-        )
-    )
-    if witness is None:
-        return False, "object-schema non-emptiness is not proven by the exact semantic authority"
-    return True, "object-level schema semantics and a concrete witness are covered by exact semantic authority"
+    candidate_schema = schema if witness_schema is None else witness_schema
+    return find_exact_witness(
+        compiler_capabilities.schema_semantic_authority,
+        exact_schema_json,
+        parsed_schema=candidate_schema,
+    ) is not None
 
 
 def _compile_argument(
@@ -1682,10 +1495,10 @@ def _compile_argument(
     wire_required: bool,
     presentation_index: int,
     mode: ToolConstraintMode,
-    semantic_budget: _SemanticBudgetMeter,
     wire_payload_limit: int | None = None,
+    allow_format_fallback: bool = False,
 ) -> ArgumentBranchPlan:
-    schema_json = _metered_canonical_json_dumps(property_schema, semantic_budget)
+    schema_json = canonical_json_dumps(property_schema)
     schema_type_value = property_schema.get("type")
     schema_type = schema_type_value if isinstance(schema_type_value, str) else None
     framing_variant_id = spec.framing_selector.select(schema_type)
@@ -1699,54 +1512,68 @@ def _compile_argument(
     )
     generation_schema_json: str | None = None
     admitted_wire_payloads: tuple[str, ...] | None = None
-    if framing_variant_id is None:
-        status, value_mode, admitted, intrinsic_proof = _unsupported_proof(
-            "argument framing selector cannot resolve this schema branch"
-        )
-    elif not name_representable:
-        status, value_mode, admitted, intrinsic_proof = _unsupported_proof(
-            "argument name is not losslessly representable at the selected static wire boundary"
-        )
+    if framing_variant_id is None or not name_representable:
+        status, value_mode, intrinsic_guarantee = _unsupported_proof()
     else:
         assert variant is not None
         if variant.value_framing.kind is ValueFramingKind.RAW_UNTIL:
-            previous_wire_payload_limit = getattr(
-                semantic_budget,
-                "_hard_wire_payload_limit",
-                None,
+            status, value_mode, admitted_wire_payloads, intrinsic_guarantee = _raw_argument_proof(
+                variant,
+                compiler_capabilities,
+                property_schema,
+                schema_json=schema_json,
+                mode=mode,
+                wire_payload_limit=wire_payload_limit,
             )
-            semantic_budget._hard_wire_payload_limit = wire_payload_limit
-            try:
-                (
-                    status,
-                    value_mode,
-                    admitted,
-                    admitted_wire_payloads,
-                    intrinsic_proof,
-                ) = _raw_argument_proof(
-                    variant,
-                    compiler_capabilities,
-                    property_schema,
-                    schema_json=schema_json,
-                    semantic_budget=semantic_budget,
-                )
-            finally:
-                semantic_budget._hard_wire_payload_limit = previous_wire_payload_limit
         else:
-            status, value_mode, admitted, intrinsic_proof, generation_schema_json = (
+            status, value_mode, intrinsic_guarantee, generation_schema_json = (
                 _structured_argument_proof(
                     variant,
                     compiler_capabilities,
                     property_schema,
                     schema_json=schema_json,
                     mode=mode,
-                    semantic_budget=semantic_budget,
                 )
             )
-    proof = _cap_proof_to_mode(intrinsic_proof, mode)
-    generated = _argument_is_generated(status, proof, mode) and name_representable
+    guarantee = _cap_guarantee_to_mode(intrinsic_guarantee, mode)
+    generated = _argument_is_generated(status, guarantee, mode) and name_representable
+    if (
+        not generated
+        and allow_format_fallback
+        and mode is ToolConstraintMode.SCHEMA
+        and name_representable
+        and variant is not None
+    ):
+        generation_schema_json = None
+        admitted_wire_payloads = None
+        if variant.value_framing.kind is ValueFramingKind.RAW_UNTIL:
+            status, value_mode, admitted_wire_payloads, intrinsic_guarantee = _raw_argument_proof(
+                variant,
+                compiler_capabilities,
+                property_schema,
+                schema_json=schema_json,
+                mode=ToolConstraintMode.FORMAT,
+                wire_payload_limit=wire_payload_limit,
+            )
+        else:
+            status, value_mode, intrinsic_guarantee, generation_schema_json = (
+                _structured_argument_proof(
+                    variant,
+                    compiler_capabilities,
+                    property_schema,
+                    schema_json=schema_json,
+                    mode=ToolConstraintMode.FORMAT,
+                )
+            )
+        guarantee = _cap_guarantee_to_mode(intrinsic_guarantee, ToolConstraintMode.FORMAT)
+        generated = (
+            _argument_is_generated(status, guarantee, ToolConstraintMode.FORMAT)
+            and name_representable
+        )
     if not generated:
         generation_schema_json = None
+        admitted_wire_payloads = None
+        guarantee = GenerationGuarantee.NONE
     return ArgumentBranchPlan(
         name=name,
         required=required,
@@ -1756,26 +1583,24 @@ def _compile_argument(
         generation_schema_json=generation_schema_json,
         presentation_index=presentation_index,
         framing_variant_id=framing_variant_id,
-        name_representable=name_representable,
-        representability=status,
         value_mode=value_mode,
-        admitted_values_json=admitted,
         admitted_wire_payloads=admitted_wire_payloads,
-        proof=proof,
+        guarantee=guarantee,
     )
 
 
-def _raw_unsupported_proof(
-    detail: str,
-) -> tuple[
+def _raw_unsupported_proof() -> tuple[
     RepresentabilityStatus,
     ConstraintValueMode,
     tuple[str, ...] | None,
-    tuple[str, ...] | None,
-    BranchGuaranteeProof,
+    GenerationGuarantee,
 ]:
-    status, value_mode, admitted, proof = _unsupported_proof(detail)
-    return status, value_mode, admitted, None, proof
+    return (
+        RepresentabilityStatus.UNSUPPORTED,
+        ConstraintValueMode.VALIDATION_ONLY,
+        None,
+        GenerationGuarantee.NONE,
+    )
 
 
 def _raw_argument_proof(
@@ -1784,27 +1609,24 @@ def _raw_argument_proof(
     property_schema: dict[str, JsonValue],
     *,
     schema_json: str | None = None,
-    semantic_budget: _SemanticBudgetMeter,
+    mode: ToolConstraintMode,
+    wire_payload_limit: int | None = None,
 ) -> tuple[
     RepresentabilityStatus,
     ConstraintValueMode,
     tuple[str, ...] | None,
-    tuple[str, ...] | None,
-    BranchGuaranteeProof,
+    GenerationGuarantee,
 ]:
     forbidden = variant.value_framing.forbidden_close_language
     assert forbidden is not None
-    raw_codec = variant.value_framing.codec
-    if raw_codec not in {
+    if variant.value_framing.codec not in {
         ValueCodecKind.RAW_STRING,
         ValueCodecKind.RAW_STRING_STRIP_JSON_STRING_OR_TEXT,
     }:
-        return _raw_unsupported_proof("A0 RAW_UNTIL proof currently requires a raw-string codec")
+        return _raw_unsupported_proof()
     if property_schema.get("type") != "string":
-        return _raw_unsupported_proof("RAW_STRING codec cannot soundly decode a non-string property")
+        return _raw_unsupported_proof()
 
-    wire_payload_limit = getattr(semantic_budget, "_hard_wire_payload_limit", None)
-    semantic_budget.charge_work(len(property_schema))
     semantic_keys = set(property_schema) - _ANNOTATION_KEYWORDS
     unsupported = semantic_keys - set(compiler_capabilities.supported_property_keywords)
 
@@ -1812,25 +1634,25 @@ def _raw_argument_proof(
     if "const" in property_schema:
         const = property_schema["const"]
         if not isinstance(const, str):
-            return _raw_unsupported_proof("string const must itself be a string")
+            return _raw_unsupported_proof()
         finite_values = (const,)
     if "enum" in property_schema:
         enum_value = property_schema["enum"]
         if not isinstance(enum_value, list):
-            return _raw_unsupported_proof("string enum must contain only strings")
-        semantic_budget.charge_work(len(enum_value))
+            return _raw_unsupported_proof()
         enum_values_list: list[str] = []
         enum_members: set[str] = set()
         for value in enum_value:
             if not isinstance(value, str):
-                return _raw_unsupported_proof("string enum must contain only strings")
+                return _raw_unsupported_proof()
             enum_values_list.append(value)
             enum_members.add(value)
         enum_values = tuple(enum_values_list)
-        if finite_values is None:
-            finite_values = enum_values
-        else:
-            finite_values = tuple(value for value in finite_values if value in enum_members)
+        finite_values = (
+            enum_values
+            if finite_values is None
+            else tuple(value for value in finite_values if value in enum_members)
+        )
 
     resolved_schema_json = (
         schema_json if schema_json is not None else canonical_json_dumps(property_schema)
@@ -1840,21 +1662,21 @@ def _raw_argument_proof(
             compiler_capabilities.schema_semantic_authority
             is not SchemaSemanticAuthority.NONE
         )
-        semantically_valid: list[str] = []
-        if authoritative:
-            for value in finite_values:
-                semantic_budget.charge_work()
-                if schema_value_is_valid(
-                    compiler_capabilities.schema_semantic_authority,
-                    resolved_schema_json,
-                    value,
-                ):
-                    semantically_valid.append(value)
-        safe_values_list: list[str] = []
+        candidate_values: list[str] = []
+        if mode is ToolConstraintMode.FORMAT:
+            candidate_values.extend(finite_values)
+        elif authoritative:
+            _, admitted = exact_finite_non_emptiness(
+                compiler_capabilities.schema_semantic_authority,
+                resolved_schema_json,
+                finite_values,
+            )
+            candidate_values.extend(
+                value for value in admitted if isinstance(value, str)
+            )
         safe_wire_payloads_list: list[str] = []
         wire_payload_bytes_used = 0
-        for value in semantically_valid:
-            semantic_budget.charge_work(_text_scan_work_units(value))
+        for value in candidate_values:
             remaining_wire_bytes = (
                 None
                 if wire_payload_limit is None
@@ -1866,106 +1688,65 @@ def _raw_argument_proof(
                 remaining_wire_bytes,
             )
             if encoded is not None:
-                wire_payload_bytes_used += _metered_utf8_output_bytes(encoded, semantic_budget)
-                safe_values_list.append(value)
+                wire_payload_bytes_used += _utf8_len_or_hard_reject(
+                    encoded,
+                    label="finite wire payload",
+                )
                 safe_wire_payloads_list.append(encoded)
-        safe_values = tuple(safe_values_list)
         safe_wire_payloads = tuple(safe_wire_payloads_list)
-        if authoritative and not safe_values:
+        if mode is ToolConstraintMode.SCHEMA and authoritative and not safe_wire_payloads:
             return (
                 RepresentabilityStatus.EMPTY,
                 ConstraintValueMode.FINITE_VALUES,
                 (),
-                (),
-                BranchGuaranteeProof(
-                    framing_safe=True,
-                    decode_sound=True,
-                    schema_safe=not unsupported,
-                    non_empty=NonEmptinessStatus.PROVEN_EMPTY,
-                    guarantee=GenerationGuarantee.NONE,
-                    detail="exact schema authority plus close-language intersection proves the finite raw branch empty",
-                ),
+                GenerationGuarantee.NONE,
             )
-        schema_safe = (
-            authoritative
-            and not unsupported
-            and compiler_capabilities.schema_semantic_authority is not SchemaSemanticAuthority.NONE
-        )
-        non_empty = (
-            NonEmptinessStatus.PROVEN_NON_EMPTY
-            if safe_values
-            else NonEmptinessStatus.UNKNOWN
-        )
+        schema_safe = authoritative and not unsupported
         guarantee = (
             GenerationGuarantee.SCHEMA
-            if schema_safe and non_empty is NonEmptinessStatus.PROVEN_NON_EMPTY
-            else GenerationGuarantee.NONE
+            if schema_safe and safe_wire_payloads
+            else (
+                GenerationGuarantee.FORMAT
+                if mode is ToolConstraintMode.FORMAT and safe_wire_payloads
+                else GenerationGuarantee.NONE
+            )
         )
         return (
             RepresentabilityStatus.REPRESENTABLE,
             ConstraintValueMode.FINITE_VALUES,
-            _metered_canonical_json_values(tuple(safe_values), semantic_budget)
-            if safe_values
-            else None,
-            safe_wire_payloads if safe_values else None,
-            BranchGuaranteeProof(
-                framing_safe=True,
-                decode_sound=True,
-                schema_safe=schema_safe,
-                non_empty=non_empty,
-                guarantee=guarantee,
-                detail=(
-                    "finite raw values are validated by exact schema authority and intersected with every structural close spelling"
-                    if guarantee is GenerationGuarantee.SCHEMA
-                    else "finite raw non-emptiness is not proven by exact semantic authority"
-                ),
-            ),
+            safe_wire_payloads if safe_wire_payloads else None,
+            guarantee,
+        )
+
+    if mode is ToolConstraintMode.FORMAT:
+        return (
+            RepresentabilityStatus.REPRESENTABLE,
+            ConstraintValueMode.ANY_SAFE_RAW,
+            None,
+            GenerationGuarantee.FORMAT,
         )
 
     schema_safe = (
         not unsupported
         and compiler_capabilities.schema_semantic_authority is not SchemaSemanticAuthority.NONE
     )
-    witness = find_exact_witness_metered(
+    witness = find_exact_witness(
         compiler_capabilities.schema_semantic_authority,
         resolved_schema_json,
-        semantic_budget.charge_work,
         parsed_schema=property_schema,
     )
-    if witness is not None and isinstance(witness.value, str):
-        semantic_budget.charge_work()
     witness_safe = (
         witness is not None
         and isinstance(witness.value, str)
         and encode_lossless_raw_string(witness.value, variant.value_framing) is not None
     )
-    non_empty = (
-        NonEmptinessStatus.PROVEN_NON_EMPTY
-        if witness_safe
-        else NonEmptinessStatus.UNKNOWN
-    )
-    guarantee = (
-        GenerationGuarantee.SCHEMA
-        if schema_safe and non_empty is NonEmptinessStatus.PROVEN_NON_EMPTY
-        else GenerationGuarantee.NONE
-    )
     return (
         RepresentabilityStatus.REPRESENTABLE,
         ConstraintValueMode.ANY_SAFE_RAW,
         None,
-        None,
-        BranchGuaranteeProof(
-            framing_safe=True,
-            decode_sound=True,
-            schema_safe=schema_safe,
-            non_empty=non_empty,
-            guarantee=guarantee,
-            detail=(
-                "exact schema authority validates a raw witness outside the complete structural close language"
-                if guarantee is GenerationGuarantee.SCHEMA
-                else "raw branch non-emptiness is not proven by exact semantic authority"
-            ),
-        ),
+        GenerationGuarantee.SCHEMA
+        if schema_safe and witness_safe
+        else GenerationGuarantee.NONE,
     )
 
 
@@ -1979,15 +1760,12 @@ def _decoder_safe_generation_schema(
     schema: dict[str, JsonValue],
     *,
     preserve_schema_semantics: bool,
-    semantic_budget: _SemanticBudgetMeter,
 ) -> dict[str, JsonValue] | None:
-    semantic_budget.charge_work()
     schema_type = schema.get("type")
     if not isinstance(schema_type, str):
         return None
 
     if preserve_schema_semantics:
-        semantic_budget.charge_work()
         result: dict[str, JsonValue] = dict(schema)
     else:
         result = {"type": schema_type}
@@ -2020,7 +1798,6 @@ def _decoder_safe_generation_schema(
         transformed_items = _decoder_safe_generation_schema(
             items,
             preserve_schema_semantics=preserve_schema_semantics,
-            semantic_budget=semantic_budget,
         )
         if transformed_items is None:
             return None
@@ -2032,9 +1809,7 @@ def _decoder_safe_generation_schema(
         if not isinstance(properties_value, dict) or not isinstance(required_value, list):
             return None
 
-        # Authorize the complete request-sized required traversal before consuming it, then reuse
-        # the one materialized pass for membership, completeness and emitted required ordering.
-        semantic_budget.charge_work(len(required_value))
+        # Reuse one materialized pass for membership, completeness and emitted required ordering.
         required_names: list[str] = []
         required_name_set: set[str] = set()
         for name in required_value:
@@ -2044,7 +1819,6 @@ def _decoder_safe_generation_schema(
             required_name_set.add(name)
         remaining_required = set(required_name_set)
 
-        semantic_budget.charge_work()
         transformed_properties: dict[str, JsonValue] = {}
         for name, child in properties_value.items():
             if not isinstance(name, str) or not isinstance(child, dict):
@@ -2052,7 +1826,6 @@ def _decoder_safe_generation_schema(
             transformed = _decoder_safe_generation_schema(
                 child,
                 preserve_schema_semantics=preserve_schema_semantics,
-                semantic_budget=semantic_budget,
             )
             if transformed is None:
                 if name in required_name_set:
@@ -2078,34 +1851,28 @@ def _structured_argument_proof(
     *,
     schema_json: str,
     mode: ToolConstraintMode,
-    semantic_budget: _SemanticBudgetMeter,
 ) -> tuple[
     RepresentabilityStatus,
     ConstraintValueMode,
-    tuple[str, ...] | None,
-    BranchGuaranteeProof,
+    GenerationGuarantee,
     str | None,
 ]:
     if variant.value_framing.codec is not ValueCodecKind.JSON:
-        status, value_mode, admitted, proof = _unsupported_proof(
-            "structured A0 proof requires JSON codec"
-        )
-        return status, value_mode, admitted, proof, None
+        status, value_mode, guarantee = _unsupported_proof()
+        return status, value_mode, guarantee, None
 
     schema_authority = compiler_capabilities.schema_semantic_authority
 
     if not compiler_capabilities.decoder_safe_generation_schema:
-        unsupported = _unsupported_schema_keyword_metered(
+        unsupported = _unsupported_schema_keyword(
             property_schema,
             frozenset(compiler_capabilities.supported_property_keywords),
-            semantic_budget,
         )
         schema_safe = unsupported is None and schema_authority is not SchemaSemanticAuthority.NONE
-        non_empty = _exact_non_emptiness_legacy_metered(
+        non_empty = _exact_non_emptiness(
             compiler_capabilities,
             property_schema,
-            schema_json,
-            semantic_budget,
+            schema_json=schema_json,
         )
         value_mode = (
             ConstraintValueMode.STRUCTURED_SCHEMA
@@ -2113,20 +1880,7 @@ def _structured_argument_proof(
             else ConstraintValueMode.STRUCTURED_FORMAT
         )
         if non_empty is NonEmptinessStatus.PROVEN_EMPTY:
-            return (
-                RepresentabilityStatus.EMPTY,
-                value_mode,
-                None,
-                BranchGuaranteeProof(
-                    framing_safe=True,
-                    decode_sound=True,
-                    schema_safe=schema_safe,
-                    non_empty=non_empty,
-                    guarantee=GenerationGuarantee.NONE,
-                    detail="exact schema authority proves the structured branch empty",
-                ),
-                None,
-            )
+            return RepresentabilityStatus.EMPTY, value_mode, GenerationGuarantee.NONE, None
         guarantee = (
             GenerationGuarantee.SCHEMA
             if schema_safe and non_empty is NonEmptinessStatus.PROVEN_NON_EMPTY
@@ -2139,89 +1893,46 @@ def _structured_argument_proof(
         return (
             RepresentabilityStatus.REPRESENTABLE,
             value_mode,
-            None,
-            BranchGuaranteeProof(
-                framing_safe=True,
-                decode_sound=True,
-                schema_safe=schema_safe,
-                non_empty=non_empty,
-                guarantee=guarantee,
-                detail=(
-                    f"unsupported schema keyword: {unsupported}"
-                    if unsupported is not None
-                    else (
-                        "exact schema authority validates a concrete structured witness"
-                        if guarantee is not GenerationGuarantee.NONE
-                        else "structured branch non-emptiness is not proven by exact semantic authority"
-                    )
-                ),
-            ),
+            guarantee,
             schema_json if guarantee is not GenerationGuarantee.NONE else None,
         )
 
     if mode is ToolConstraintMode.SCHEMA:
-        unsupported = _unsupported_schema_keyword_metered(
+        unsupported = _unsupported_schema_keyword(
             property_schema,
             frozenset(compiler_capabilities.supported_property_keywords),
-            semantic_budget,
         )
         schema_safe = unsupported is None and schema_authority is not SchemaSemanticAuthority.NONE
         if not schema_safe:
-            status, value_mode, admitted, proof = _unsupported_proof(
-                f"unsupported schema keyword: {unsupported}"
-                if unsupported is not None
-                else "compiler capability has no exact schema semantic authority"
-            )
-            return status, value_mode, admitted, proof, None
+            status, value_mode, guarantee = _unsupported_proof()
+            return status, value_mode, guarantee, None
         generation_schema = _decoder_safe_generation_schema(
             property_schema,
             preserve_schema_semantics=True,
-            semantic_budget=semantic_budget,
         )
         value_mode = ConstraintValueMode.STRUCTURED_SCHEMA
     elif mode is ToolConstraintMode.FORMAT:
         generation_schema = _decoder_safe_generation_schema(
             property_schema,
             preserve_schema_semantics=False,
-            semantic_budget=semantic_budget,
         )
         value_mode = ConstraintValueMode.STRUCTURED_FORMAT
-        schema_safe = False
     else:
-        status, unsupported_mode, admitted, proof = _unsupported_proof(
-            "OFF mode does not generate structured Tool-wire branches"
-        )
-        return status, unsupported_mode, admitted, proof, None
+        status, value_mode, guarantee = _unsupported_proof()
+        return status, value_mode, guarantee, None
 
     if generation_schema is None:
-        status, unsupported_mode, admitted, proof = _unsupported_proof(
-            "structured source type/shape has no decoder-safe generation schema"
-        )
-        return status, unsupported_mode, admitted, proof, None
+        status, value_mode, guarantee = _unsupported_proof()
+        return status, value_mode, guarantee, None
 
-    generation_schema_json = _metered_canonical_json_dumps(generation_schema, semantic_budget)
-    _metered_utf8_output_bytes(generation_schema_json, semantic_budget)
-    semantic_budget.provide_schema_json(generation_schema_json)
+    generation_schema_json = canonical_json_dumps(generation_schema)
     non_empty = _exact_non_emptiness(
         compiler_capabilities,
         generation_schema,
-        semantic_budget=semantic_budget,
+        schema_json=generation_schema_json,
     )
     if non_empty is NonEmptinessStatus.PROVEN_EMPTY:
-        return (
-            RepresentabilityStatus.EMPTY,
-            value_mode,
-            None,
-            BranchGuaranteeProof(
-                framing_safe=True,
-                decode_sound=True,
-                schema_safe=schema_safe,
-                non_empty=non_empty,
-                guarantee=GenerationGuarantee.NONE,
-                detail="decoder-safe generation schema is proven empty",
-            ),
-            None,
-        )
+        return RepresentabilityStatus.EMPTY, value_mode, GenerationGuarantee.NONE, None
     guarantee = (
         GenerationGuarantee.SCHEMA
         if value_mode is ConstraintValueMode.STRUCTURED_SCHEMA
@@ -2236,74 +1947,8 @@ def _structured_argument_proof(
     return (
         RepresentabilityStatus.REPRESENTABLE,
         value_mode,
-        None,
-        BranchGuaranteeProof(
-            framing_safe=True,
-            decode_sound=True,
-            schema_safe=schema_safe,
-            non_empty=non_empty,
-            guarantee=guarantee,
-            detail=(
-                "decoder-safe generation schema is a proven non-empty subset of the source schema"
-                if guarantee is GenerationGuarantee.SCHEMA
-                else (
-                    "decoder-safe FORMAT skeleton is proven non-empty"
-                    if guarantee is GenerationGuarantee.FORMAT
-                    else "decoder-safe generation-schema non-emptiness is not proven"
-                )
-            ),
-        ),
+        guarantee,
         generation_schema_json if guarantee is not GenerationGuarantee.NONE else None,
-    )
-
-
-def _exact_non_emptiness_legacy_metered(
-    compiler_capabilities: ConstraintCompilerCapabilities,
-    schema: dict[str, JsonValue],
-    schema_json: str,
-    semantic_budget: _SemanticBudgetMeter,
-) -> NonEmptinessStatus:
-    """Meter the legacy finite/witness algorithm without changing its identity semantics."""
-
-    authority = compiler_capabilities.schema_semantic_authority
-    finite: tuple[JsonValue, ...] | None = None
-    if "const" in schema:
-        finite = (schema["const"],)
-    enum_value = schema.get("enum")
-    if isinstance(enum_value, list):
-        semantic_budget.charge_work(len(enum_value))
-        if finite is None:
-            finite = tuple(enum_value)
-        else:
-            enum_identities: set[str] = set()
-            for value in enum_value:
-                enum_identities.add(_metered_canonical_json_dumps(value, semantic_budget))
-            semantic_budget.charge_work(len(finite))
-            filtered: list[JsonValue] = []
-            for value in finite:
-                if _metered_canonical_json_dumps(value, semantic_budget) in enum_identities:
-                    filtered.append(value)
-            finite = tuple(filtered)
-
-    if finite is not None:
-        if authority is SchemaSemanticAuthority.NONE:
-            return NonEmptinessStatus.UNKNOWN
-        for candidate in finite:
-            semantic_budget.charge_work()
-            if schema_value_is_valid(authority, schema_json, candidate):
-                return NonEmptinessStatus.PROVEN_NON_EMPTY
-        return NonEmptinessStatus.PROVEN_EMPTY
-
-    witness = find_exact_witness_metered(
-        authority,
-        schema_json,
-        semantic_budget.charge_work,
-        parsed_schema=schema,
-    )
-    return (
-        NonEmptinessStatus.PROVEN_NON_EMPTY
-        if witness is not None
-        else NonEmptinessStatus.UNKNOWN
     )
 
 
@@ -2311,92 +1956,32 @@ def _exact_non_emptiness(
     compiler_capabilities: ConstraintCompilerCapabilities,
     schema: dict[str, JsonValue],
     *,
-    semantic_budget: _SemanticBudgetMeter | None = None,
+    schema_json: str | None = None,
 ) -> NonEmptinessStatus:
-    if semantic_budget is None:
-        resolved_schema_json = canonical_json_dumps(schema)
-        finite: tuple[JsonValue, ...] | None = None
-        if "const" in schema:
-            finite = (schema["const"],)
+    resolved_schema_json = schema_json if schema_json is not None else canonical_json_dumps(schema)
+    finite: tuple[JsonValue, ...] | None = None
+    if "const" in schema:
+        finite = (schema["const"],)
+    else:
         enum_value = schema.get("enum")
         if isinstance(enum_value, list):
-            enum_values = tuple(enum_value)
-            if finite is None:
-                finite = enum_values
-            else:
-                enum_identities = {canonical_json_dumps(value) for value in enum_values}
-                finite = tuple(
-                    value for value in finite if canonical_json_dumps(value) in enum_identities
-                )
-        if finite is not None:
-            authoritative, admitted = exact_finite_non_emptiness(
-                compiler_capabilities.schema_semantic_authority,
-                resolved_schema_json,
-                finite,
-            )
-            if not authoritative:
-                return NonEmptinessStatus.UNKNOWN
-            return (
-                NonEmptinessStatus.PROVEN_NON_EMPTY
-                if admitted
-                else NonEmptinessStatus.PROVEN_EMPTY
-            )
-        witness = find_exact_witness(
+            finite = tuple(enum_value)
+    if finite is not None:
+        authoritative, admitted = exact_finite_non_emptiness(
             compiler_capabilities.schema_semantic_authority,
             resolved_schema_json,
+            finite,
         )
+        if not authoritative:
+            return NonEmptinessStatus.UNKNOWN
         return (
             NonEmptinessStatus.PROVEN_NON_EMPTY
-            if witness is not None
-            else NonEmptinessStatus.UNKNOWN
+            if admitted
+            else NonEmptinessStatus.PROVEN_EMPTY
         )
-
-    schema_json = semantic_budget.take_schema_json()
-    if schema_json is None:
-        semantic_budget.charge_work()
-        schema_json = canonical_json_dumps(schema)
-
-    authority = compiler_capabilities.schema_semantic_authority
-    if authority is SchemaSemanticAuthority.NONE:
-        return NonEmptinessStatus.UNKNOWN
-
-    const_present = "const" in schema
-    enum_value = schema.get("enum")
-    enum_present = isinstance(enum_value, list)
-    if const_present or enum_present:
-        if const_present:
-            const_value = schema["const"]
-            if enum_present:
-                assert isinstance(enum_value, list)
-                found = False
-                for index in range(len(enum_value)):
-                    semantic_budget.charge_work()
-                    candidate = enum_value[index]
-                    if schema_values_equal(authority, const_value, candidate):
-                        found = True
-                        break
-                if not found:
-                    return NonEmptinessStatus.PROVEN_EMPTY
-            semantic_budget.charge_work()
-            return (
-                NonEmptinessStatus.PROVEN_NON_EMPTY
-                if schema_value_is_valid(authority, schema_json, const_value)
-                else NonEmptinessStatus.PROVEN_EMPTY
-            )
-
-        assert isinstance(enum_value, list)
-        for index in range(len(enum_value)):
-            semantic_budget.charge_work()
-            candidate = enum_value[index]
-            semantic_budget.charge_work()
-            if schema_value_is_valid(authority, schema_json, candidate):
-                return NonEmptinessStatus.PROVEN_NON_EMPTY
-        return NonEmptinessStatus.PROVEN_EMPTY
-
-    witness = find_exact_witness_metered(
-        authority,
-        schema_json,
-        semantic_budget.charge_work,
+    witness = find_exact_witness(
+        compiler_capabilities.schema_semantic_authority,
+        resolved_schema_json,
         parsed_schema=schema,
     )
     return (
@@ -2404,44 +1989,6 @@ def _exact_non_emptiness(
         if witness is not None
         else NonEmptinessStatus.UNKNOWN
     )
-
-
-def _unsupported_schema_keyword_metered(
-    schema: dict[str, JsonValue],
-    supported_keywords: frozenset[str],
-    semantic_budget: _SemanticBudgetMeter,
-) -> str | None:
-    """Walk supported schema structure only after reserving each request-sized layer."""
-
-    stack: list[dict[str, JsonValue]] = [schema]
-    while stack:
-        current = stack.pop()
-        semantic_budget.charge_work(len(current))
-        unsupported_name: str | None = None
-        children: list[dict[str, JsonValue]] = []
-        for keyword, value in current.items():
-            if (
-                keyword not in _ANNOTATION_KEYWORDS
-                and keyword not in supported_keywords
-                and (unsupported_name is None or keyword < unsupported_name)
-            ):
-                unsupported_name = keyword
-            if keyword in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
-                semantic_budget.charge_work(len(value))
-                for child in value.values():
-                    if isinstance(child, dict):
-                        children.append(child)
-            elif keyword in _SCHEMA_SINGLE_KEYWORDS and isinstance(value, dict):
-                children.append(value)
-            elif keyword in _SCHEMA_ARRAY_KEYWORDS and isinstance(value, list):
-                semantic_budget.charge_work(len(value))
-                for child in value:
-                    if isinstance(child, dict):
-                        children.append(child)
-        if unsupported_name is not None:
-            return unsupported_name
-        stack.extend(reversed(children))
-    return None
 
 
 def _unsupported_schema_keyword(
@@ -2473,64 +2020,39 @@ def _unsupported_schema_keyword(
     return None
 
 
-def _unsupported_proof(
-    detail: str,
-) -> tuple[
+def _unsupported_proof() -> tuple[
     RepresentabilityStatus,
     ConstraintValueMode,
-    tuple[str, ...] | None,
-    BranchGuaranteeProof,
+    GenerationGuarantee,
 ]:
     return (
         RepresentabilityStatus.UNSUPPORTED,
         ConstraintValueMode.VALIDATION_ONLY,
-        None,
-        BranchGuaranteeProof(
-            framing_safe=False,
-            decode_sound=False,
-            schema_safe=False,
-            non_empty=NonEmptinessStatus.UNKNOWN,
-            guarantee=GenerationGuarantee.NONE,
-            detail=detail,
-        ),
+        GenerationGuarantee.NONE,
     )
 
 
-def _cap_proof_to_mode(
-    proof: BranchGuaranteeProof,
+def _cap_guarantee_to_mode(
+    guarantee: GenerationGuarantee,
     mode: ToolConstraintMode,
-) -> BranchGuaranteeProof:
+) -> GenerationGuarantee:
     if mode is ToolConstraintMode.SCHEMA:
-        return proof
-    guarantee = (
-        GenerationGuarantee.NONE
-        if mode is ToolConstraintMode.OFF
-        else min(
-            proof.guarantee,
-            GenerationGuarantee.FORMAT,
-            key=_guarantee_rank,
-        )
-    )
-    return BranchGuaranteeProof(
-        framing_safe=proof.framing_safe,
-        decode_sound=proof.decode_sound,
-        schema_safe=proof.schema_safe,
-        non_empty=proof.non_empty,
-        guarantee=guarantee,
-        detail=proof.detail,
-    )
+        return guarantee
+    if mode is ToolConstraintMode.OFF:
+        return GenerationGuarantee.NONE
+    return min(guarantee, GenerationGuarantee.FORMAT, key=_guarantee_rank)
 
 
 def _argument_is_generated(
     status: RepresentabilityStatus,
-    proof: BranchGuaranteeProof,
+    guarantee: GenerationGuarantee,
     mode: ToolConstraintMode,
 ) -> bool:
     if mode is ToolConstraintMode.OFF or status is not RepresentabilityStatus.REPRESENTABLE:
         return False
     if mode is ToolConstraintMode.SCHEMA:
-        return proof.guarantee is GenerationGuarantee.SCHEMA
-    return proof.guarantee in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
+        return guarantee is GenerationGuarantee.SCHEMA
+    return guarantee in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
 
 
 def _tool_guarantee(
@@ -2548,7 +2070,7 @@ def _tool_guarantee(
         if mode is ToolConstraintMode.SCHEMA and object_schema_safe:
             return GenerationGuarantee.SCHEMA
         return GenerationGuarantee.FORMAT
-    guarantee = min((argument.proof.guarantee for argument in relevant), key=_guarantee_rank)
+    guarantee = min((argument.guarantee for argument in relevant), key=_guarantee_rank)
     if guarantee is GenerationGuarantee.SCHEMA and (
         mode is ToolConstraintMode.FORMAT or not object_schema_safe
     ):
@@ -2572,43 +2094,18 @@ def _minimal_order_plan(prepared: _PreparedOrderState, spec: ToolWireSpec) -> Ar
     return ArgumentOrderPlan((prepared.required,), None if narrowed else 1, narrowed)
 
 
-def _full_order_candidate_v3(
-    spec: ToolWireSpec,
+def _declared_order_plan(
     prepared: _PreparedOrderState,
-    max_permutations: int,
-) -> ArgumentOrderPlan | None:
-    """Return one bounded exhaustive candidate, or None when V3 must keep the stable baseline."""
-
-    if len(prepared.presentation_order) > _MAX_EXHAUSTIVE_PERMUTABLE_WIDTH:
-        return None
-    required = prepared.required
-    optional = prepared.optional
-    if spec.ordering is ArgumentOrderingMode.DECLARATION_ORDER:
-        full_count = _declaration_order_count(len(optional), max_permutations)
-        if full_count is None:
-            return None
-        declaration_orders = tuple(
-            tuple(
-                name
-                for name in prepared.presentation_order
-                if name in prepared.required_names or name in included
-            )
-            for size in range(len(optional) + 1)
-            for included in combinations(optional, size)
-        )
-        return ArgumentOrderPlan(declaration_orders or (required,), full_count, False)
-
-    full_count = _permutable_order_count(len(required), len(optional), max_permutations)
-    if full_count is None:
-        return None
-    orders: list[tuple[str, ...]] = []
-    for size in range(len(optional) + 1):
-        for included in combinations(optional, size):
-            names = (*required, *included)
-            orders.extend(permutations(names))
-    if not orders:
-        orders.append(())
-    return ArgumentOrderPlan(tuple(orders), full_count, False)
+    spec: ToolWireSpec,
+) -> ArgumentOrderPlan:
+    """One compact declared order; optional parameters do not require subset enumeration."""
+    narrowed = spec.ordering is ArgumentOrderingMode.PERMUTABLE and len(prepared.presentation_order) > 1
+    return ArgumentOrderPlan(
+        (prepared.presentation_order,),
+        None if narrowed else 1,
+        narrowed,
+        optional_names=frozenset(prepared.optional),
+    )
 
 
 def _order_product_cost(tools: tuple[ToolBranchPlan, ...]) -> _OrderProductCost:
@@ -2635,15 +2132,12 @@ def _order_product_cost(tools: tuple[ToolBranchPlan, ...]) -> _OrderProductCost:
     )
 
 
-def _prepare_orders_metered(
+def _prepare_orders(
     presentation_order: tuple[str, ...],
     required_names: frozenset[str],
-    minimum_order_bytes: int,
-    ledger: _CompileBudgetLedger,
 ) -> _PreparedOrderState:
     """Partition one hard-bounded presentation order for V3 product selection."""
 
-    del ledger
     required_values: list[str] = []
     optional_values: list[str] = []
     for name in presentation_order:
@@ -2653,35 +2147,4 @@ def _prepare_orders_metered(
         required_names=required_names,
         required=tuple(required_values),
         optional=tuple(optional_values),
-        minimum_order_bytes=minimum_order_bytes,
     )
-
-
-def _declaration_order_count(optional_count: int, cap: int) -> int | None:
-    if optional_count >= cap.bit_length():
-        return None
-    count = 1 << optional_count
-    return count if count <= cap else None
-
-
-def _permutable_order_count(required_count: int, optional_count: int, cap: int) -> int | None:
-    total = 0
-    for optional_present in range(optional_count + 1):
-        remaining = cap - total
-        factorial_term = _bounded_factorial(required_count + optional_present, remaining)
-        if factorial_term is None:
-            return None
-        choose = comb(optional_count, optional_present)
-        if choose > remaining // factorial_term:
-            return None
-        total += choose * factorial_term
-    return total
-
-
-def _bounded_factorial(value: int, cap: int) -> int | None:
-    result = 1
-    for factor in range(2, value + 1):
-        if result > cap // factor:
-            return None
-        result *= factor
-    return result

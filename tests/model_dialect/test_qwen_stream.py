@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Iterable
 
@@ -20,13 +21,39 @@ from exqserve.core.events import (
     ToolCallCompleted,
     ToolCallStarted,
 )
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
     NativeTokenProvenanceError,
     ParserAmbiguityDetail,
+    ParserCreationContext,
     ParserTerminalIssueKind,
 )
 from exqserve.model.qwen import QwenIncrementalParser
+from exqserve.server.qwen_parser_binding import resolve_qwen_parser_context
+from exqserve.tool_wire.controls.qwen import QwenToolRegionDecoder
+
+
+def _parser(
+    request_id: str,
+    *,
+    start_in_reasoning: bool = False,
+    tool_policy: ToolPolicy | None = None,
+    parser_context: ParserCreationContext | None = None,
+) -> QwenIncrementalParser:
+    if parser_context is None:
+        parser_context = resolve_qwen_parser_context(
+            None,
+            None,
+            ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY,
+        )
+        assert parser_context is not None
+    return QwenIncrementalParser(
+        request_id,
+        start_in_reasoning=start_in_reasoning,
+        tool_policy=tool_policy,
+        parser_context=parser_context,
+    )
 
 
 def _parse(
@@ -35,13 +62,27 @@ def _parse(
     *,
     tool_policy: ToolPolicy | None = None,
 ) -> tuple[list[GenerationEvent], bool]:
-    parser = QwenIncrementalParser(request_id, tool_policy=tool_policy)
+    parser = _parser(request_id, tool_policy=tool_policy)
     events: list[GenerationEvent] = []
     for chunk in chunks:
         events.extend(parser.feed(chunk))
     finished = parser.finish()
     events.extend(finished.events)
     return events, finished.incomplete_tool_call
+
+
+def _shared_validation_parser(request_id: str, tool_policy: ToolPolicy) -> QwenIncrementalParser:
+    context = resolve_qwen_parser_context(
+        None,
+        None,
+        ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY,
+    )
+    assert context is not None
+    return _parser(
+        request_id,
+        tool_policy=tool_policy,
+        parser_context=context,
+    )
 
 
 def _reasoning_text(events: Iterable[GenerationEvent]) -> str:
@@ -66,11 +107,11 @@ def _completed_calls(events: Iterable[GenerationEvent]) -> list[ToolCallComplete
 
 def test_parser_validates_tool_policy_at_public_boundary() -> None:
     with pytest.raises(TypeError, match="tool_policy"):
-        QwenIncrementalParser("req-invalid", tool_policy="bad")  # type: ignore[arg-type]
+        _parser("req-invalid", tool_policy="bad")  # type: ignore[arg-type]
 
 
 def test_preopened_reasoning_from_generation_prompt_is_separated() -> None:
-    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    parser = _parser("req-1", start_in_reasoning=True)
     events = list(parser.feed("reason from preopened think</think>answer"))
     events.extend(parser.finish().events)
 
@@ -281,7 +322,7 @@ def test_string_parameter_schema_preserves_raw_json_looking_text_as_string() -> 
         ),
     )
     policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), True)
-    parser = QwenIncrementalParser("req-string", tool_policy=policy)
+    parser = _parser("req-string", tool_policy=policy)
     source = (
         "<tool_call><function=save>"
         "<parameter=label>true</parameter>"
@@ -306,7 +347,7 @@ def test_string_parameter_schema_still_accepts_json_quoted_string_surface() -> N
         ),
     )
     policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), True)
-    parser = QwenIncrementalParser("req-quoted", tool_policy=policy)
+    parser = _parser("req-quoted", tool_policy=policy)
     events = list(
         parser.feed(
             '<tool_call><function=save><parameter=label>"hello"</parameter>'
@@ -316,6 +357,299 @@ def test_string_parameter_schema_still_accepts_json_quoted_string_surface() -> N
     events.extend(parser.finish().events)
 
     assert _completed_calls(events)[0].call.arguments_json == '{"label":"hello"}'
+
+
+@pytest.mark.parametrize("character_chunks", (False, True))
+def test_shared_validation_decoder_preserves_quoted_raw_literal_parameter_close(
+    character_chunks: bool,
+) -> None:
+    tool = FunctionTool(
+        "save",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"label":{"type":"string"}},'
+            '"required":["label"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    parser = _shared_validation_parser("req-shared-literal-close", policy)
+    source = (
+        '<tool_call><function=save><parameter=label>'
+        '"before </parameter> after"'
+        '</parameter></function></tool_call>'
+    )
+    events: list[GenerationEvent] = []
+    for chunk in (list(source) if character_chunks else [source]):
+        events.extend(parser.feed(chunk))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.terminal_issue is None
+    assert finished.incomplete_tool_call is False
+    assert [call.call.arguments_json for call in _completed_calls(events)] == [
+        '{"label":"before </parameter> after"}'
+    ]
+
+
+@pytest.mark.parametrize("character_chunks", (False, True))
+def test_shared_validation_decoder_preserves_tool_text_tool_reentry(
+    character_chunks: bool,
+) -> None:
+    tool = FunctionTool(
+        "read",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"file_path":{"type":"string"}},'
+            '"required":["file_path"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    parser = _shared_validation_parser("req-shared-tool-text-tool", policy)
+    source = (
+        "<tool_call><function=read><parameter=file_path>/README.md</parameter></function></tool_call>"
+        " ordinary text "
+        "<tool_call><function=read><parameter=file_path>/engine.py</parameter></function></tool_call>"
+    )
+    events: list[GenerationEvent] = []
+    for chunk in (list(source) if character_chunks else [source]):
+        events.extend(parser.feed(chunk))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.terminal_issue is None
+    assert finished.incomplete_tool_call is False
+    assert [(call.call.index, call.call.arguments_json) for call in _completed_calls(events)] == [
+        (0, '{"file_path":"/README.md"}'),
+        (1, '{"file_path":"/engine.py"}'),
+    ]
+    assert _text(events) == " ordinary text "
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        (
+            "source = '<tool_call><function=fake><parameter=x>1</parameter>"
+            "</function></tool_call><tool_call>'"
+        ),
+        (
+            "source = '''<tool_call><function=fake><parameter=x>1</parameter>"
+            "</function></tool_call><tool_call>'''"
+        ),
+    ),
+)
+def test_shared_validation_decoder_preserves_balanced_source_literal_fake_boundary(
+    literal: str,
+) -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"content":{"type":"string"},"file_path":{"type":"string"}},'
+            '"required":["content","file_path"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    parser = _shared_validation_parser("req-shared-source-literal", policy)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        + literal
+        + "</parameter><parameter=file_path>/tmp/harness.py</parameter>"
+        "</function></tool_call>"
+    )
+    events = list(parser.feed(source))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.terminal_issue is None
+    assert finished.incomplete_tool_call is False
+    assert [parse_json_strict(call.call.arguments_json) for call in _completed_calls(events)] == [
+        {"content": literal, "file_path": "/tmp/harness.py"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "literal",
+    (
+        "before `</parameter></function></tool_call>` after",
+        "before\n```text\n</parameter></function></tool_call>\n```\nafter",
+    ),
+)
+@pytest.mark.parametrize("native_spans", (False, True))
+def test_shared_validation_decoder_preserves_code_literal_close_chain(
+    literal: str,
+    native_spans: bool,
+) -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    parser = _shared_validation_parser("req-shared-code-literal", policy)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        + literal
+        + "</parameter></function></tool_call>"
+    )
+    events = (
+        list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
+        if native_spans
+        else list(parser.feed(source))
+    )
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.terminal_issue is None
+    assert finished.incomplete_tool_call is False
+    assert [parse_json_strict(call.call.arguments_json) for call in _completed_calls(events)] == [
+        {"content": literal}
+    ]
+
+
+def test_shared_validation_decoder_keeps_dual_valid_raw_boundary_ambiguous() -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    parser = _shared_validation_parser("req-shared-dual-valid", policy)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        "prefix </parameter></function></tool_call> literal suffix"
+        "</parameter></function></tool_call>"
+    )
+    events = list(parser.feed(source))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.protocol_terminal_issue is not None
+    assert finished.protocol_terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert not any(
+        isinstance(event, (ToolCallStarted, ToolCallArgumentsDelta, ToolCallCompleted))
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("definitions_key", ("$defs", "definitions"))
+@pytest.mark.parametrize("raw_value", ("true", "123", "null", '{"a":1}', "[1,2]"))
+def test_local_ref_string_parameter_preserves_json_looking_raw_text(
+    definitions_key: str,
+    raw_value: str,
+) -> None:
+    schema = json.dumps(
+        {
+            definitions_key: {"item": {"type": "string"}},
+            "type": "object",
+            "properties": {"label": {"$ref": f"#/{definitions_key}/item"}},
+            "required": ["label"],
+            "additionalProperties": False,
+        },
+        separators=(",", ":"),
+    )
+    tool = FunctionTool("save", None, JsonSchema(schema), True)
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), False)
+    parser = _parser("req-ref-string", tool_policy=policy)
+    source = (
+        "<tool_call><function=save><parameter=label>"
+        + raw_value
+        + "</parameter></function></tool_call>"
+    )
+    events = list(parser.feed(source))
+    events.extend(parser.finish().events)
+
+    call = _completed_calls(events)[0].call
+    assert parse_json_strict(call.arguments_json)["label"] == raw_value
+
+
+@pytest.mark.parametrize("definitions_key", ("$defs", "definitions"))
+@pytest.mark.parametrize(
+    ("target_schema", "property_annotations", "raw_value"),
+    (
+        ({"type": "string", "enum": ["true"]}, {}, "true"),
+        ({"type": "string", "const": "123"}, {}, "123"),
+        ({"type": "string"}, {"$comment": "annotation only"}, "null"),
+    ),
+)
+def test_local_ref_string_parameter_typing_covers_finite_and_annotation_forms(
+    definitions_key: str,
+    target_schema: dict[str, object],
+    property_annotations: dict[str, object],
+    raw_value: str,
+) -> None:
+    property_schema: dict[str, object] = {
+        "$ref": f"#/{definitions_key}/item",
+        **property_annotations,
+    }
+    schema = json.dumps(
+        {
+            definitions_key: {"item": target_schema},
+            "type": "object",
+            "properties": {"label": property_schema},
+            "required": ["label"],
+            "additionalProperties": False,
+        },
+        separators=(",", ":"),
+    )
+    policy = ToolPolicy(
+        (FunctionTool("save", None, JsonSchema(schema), True),),
+        ToolChoice(ToolChoiceMode.AUTO),
+        False,
+    )
+    parser = _parser("req-ref-string-finite", tool_policy=policy)
+    source = (
+        "<tool_call><function=save><parameter=label>"
+        + raw_value
+        + "</parameter></function></tool_call>"
+    )
+    events = list(parser.feed(source))
+    events.extend(parser.finish().events)
+
+    call = _completed_calls(events)[0].call
+    assert parse_json_strict(call.arguments_json)["label"] == raw_value
+
+
+def test_local_ref_string_parameter_is_chunk_and_native_token_invariant() -> None:
+    schema = JsonSchema(
+        '{"$defs":{"item":{"type":"string","enum":["true"]}},'
+        '"type":"object","properties":{"label":{"$ref":"#/$defs/item",'
+        '"$comment":"annotation only"}},"required":["label"],'
+        '"additionalProperties":false}'
+    )
+    policy = ToolPolicy(
+        (FunctionTool("save", None, schema, True),),
+        ToolChoice(ToolChoiceMode.AUTO),
+        False,
+    )
+    source = (
+        "<tool_call><function=save><parameter=label>true</parameter>"
+        "</function></tool_call>"
+    )
+
+    for split in range(len(source) + 1):
+        events, incomplete = _parse([source[:split], source[split:]], tool_policy=policy)
+        assert incomplete is False, split
+        call = _completed_calls(events)[0].call
+        assert parse_json_strict(call.arguments_json)["label"] == "true", split
+
+    parser = _parser("req-ref-string-native", tool_policy=policy)
+    events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
+    events.extend(parser.finish().events)
+    call = _completed_calls(events)[0].call
+    assert parse_json_strict(call.arguments_json)["label"] == "true"
 
 
 def test_duplicate_parameter_names_fail_closed_in_qwen_envelope_parser() -> None:
@@ -382,7 +716,7 @@ def test_tool_call_inside_reasoning_is_parsed_not_leaked_as_reasoning_text() -> 
 
 def test_unconfirmed_tool_marker_in_reasoning_remains_literal() -> None:
     source = "The parser treats <tool_call> as a candidate marker in prose."
-    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    parser = _parser("req-1", start_in_reasoning=True)
     events: list[GenerationEvent] = []
     for character in source:
         events.extend(parser.feed(character))
@@ -408,7 +742,7 @@ def test_real_markers_after_reasoning_inline_code_still_parse() -> None:
         "</think>"
         "<tool_call><function=lookup><parameter=q>1</parameter></function></tool_call>"
     )
-    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    parser = _parser("req-1", start_in_reasoning=True)
     events: list[GenerationEvent] = []
     for character in source:
         events.extend(parser.feed(character))
@@ -423,7 +757,7 @@ def test_real_markers_after_reasoning_inline_code_still_parse() -> None:
 
 def test_quoted_source_markers_remain_literal_across_character_boundaries() -> None:
     source = 'The source says _PLAIN_MARKERS = ("<think>", "</think>", "<tool_call>").'
-    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    parser = _parser("req-1", start_in_reasoning=True)
     events: list[GenerationEvent] = []
     for character in source:
         events.extend(parser.feed(character))
@@ -437,10 +771,10 @@ def test_quoted_source_markers_remain_literal_across_character_boundaries() -> N
 
 def test_single_quoted_end_think_marker_remains_reasoning_text() -> None:
     source = "The Qwen tool-call format is '</think>', followed by more analysis."
-    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    parser = _parser("req-1", start_in_reasoning=True)
     events: list[GenerationEvent] = []
     for split in range(len(source) + 1):
-        parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+        parser = _parser("req-1", start_in_reasoning=True)
         events = list(parser.feed(source[:split]))
         events.extend(parser.feed(source[split:]))
         finished = parser.finish()
@@ -456,7 +790,7 @@ def test_backtick_code_protocol_markers_remain_literal_at_every_split() -> None:
     )
     for source in samples:
         for split in range(len(source) + 1):
-            parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+            parser = _parser("req-1", start_in_reasoning=True)
             events = list(parser.feed(source[:split]))
             events.extend(parser.feed(source[split:]))
             finished = parser.finish()
@@ -469,7 +803,7 @@ def test_backtick_code_protocol_markers_remain_literal_at_every_split() -> None:
 def test_real_end_think_after_closed_code_span_still_switches_channel() -> None:
     source = "Discuss `</think>` literally.</think>final"
     for split in range(len(source) + 1):
-        parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+        parser = _parser("req-1", start_in_reasoning=True)
         events = list(parser.feed(source[:split]))
         events.extend(parser.feed(source[split:]))
         finished = parser.finish()
@@ -485,7 +819,7 @@ def test_split_fenced_literal_then_real_close_streams_text_before_eos() -> None:
 
     for opening_chunks in opening_splits:
         for suffix in suffixes:
-            parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+            parser = _parser("req-1", start_in_reasoning=True)
             events: list[GenerationEvent] = []
             for chunk in opening_chunks:
                 events.extend(parser.feed(chunk))
@@ -511,7 +845,7 @@ def test_malformed_inline_backticks_do_not_suppress_later_real_tool_call() -> No
     )
 
     for split in range(len(source) + 1):
-        parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+        parser = _parser("req-1", start_in_reasoning=True)
         events = list(parser.feed(source[:split]))
         events.extend(parser.feed(source[split:]))
         finished = parser.finish()
@@ -535,7 +869,7 @@ def test_fenced_literal_tool_marker_then_real_tool_call_remains_distinct() -> No
         )
 
         for split in range(len(source) + 1):
-            parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+            parser = _parser("req-1", start_in_reasoning=True)
             events = list(parser.feed(source[:split]))
             events.extend(parser.feed(source[split:]))
             finished = parser.finish()
@@ -555,7 +889,7 @@ def test_unclosed_fence_recovers_complete_tool_call_deterministically_at_eos() -
         "</think>\n"
         "<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
     )
-    parser = QwenIncrementalParser("req-1", start_in_reasoning=True)
+    parser = _parser("req-1", start_in_reasoning=True)
     streamed = list(parser.feed(source))
     finished = parser.finish()
     events = [*streamed, *finished.events]
@@ -652,7 +986,7 @@ def test_ambiguous_parameter_close_waits_for_partial_envelope_then_rejects_it_as
     source = _raw_parameter_tool_call(value + suffix)
     split = source.index("</fun") + len("</fun")
 
-    parser = QwenIncrementalParser("req-1")
+    parser = _parser("req-1")
     first_events = list(parser.feed(source[:split]))
     assert _completed_calls(first_events) == []
 
@@ -692,6 +1026,109 @@ def test_complete_tool_close_literal_with_later_real_close_fails_closed_across_s
         assert not any(isinstance(event, ToolCallStarted) for event in events), split
 
 
+def test_semantically_invalid_early_raw_close_does_not_compete_with_unique_valid_close() -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{'
+            '"content":{"type":"string"},"file_path":{"type":"string"}},'
+            '"required":["content","file_path"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        "before </parameter></function></tool_call> after"
+        "</parameter><parameter=file_path>/tmp/x</parameter></function></tool_call>"
+    )
+
+    for chunks in ((source,), tuple(source)):
+        events, incomplete = _parse(chunks, tool_policy=policy)
+        calls = _completed_calls(events)
+        assert not incomplete
+        assert len(calls) == 1
+        assert calls[0].call.name == "write"
+        assert parse_json_strict(calls[0].call.arguments_json) == {
+            "content": "before </parameter></function></tool_call> after",
+            "file_path": "/tmp/x",
+        }
+
+
+@pytest.mark.parametrize(
+    ("value_schema", "prefix", "suffix"),
+    (
+        ({"type": "string", "minLength": 80}, "short", "x" * 100),
+        ({"type": "string", "pattern": "TAIL$"}, "short", "TAIL"),
+        (
+            {"type": "string", "const": "short</parameter></function></tool_call>TAIL"},
+            "short",
+            "TAIL",
+        ),
+        (
+            {"type": "string", "enum": ["short</parameter></function></tool_call>TAIL"]},
+            "short",
+            "TAIL",
+        ),
+    ),
+)
+def test_value_invalid_raw_full_close_does_not_create_false_ambiguity(
+    value_schema: dict[str, object],
+    prefix: str,
+    suffix: str,
+) -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"content": value_schema},
+                    "required": ["content"],
+                    "additionalProperties": False,
+                },
+                separators=(",", ":"),
+            )
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    fake_close = "</parameter></function></tool_call>"
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        + prefix
+        + fake_close
+        + suffix
+        + "</parameter></function></tool_call>"
+    )
+
+    for chunks in ((source,), tuple(source), tuple(source[index : index + 7] for index in range(0, len(source), 7))):
+        events, incomplete = _parse(chunks, tool_policy=policy)
+        calls = _completed_calls(events)
+        assert not incomplete
+        assert len(calls) == 1
+        assert parse_json_strict(calls[0].call.arguments_json) == {
+            "content": prefix + fake_close + suffix
+        }
+
+
+@pytest.mark.parametrize("gap", (" " * 9, "\u00a0"))
+def test_nonstructural_adjacent_tool_gap_is_preserved_as_text_remainder(gap: str) -> None:
+    source = (
+        "<tool_call><function=a><parameter=x>1</parameter></function></tool_call>"
+        + gap
+        + "<tool_call><function=b><parameter=y>2</parameter></function></tool_call>"
+    )
+
+    events, incomplete = _parse((source,))
+
+    assert not incomplete
+    assert [event.call.name for event in _completed_calls(events)] == ["a", "b"]
+    assert "".join(event.text for event in events if isinstance(event, TextDelta)) == gap
+
+
 def test_single_full_close_candidate_completes_and_replays_text_remainder_across_splits() -> None:
     source = _raw_parameter_tool_call("echo ok") + " ordinary remainder"
 
@@ -718,6 +1155,71 @@ def test_back_to_back_tool_calls_keep_order_across_splits() -> None:
             ("a", '{"x":1}'),
             ("b", '{"y":2}'),
         ], split
+
+
+def test_validation_only_plain_adjacent_complete_tools_reach_policy_when_parallel_disallowed() -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    source = (
+        "<tool_call><function=write><parameter=content>one</parameter></function></tool_call>"
+        "<tool_call><function=write><parameter=content>two</parameter></function></tool_call>"
+    )
+
+    chunkings = (
+        (source,),
+        tuple(source),
+        tuple(source[index : index + 7] for index in range(0, len(source), 7)),
+    )
+    for chunks in chunkings:
+        events, incomplete = _parse(chunks, tool_policy=policy)
+        calls = _completed_calls(events)
+        assert incomplete is False
+        assert [parse_json_strict(call.call.arguments_json) for call in calls] == [
+            {"content": "one"},
+            {"content": "two"},
+        ]
+
+
+@pytest.mark.parametrize("allow_parallel", [False, True])
+def test_validation_only_plain_bare_adjacent_opener_stays_text_remainder(
+    allow_parallel: bool,
+) -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=allow_parallel)
+    remainder = "\n<tool_call> literal-protocol-example tail"
+    source = (
+        "<tool_call><function=write><parameter=content>one</parameter></function></tool_call>"
+        + remainder
+    )
+
+    chunkings = (
+        (source,),
+        tuple(source),
+        tuple(source[index : index + 7] for index in range(0, len(source), 7)),
+    )
+    for chunks in chunkings:
+        events, incomplete = _parse(chunks, tool_policy=policy)
+        calls = _completed_calls(events)
+        assert incomplete is False
+        assert len(calls) == 1
+        assert parse_json_strict(calls[0].call.arguments_json) == {"content": "one"}
+        assert _text(events) == remainder
 
 
 @pytest.mark.parametrize(
@@ -902,8 +1404,16 @@ def test_nested_raw_ambiguity_fails_closed_without_recursive_parser_nesting(dept
             + " after</parameter></function></tool_call>"
         )
 
-    events, incomplete = _parse([source])
-    assert incomplete is True
+    parser = _parser(f"req-nested-raw-{depth}")
+    events = list(parser.feed(source))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert not finished.incomplete_tool_call
+    issue = finished.terminal_issue
+    assert issue is not None
+    assert issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert issue.ambiguity_detail is ParserAmbiguityDetail.HOLD_LIMIT
     assert _completed_calls(events) == []
     assert not any(isinstance(event, ToolCallStarted) for event in events)
 
@@ -1223,7 +1733,7 @@ def _native_tool_boundary_spans(text: str) -> tuple[NativeTokenSpan, ...]:
 
 
 def test_native_aware_marker_is_candidate_with_backtick_literal_veto() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     first = "The format is `</think>` and still reasoning.\n"
     literal_span = _native_span(first, "</think>", 248069)
     events = list(parser.feed_with_native_tokens(first, (literal_span,)))
@@ -1241,6 +1751,64 @@ def test_native_aware_marker_is_candidate_with_backtick_literal_veto() -> None:
     calls = _completed_calls(events)
     assert len(calls) == 1
     assert calls[0].call.name == "read"
+
+
+def test_native_reasoning_close_drops_only_cross_line_provisional_inline_state() -> None:
+    parser = _parser("req-native-channel-boundary", start_in_reasoning=True)
+    events: list[GenerationEvent] = []
+
+    events.extend(parser.feed_with_native_tokens("Inspect `classify_marker:\n", ()))
+
+    close = "</think>\n\nI'm checking the tests"
+    close_span = _native_span(close, "</think>", 248069)
+    events.extend(parser.feed_with_native_tokens(close, (close_span,)))
+
+    tool = (
+        ".\n\n<tool_call><function=read><parameter=file_path>/x</parameter>"
+        "</function></tool_call>"
+    )
+    tool_span = _native_span(tool, "<tool_call>", 248058)
+    events.extend(parser.feed_with_native_tokens(tool, (tool_span,)))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.terminal_issue is None
+    assert finished.incomplete_tool_call is False
+    assert _reasoning_text(events) == "Inspect `classify_marker:\n"
+    assert _text(events) == "\n\nI'm checking the tests.\n\n"
+    calls = _completed_calls(events)
+    assert len(calls) == 1
+    assert calls[0].call.name == "read"
+    assert calls[0].call.arguments_json == '{"file_path":"/x"}'
+
+
+def test_native_reasoning_close_chunk_end_replays_next_chunk_in_text_channel() -> None:
+    parser = _parser("req-native-channel-boundary-split", start_in_reasoning=True)
+    events = list(parser.feed_with_native_tokens("Inspect `classify_marker:\n", ()))
+
+    close = "</think>"
+    close_span = _native_span(close, "</think>", 248069)
+    pending = list(parser.feed_with_native_tokens(close, (close_span,)))
+    assert not any(isinstance(event, ReasoningCompleted) for event in pending)
+    events.extend(pending)
+
+    tool = (
+        "\n\n<tool_call><function=read><parameter=file_path>/x</parameter>"
+        "</function></tool_call>"
+    )
+    tool_span = _native_span(tool, "<tool_call>", 248058)
+    events.extend(parser.feed_with_native_tokens(tool, (tool_span,)))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert finished.terminal_issue is None
+    assert finished.incomplete_tool_call is False
+    assert _reasoning_text(events) == "Inspect `classify_marker:\n"
+    assert _text(events) == "\n\n"
+    calls = _completed_calls(events)
+    assert len(calls) == 1
+    assert calls[0].call.name == "read"
+    assert calls[0].call.arguments_json == '{"file_path":"/x"}'
 
 
 @pytest.mark.parametrize(
@@ -1263,7 +1831,7 @@ def test_native_multiline_inline_marker_is_literal_at_every_valid_split(
     for split in range(len(source) + 1):
         if marker_start < split < marker_end:
             continue
-        parser = QwenIncrementalParser(
+        parser = _parser(
             "req-native-multiline",
             start_in_reasoning=start_in_reasoning,
         )
@@ -1312,7 +1880,7 @@ def test_native_multiline_double_backtick_marker_is_literal_at_every_valid_split
     for split in range(len(source) + 1):
         if marker_start < split < marker_end:
             continue
-        parser = QwenIncrementalParser("req-native-multiline-double", start_in_reasoning=True)
+        parser = _parser("req-native-multiline-double", start_in_reasoning=True)
         first = source[:split]
         second = source[split:]
         first_spans = (
@@ -1341,7 +1909,7 @@ def test_native_multiline_double_backtick_marker_is_literal_at_every_valid_split
 
 
 def test_native_multiline_captured_trace_104_105_keeps_end_think_literal() -> None:
-    parser = QwenIncrementalParser("req_fd718d04b137457d93e9596978255ed4", start_in_reasoning=True)
+    parser = _parser("req_fd718d04b137457d93e9596978255ed4", start_in_reasoning=True)
     first = " think the format is:\n- Tool call 1: `<tool_call><"
     first_tool = _native_span(first, "<tool_call>", 248058)
     second = "function=a>...</function>\n</think>\n\n<tool_call>`\n- Tool call 2: `<tool_call"
@@ -1359,7 +1927,7 @@ def test_native_multiline_captured_trace_104_105_keeps_end_think_literal() -> No
 
 
 def test_native_real_end_think_after_closed_multiline_inline_span_stays_structural() -> None:
-    parser = QwenIncrementalParser("req-native-multiline-real-close", start_in_reasoning=True)
+    parser = _parser("req-native-multiline-real-close", start_in_reasoning=True)
     example = "Example: `abc\n</think>` still reasoning."
     example_span = _native_span(example, "</think>", 248069)
     real_close = "</think>final"
@@ -1373,8 +1941,8 @@ def test_native_real_end_think_after_closed_multiline_inline_span_stays_structur
     assert _text(events) == "final"
 
 
-def test_native_unmatched_multiline_inline_opener_reports_ambiguity_at_eos() -> None:
-    parser = QwenIncrementalParser("req-native-unmatched-inline", start_in_reasoning=True)
+def test_native_unmatched_multiline_inline_yields_to_verified_reasoning_close_at_eos() -> None:
+    parser = _parser("req-native-unmatched-inline", start_in_reasoning=True)
     prefix = "analysis `open\n"
     marker_chunk = "</think>after marker"
     marker_span = _native_span(marker_chunk, "</think>", 248069)
@@ -1388,19 +1956,17 @@ def test_native_unmatched_multiline_inline_opener_reports_ambiguity_at_eos() -> 
     events.extend(finished.events)
 
     assert _reasoning_text(events) == prefix
-    assert _text(events) == ""
+    assert _text(events) == "after marker"
     assert finished.incomplete_tool_call is False
-    assert finished.terminal_issue is not None
-    assert finished.terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
-    assert finished.terminal_issue.ambiguity_detail is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+    assert finished.terminal_issue is None
 
 
 @pytest.mark.parametrize(("opener", "longer_run"), [("`", "```"), ("``", "```")])
-def test_native_multiline_inline_requires_exact_width_close(
+def test_native_multiline_nonmatching_backtick_run_does_not_veto_reasoning_close(
     opener: str,
     longer_run: str,
 ) -> None:
-    parser = QwenIncrementalParser("req-native-exact-inline-close", start_in_reasoning=True)
+    parser = _parser("req-native-exact-inline-close", start_in_reasoning=True)
     prefix = f"analysis {opener}open\n"
     marker_chunk = f"</think>{longer_run} final"
     marker_span = _native_span(marker_chunk, "</think>", 248069)
@@ -1411,15 +1977,13 @@ def test_native_multiline_inline_requires_exact_width_close(
     events.extend(finished.events)
 
     assert _reasoning_text(events) == prefix
-    assert _text(events) == ""
-    assert finished.terminal_issue is not None
-    assert finished.terminal_issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
-    assert finished.terminal_issue.ambiguity_detail is ParserAmbiguityDetail.UNRESOLVED_BOUNDARY
+    assert _text(events) == f"{longer_run} final"
+    assert finished.terminal_issue is None
 
 
 @pytest.mark.parametrize(("opener", "longer_run"), [("`", "```"), ("``", "```")])
 def test_plain_multiline_inline_requires_exact_width_close(opener: str, longer_run: str) -> None:
-    parser = QwenIncrementalParser("req-plain-exact-inline-close", start_in_reasoning=True)
+    parser = _parser("req-plain-exact-inline-close", start_in_reasoning=True)
     source = f"analysis {opener}open\n</think>{longer_run} final"
 
     events = list(parser.feed(source))
@@ -1430,7 +1994,7 @@ def test_plain_multiline_inline_requires_exact_width_close(opener: str, longer_r
 
 
 def test_native_aware_back_to_back_tool_calls_preserve_verified_second_opener() -> None:
-    parser = QwenIncrementalParser("req-native-back-to-back")
+    parser = _parser("req-native-back-to-back")
     source = (
         "<tool_call>\n<function=read>\n<parameter=file_path>/README.md</parameter>\n"
         "</function>\n</tool_call>\n"
@@ -1452,7 +2016,7 @@ def test_native_aware_back_to_back_tool_calls_preserve_verified_second_opener() 
 
 
 def test_native_verified_close_and_next_opener_commit_first_multiparam_tool_before_second_finishes() -> None:
-    parser = QwenIncrementalParser("req-native-multiparam-boundary")
+    parser = _parser("req-native-multiparam-boundary")
     first = (
         "<tool_call><function=read><parameter=file_path>/a</parameter>"
         "<parameter=offset>701</parameter></function></tool_call>"
@@ -1503,7 +2067,7 @@ def test_native_verified_close_and_next_opener_commit_first_multiparam_tool_befo
 def test_native_verified_multiparam_back_to_back_is_chunk_invariant(
     chunks: tuple[str, ...],
 ) -> None:
-    parser = QwenIncrementalParser("req-native-multiparam-chunks")
+    parser = _parser("req-native-multiparam-chunks")
     events: list[GenerationEvent] = []
     for chunk in chunks:
         events.extend(
@@ -1531,7 +2095,7 @@ def test_frozen_dsh_night_record10_commits_first_read_without_duplicate_second_s
         ),
     )
     policy = ToolPolicy((read_tool,), ToolChoice(ToolChoiceMode.AUTO), True)
-    parser = QwenIncrementalParser(
+    parser = _parser(
         "req_a250bbf935f647aeaf3941c6c56852b4",
         start_in_reasoning=True,
         tool_policy=policy,
@@ -1596,7 +2160,7 @@ def test_frozen_dsh_night_record10_commits_first_read_without_duplicate_second_s
 
 
 def test_native_verified_literal_close_and_fake_opener_do_not_commit_tool_boundary() -> None:
-    parser = QwenIncrementalParser("req-native-literal-boundary-veto")
+    parser = _parser("req-native-literal-boundary-veto")
     prefix = (
         "<tool_call><function=bash><parameter=command>before `"
         "</parameter></function></tool_call><tool_call>"
@@ -1630,7 +2194,7 @@ def test_native_verified_dual_valid_quoted_raw_boundary_fails_explicit_ambiguity
         '"}</parameter><parameter=file_path>/tmp/harness.py</parameter>'
         "</function></tool_call>"
     )
-    parser = QwenIncrementalParser("req-native-quoted-raw-boundary", tool_policy=policy)
+    parser = _parser("req-native-quoted-raw-boundary", tool_policy=policy)
 
     events = list(parser.feed_with_native_tokens(prefix, _native_tool_boundary_spans(prefix)))
     assert parser.early_terminal_issue is None
@@ -1686,7 +2250,7 @@ def test_native_fake_boundary_inside_non_json_quote_raw_parameter_stays_data(
         + "</parameter><parameter=file_path>/tmp/harness.py</parameter>"
         "</function></tool_call>"
     )
-    parser = QwenIncrementalParser("req-native-non-json-quote", tool_policy=policy)
+    parser = _parser("req-native-non-json-quote", tool_policy=policy)
 
     events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
     finished = parser.finish()
@@ -1722,7 +2286,7 @@ def test_unmatched_double_quote_inside_raw_string_does_not_hide_real_tool_close(
         f"<parameter=new_string>{new_string}</parameter>"
         "</function></tool_call>"
     )
-    parser = QwenIncrementalParser("req-unmatched-double", tool_policy=policy)
+    parser = _parser("req-unmatched-double", tool_policy=policy)
 
     events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
     finished = parser.finish()
@@ -1753,7 +2317,7 @@ def test_dual_valid_raw_tool_decompositions_fail_explicit_ambiguity_without_side
         "prefix </parameter></function></tool_call> literal suffix"
         "</parameter></function></tool_call>"
     )
-    parser = QwenIncrementalParser("req-dual-valid", tool_policy=policy)
+    parser = _parser("req-dual-valid", tool_policy=policy)
 
     events = list(parser.feed_with_native_tokens(source, _native_tool_boundary_spans(source)))
     finished = parser.finish()
@@ -1787,7 +2351,7 @@ def test_dual_valid_lexically_contained_candidate_is_not_preferred_away() -> Non
         'prefix "</parameter></function></tool_call>" suffix'
         '</parameter></function></tool_call>'
     )
-    parser = QwenIncrementalParser("req-dual-valid-lexical", tool_policy=policy)
+    parser = _parser("req-dual-valid-lexical", tool_policy=policy)
 
     events = list(parser.feed(source))
     finished = parser.finish()
@@ -1807,7 +2371,7 @@ def test_dual_valid_lexically_contained_candidate_is_not_preferred_away() -> Non
 
 
 def test_native_aware_tool_text_tool_preserves_verified_second_opener() -> None:
-    parser = QwenIncrementalParser("req-native-tool-text-tool")
+    parser = _parser("req-native-tool-text-tool")
     source = (
         "<tool_call>\n<function=read>\n<parameter=file_path>/README.md</parameter>\n"
         "</function>\n</tool_call>\n"
@@ -1830,7 +2394,7 @@ def test_native_aware_tool_text_tool_preserves_verified_second_opener() -> None:
 
 
 def test_native_aware_tool_text_tool_like_raw_literal_never_commits_side_effects() -> None:
-    parser = QwenIncrementalParser("req-native-tool-text-tool-literal")
+    parser = _parser("req-native-tool-text-tool-literal")
     source = _raw_parameter_tool_call(
         "before </parameter></function></tool_call> ordinary "
         "<tool_call><function=fake> literal"
@@ -1846,7 +2410,7 @@ def test_native_aware_tool_text_tool_like_raw_literal_never_commits_side_effects
 
 @pytest.mark.parametrize("literal_close", ("</tool_call>", "</function>", "</parameter>"))
 def test_native_aware_tool_text_tool_preserves_top_level_literal_closes(literal_close: str) -> None:
-    parser = QwenIncrementalParser(f"req-native-literal-close-{literal_close}")
+    parser = _parser(f"req-native-literal-close-{literal_close}")
     source = (
         "<tool_call><function=read><parameter=file_path>/README.md</parameter></function></tool_call>"
         f" ordinary {literal_close} literal "
@@ -1866,7 +2430,7 @@ def test_native_aware_tool_text_tool_preserves_top_level_literal_closes(literal_
 
 
 def test_native_aware_tool_text_tool_preserves_backticked_top_level_literal_close() -> None:
-    parser = QwenIncrementalParser("req-native-backticked-literal-close")
+    parser = _parser("req-native-backticked-literal-close")
     source = (
         "<tool_call><function=read><parameter=file_path>/README.md</parameter></function></tool_call>"
         " discuss `</tool_call>` literally "
@@ -1882,7 +2446,7 @@ def test_native_aware_tool_text_tool_preserves_backticked_top_level_literal_clos
 
 
 def test_native_aware_tool_text_tool_preserves_backticked_full_close_chain() -> None:
-    parser = QwenIncrementalParser("req-native-backticked-full-close")
+    parser = _parser("req-native-backticked-full-close")
     middle = " discuss `</parameter></function></tool_call>` literally "
     source = (
         "<tool_call><function=read><parameter=file_path>/README.md</parameter></function></tool_call>"
@@ -1899,7 +2463,7 @@ def test_native_aware_tool_text_tool_preserves_backticked_full_close_chain() -> 
 
 
 def test_native_aware_tool_text_tool_preserves_fenced_full_close_chain() -> None:
-    parser = QwenIncrementalParser("req-native-fenced-full-close")
+    parser = _parser("req-native-fenced-full-close")
     middle = "\n```text\n</parameter></function></tool_call>\n```\n"
     source = (
         "<tool_call><function=read><parameter=file_path>/README.md</parameter></function></tool_call>"
@@ -1916,7 +2480,7 @@ def test_native_aware_tool_text_tool_preserves_fenced_full_close_chain() -> None
 
 
 def test_native_aware_inline_literal_full_close_and_tool_envelope_stays_text() -> None:
-    parser = QwenIncrementalParser("req-native-inline-full-close-tool-literal")
+    parser = _parser("req-native-inline-full-close-tool-literal")
     middle = (
         " discuss `</parameter></function></tool_call> "
         "<tool_call><function=read><parameter=file_path>/tmp/literal</parameter></function></tool_call>` "
@@ -1941,7 +2505,7 @@ def test_native_aware_inline_literal_full_close_and_tool_envelope_stays_text() -
 
 
 def test_native_aware_fenced_literal_full_close_and_tool_envelope_stays_text() -> None:
-    parser = QwenIncrementalParser("req-native-fenced-full-close-tool-literal")
+    parser = _parser("req-native-fenced-full-close-tool-literal")
     middle = (
         "\n```text\n"
         "</parameter></function></tool_call>\n"
@@ -1967,7 +2531,7 @@ def test_native_aware_fenced_literal_full_close_and_tool_envelope_stays_text() -
 
 
 def test_native_aware_three_back_to_back_tool_calls_replay_recursively() -> None:
-    parser = QwenIncrementalParser("req-native-back-to-back-three")
+    parser = _parser("req-native-back-to-back-three")
     source = "".join(
         f"<tool_call><function=read><parameter=file_path>/{name}</parameter></function></tool_call>"
         for name in ("one.py", "two.py", "three.py")
@@ -1988,7 +2552,7 @@ def test_native_aware_three_back_to_back_tool_calls_replay_recursively() -> None
 
 
 def test_native_aware_captured_back_to_back_shape_keeps_second_call_structural() -> None:
-    parser = QwenIncrementalParser("req_a859e0e50ca2440ba6798fc726f9d335", start_in_reasoning=True)
+    parser = _parser("req_a859e0e50ca2440ba6798fc726f9d335", start_in_reasoning=True)
     first = (
         "Let me start by reading the README and the main architecture files. I'll read several in parallel.\n"
         "</think>\n\n<tool_call>\n<function=read>\n<parameter=file_path>\n"
@@ -2046,7 +2610,7 @@ def test_native_aware_captured_back_to_back_shape_keeps_second_call_structural()
     ],
 )
 def test_native_aware_back_to_back_tool_calls_are_chunk_invariant(chunks: tuple[str, ...]) -> None:
-    parser = QwenIncrementalParser("req-native-back-to-back-split")
+    parser = _parser("req-native-back-to-back-split")
     events: list[GenerationEvent] = []
     for chunk in chunks:
         events.extend(parser.feed_with_native_tokens(chunk, _native_tool_spans(chunk)))
@@ -2064,7 +2628,7 @@ def test_native_aware_back_to_back_tool_calls_are_chunk_invariant(chunks: tuple[
 
 
 def test_native_aware_replayed_tool_opener_still_honors_literal_context() -> None:
-    parser = QwenIncrementalParser("req-native-back-to-back-literal")
+    parser = _parser("req-native-back-to-back-literal")
     source = (
         "<tool_call><function=read><parameter=file_path>/README.md</parameter></function></tool_call>"
         "\n`<tool_call><function=read> literal protocol example`"
@@ -2082,7 +2646,7 @@ def test_native_aware_replayed_tool_opener_still_honors_literal_context() -> Non
 
 
 def test_native_aware_ordinary_same_spelling_marker_is_literal_only() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     source = "literal <tool_call> remains prose"
     events = list(parser.feed_with_native_tokens(source, ()))
     events.extend(parser.finish().events)
@@ -2092,14 +2656,14 @@ def test_native_aware_ordinary_same_spelling_marker_is_literal_only() -> None:
 
 
 def test_native_aware_unverified_ambiguous_marker_fails_closed() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
 
     with pytest.raises(NativeTokenProvenanceError):
         parser.feed_with_native_tokens("ambiguous </think> outside code", None)
 
 
 def test_native_aware_unverified_marker_inside_backticks_stays_literal() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     source = "code `</think>` remains reasoning"
     events = list(parser.feed_with_native_tokens(source, None))
     events.extend(parser.finish().events)
@@ -2108,7 +2672,7 @@ def test_native_aware_unverified_marker_inside_backticks_stays_literal() -> None
 
 
 def test_native_aware_open_inline_barrier_never_retroactively_promotes_marker() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     first = "`` source <tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>\n"
     literal_span = _native_span(first, "<tool_call>", 248058)
     events = list(parser.feed_with_native_tokens(first, (literal_span,)))
@@ -2129,7 +2693,7 @@ def test_native_aware_open_inline_barrier_never_retroactively_promotes_marker() 
 
 
 def test_native_aware_open_fence_reports_ambiguity_without_literal_tool_side_effect() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     source = "```text\nexample\n</think>\n<tool_call><function=read><parameter=file_path>/x</parameter></function></tool_call>"
     spans = (
         _native_span(source, "</think>", 248069),
@@ -2148,7 +2712,7 @@ def test_native_aware_open_fence_reports_ambiguity_without_literal_tool_side_eff
 
 
 def test_native_fence_tentative_close_same_line_tool_reports_ambiguity() -> None:
-    parser = QwenIncrementalParser("req-native-fence-tail", start_in_reasoning=True)
+    parser = _parser("req-native-fence-tail", start_in_reasoning=True)
     tool = "<tool_call><function=read><parameter=file_path>/danger</parameter></function></tool_call>"
     source = "```text\nliteral\n```   " + tool
     tool_span = _native_span(source, "<tool_call>", 248058)
@@ -2165,7 +2729,7 @@ def test_native_fence_tentative_close_same_line_tool_reports_ambiguity() -> None
 
 
 def test_native_fence_whitespace_newline_close_resolves_literal_then_real_close() -> None:
-    parser = QwenIncrementalParser("req-native-fence-close", start_in_reasoning=True)
+    parser = _parser("req-native-fence-close", start_in_reasoning=True)
     source = "```text\nliteral </think>\n```   \t\nstill reasoning</think>final"
     first_at = source.index("</think>")
     second_at = source.index("</think>", first_at + 1)
@@ -2184,7 +2748,7 @@ def test_native_fence_whitespace_newline_close_resolves_literal_then_real_close(
 
 
 def test_native_fence_whitespace_eos_close_resolves_literal() -> None:
-    parser = QwenIncrementalParser("req-native-fence-eos", start_in_reasoning=True)
+    parser = _parser("req-native-fence-eos", start_in_reasoning=True)
     source = "```text\nliteral </think>\n```   \t"
     marker_span = _native_span(source, "</think>", 248069)
 
@@ -2205,7 +2769,7 @@ def test_native_semantic_hold_exact_65536_resolves_without_overflow() -> None:
     filler = "x" * (limit - len(marker.encode()) - len(close.encode()))
     source = prefix + marker + filler + close
     marker_span = _native_span(source, marker, 248069)
-    parser = QwenIncrementalParser("req-native-hold-exact", start_in_reasoning=True)
+    parser = _parser("req-native-hold-exact", start_in_reasoning=True)
 
     events = list(parser.feed_with_native_tokens(source, (marker_span,)))
     finished = parser.finish()
@@ -2224,7 +2788,7 @@ def test_native_semantic_hold_65537th_byte_fails_before_later_close() -> None:
     filler = "x" * (limit - len(marker.encode()) - len(close.encode()) + 1)
     source = prefix + marker + filler + close
     marker_span = _native_span(source, marker, 248069)
-    parser = QwenIncrementalParser("req-native-hold-over", start_in_reasoning=True)
+    parser = _parser("req-native-hold-over", start_in_reasoning=True)
 
     events = list(parser.feed_with_native_tokens(source, (marker_span,)))
 
@@ -2244,7 +2808,7 @@ def test_native_semantic_hold_multibyte_crossing_never_partially_overflows() -> 
     filler = "x" * (limit - len(marker.encode()) - 1)
     source = prefix + marker + filler + "你\n```\n"
     marker_span = _native_span(source, marker, 248069)
-    parser = QwenIncrementalParser("req-native-hold-utf8", start_in_reasoning=True)
+    parser = _parser("req-native-hold-utf8", start_in_reasoning=True)
 
     events = list(parser.feed_with_native_tokens(source, (marker_span,)))
 
@@ -2265,7 +2829,7 @@ def test_native_fence_tentative_close_is_chunk_invariant() -> None:
     for split in range(1, len(source)):
         if marker_at < split < marker_end:
             continue
-        parser = QwenIncrementalParser("req-native-fence-partition", start_in_reasoning=True)
+        parser = _parser("req-native-fence-partition", start_in_reasoning=True)
         events: list[GenerationEvent] = []
         first = source[:split]
         second = source[split:]
@@ -2292,14 +2856,14 @@ def test_native_fence_tentative_close_is_chunk_invariant() -> None:
 
 def test_native_aware_direct_quote_veto_is_chunk_invariant() -> None:
     marker = "</think>"
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     whole = f"quoted '{marker}' still reasoning"
     span = _native_span(whole, marker, 248069)
     events = list(parser.feed_with_native_tokens(whole, (span,)))
     events.extend(parser.finish().events)
     assert _reasoning_text(events) == whole
 
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     first = f"quoted '{marker}"
     span = _native_span(first, marker, 248069)
     events = list(parser.feed_with_native_tokens(first, (span,)))
@@ -2307,7 +2871,7 @@ def test_native_aware_direct_quote_veto_is_chunk_invariant() -> None:
     events.extend(parser.finish().events)
     assert _reasoning_text(events) == whole
 
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     events = list(parser.feed_with_native_tokens("quoted '", ()))
     marker_span = NativeTokenSpan(0, len(marker), 248069, marker)
     events.extend(parser.feed_with_native_tokens(marker, (marker_span,)))
@@ -2317,7 +2881,7 @@ def test_native_aware_direct_quote_veto_is_chunk_invariant() -> None:
 
 
 def test_native_aware_unmatched_direct_quote_at_eof_does_not_veto_verified_marker() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     source = "ends with quote '</think>"
     span = _native_span(source, "</think>", 248069)
     events = list(parser.feed_with_native_tokens(source, (span,)))
@@ -2327,7 +2891,7 @@ def test_native_aware_unmatched_direct_quote_at_eof_does_not_veto_verified_marke
 
 
 def test_native_aware_unmatched_direct_quote_at_eof_fails_closed_without_provenance() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     source = "ends with quote '</think>"
     parser.feed_with_native_tokens(source, None)
 
@@ -2338,7 +2902,7 @@ def test_native_aware_unmatched_direct_quote_at_eof_fails_closed_without_provena
 @pytest.mark.parametrize("marker", ["<think>", "</think>", "<tool_call>"])
 def test_native_aware_unverified_marker_prefix_split_fails_closed(marker: str) -> None:
     for split in range(1, len(marker)):
-        parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+        parser = _parser("req-native", start_in_reasoning=True)
         parser.feed_with_native_tokens("ambiguous " + marker[:split], None)
         with pytest.raises(NativeTokenProvenanceError):
             parser.feed_with_native_tokens(marker[split:] + " outside", None)
@@ -2347,7 +2911,7 @@ def test_native_aware_unverified_marker_prefix_split_fails_closed(marker: str) -
 def test_native_aware_unverified_prefix_can_finish_in_verified_literal_context() -> None:
     marker = "</think>"
     split = 4
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     events = list(parser.feed_with_native_tokens("code `" + marker[:split], None))
     events.extend(parser.feed_with_native_tokens(marker[split:] + "` remains reasoning", ()))
     events.extend(parser.finish().events)
@@ -2356,7 +2920,7 @@ def test_native_aware_unverified_prefix_can_finish_in_verified_literal_context()
 
 
 def test_native_aware_verified_ordinary_prefix_does_not_poison_unverified_neighbor() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     events = list(parser.feed_with_native_tokens("literal <tool_", ()))
     events.extend(parser.feed_with_native_tokens("call> remains prose", None))
     events.extend(parser.finish().events)
@@ -2365,7 +2929,7 @@ def test_native_aware_verified_ordinary_prefix_does_not_poison_unverified_neighb
 
 
 def test_native_marker_must_pass_dialect_state_validation() -> None:
-    parser = QwenIncrementalParser("req-native", start_in_reasoning=True)
+    parser = _parser("req-native", start_in_reasoning=True)
     nested = "nested <think> stays reasoning"
     nested_span = _native_span(nested, "<think>", 248068)
     events = list(parser.feed_with_native_tokens(nested, (nested_span,)))
@@ -2384,3 +2948,130 @@ def test_native_marker_must_pass_dialect_state_validation() -> None:
 
     assert _reasoning_text(events) == nested
     assert _text(events) == "final literal </think>"
+
+
+def test_validation_verified_tool_opener_probe_work_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string"}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    original = QwenToolRegionDecoder.probe_compatibility_finish
+    stats = {"calls": 0, "chars": 0}
+
+    def wrapped(decoder: QwenToolRegionDecoder):  # type: ignore[no-untyped-def]
+        parts = decoder._compatibility_parts
+        if parts is not None:
+            stats["calls"] += 1
+            stats["chars"] += sum(len(part) for part in parts)
+        return original(decoder)
+
+    monkeypatch.setattr(QwenToolRegionDecoder, "probe_compatibility_finish", wrapped)
+    literal = " x <tool_call> y"
+    source = (
+        "<tool_call><function=write><parameter=content>"
+        + literal * 160
+        + "</parameter></function></tool_call>"
+    )
+    spans: list[NativeTokenSpan] = []
+    cursor = 0
+    while True:
+        position = source.find("<tool_call>", cursor)
+        if position < 0:
+            break
+        spans.append(NativeTokenSpan(position, position + len("<tool_call>"), 248058, "<tool_call>"))
+        cursor = position + len("<tool_call>")
+    close_at = source.rfind("</tool_call>")
+    spans.append(NativeTokenSpan(close_at, close_at + len("</tool_call>"), 248059, "</tool_call>"))
+
+    parser = _shared_validation_parser("req-probe-budget", policy)
+    events = list(parser.feed_with_native_tokens(source, tuple(sorted(spans, key=lambda span: span.start))))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert len(_completed_calls(events)) == 1
+    assert not finished.incomplete_tool_call
+    assert stats["chars"] <= 64 * 1024
+    assert stats["calls"] < 160
+
+
+def test_validation_only_semantic_work_exhaustion_maps_to_hold_limit() -> None:
+    close = "</parameter></function></tool_call>"
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string","minLength":100}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    parser = _shared_validation_parser("req-semantic-work-hold", policy)
+    events = list(
+        parser.feed(
+            "<tool_call><function=write><parameter=content>"
+            + (("x" + close) * 300)
+            + "tail"
+            + close
+        )
+    )
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    assert not _completed_calls(events)
+    assert not finished.incomplete_tool_call
+    issue = finished.terminal_issue
+    assert issue is not None
+    assert issue.kind is ParserTerminalIssueKind.PROTOCOL_AMBIGUITY
+    assert issue.ambiguity_detail is ParserAmbiguityDetail.HOLD_LIMIT
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_validation_only_schema_invalid_early_close_before_literal_tool_opener(
+    native: bool,
+) -> None:
+    close = "</parameter></function></tool_call>"
+    literal_opener = "<tool_call>"
+    content = "short" + close + literal_opener + " literal-protocol-example " + ("x" * 100)
+    source = "<tool_call><function=write><parameter=content>" + content + close
+    tool = FunctionTool(
+        "write",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"content":{"type":"string","minLength":80}},'
+            '"required":["content"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    parser = _shared_validation_parser(f"req-raw-literal-opener-{native}", policy)
+
+    if native:
+        spans: list[NativeTokenSpan] = []
+        at = 0
+        while True:
+            at = source.find(literal_opener, at)
+            if at < 0:
+                break
+            spans.append(NativeTokenSpan(at, at + len(literal_opener), 248058, literal_opener))
+            at += len(literal_opener)
+        events = list(parser.feed_with_native_tokens(source, tuple(spans)))
+    else:
+        events = list(parser.feed(source))
+    finished = parser.finish()
+    events.extend(finished.events)
+
+    calls = _completed_calls(events)
+    assert len(calls) == 1
+    assert calls[0].call.name == "write"
+    assert parse_json_strict(calls[0].call.arguments_json) == {"content": content}
+    assert sum(isinstance(event, ToolCallStarted) for event in events) == 1
+    assert sum(isinstance(event, ToolCallArgumentsDelta) for event in events) == 1
+    assert not finished.incomplete_tool_call
+    assert finished.terminal_issue is None

@@ -7,29 +7,28 @@ from pathlib import Path
 import pytest
 
 import exqserve.tool_wire.compiler as tool_wire_compiler
-import exqserve.tool_wire.controls.qwen as qwen_control
 import exqserve.tool_wire.lark_constraint as tool_wire_lark
 import exqserve.tool_wire.semantic_authority as tool_wire_semantic_authority
+import tests.tool_wire._legacy_qwen_a2a as qwen_a2a_control
 from exqserve.agent._json import canonical_json_dumps, parse_json_strict
 from exqserve.core.generation_guarantees import GenerationGuarantee
 from exqserve.model.contracts import ToolConstraintMode
-from exqserve.model.qwen import _parameter_value_json
-from exqserve.tool_wire import (
+from tests.tool_wire._legacy_api import (
     CompileBudget,
     ConstraintValueMode,
     DeterministicToolWireEngine,
     PlanCompileDisposition,
     ToolWireEngineStatus,
+    ValueCodecKind,
     admit_tool_sequence,
     certify_prompt_template_parity,
     encode_lossless_raw_string,
 )
-from exqserve.tool_wire.controls.qwen import (
+from tests.tool_wire._legacy_qwen_a2a import (
     compile_qwen_a2a_shadow,
-    qwen_a2a_compiler_capabilities,
-    qwen_a2a_prompt_observation,
     qwen_a2a_single_call_spec,
 )
+from tests.tool_wire._qwen_prompt_observation import qwen_a2a_prompt_observation
 from tests.tool_wire._support import policy, tool
 
 
@@ -103,10 +102,10 @@ def test_qwen_a2a_static_control_models_shared_raw_and_structured_parameter_open
     for schema_type in ("integer", "number", "boolean", "object", "array", "null"):
         assert spec.framing_selector.select(schema_type) == "qwen-json-structured"
     raw = spec.framing_variant("qwen-raw-string")
-    assert raw.value_framing.codec.value == "raw_string_strip_json_string_or_text"
-    assert raw.value_framing.codec.decode_raw_payload("\n  value\t\n") == "value"
-    assert raw.value_framing.codec.decode_raw_payload('"value"') == "value"
-    assert raw.value_framing.codec.decode_raw_payload('"a\\nb"') == "a\nb"
+    assert raw.value_framing.codec is ValueCodecKind.RAW_STRING
+    assert raw.value_framing.codec.decode_raw_payload("\n  value\t\n") == "\n  value\t\n"
+    assert raw.value_framing.codec.decode_raw_payload('"value"') == '"value"'
+    assert raw.value_framing.codec.decode_raw_payload('"a\\nb"') == '"a\\nb"'
     assert raw.value_framing.codec.decode_raw_payload("true") == "true"
     assert raw.value_framing.codec.decode_raw_payload("a\nb") == "a\nb"
     assert raw.value_framing.forbidden_close_language is not None
@@ -134,13 +133,27 @@ def test_qwen_a2a_static_name_language_matches_production_tag_rule_shape() -> No
         )
 
 
+def test_native_raw_suffix_lowering_is_derived_from_certified_close_literal() -> None:
+    start, rules = tool_wire_lark._raw_value_and_close_suffix_rule(
+        "tool_wire_raw",
+        ("<<END>>",),
+    )
+    assert start == "tool_wire_raw"
+    assert rules == ('tool_wire_raw[suffix="<<END>>"]: /[\\s\\S]*/',)
+    with pytest.raises(tool_wire_lark.ToolWireConstraintLoweringUnsupported):
+        tool_wire_lark._raw_value_and_close_suffix_rule(
+            "tool_wire_raw",
+            ("</a>", "</b>"),
+        )
+
+
 def test_qwen_a2a_plain_raw_string_can_retain_schema_guarantee() -> None:
     bundle = _compile({"content": {"type": "string"}})
     assert bundle.constrained
     branch = bundle.plan.tool("write")
     argument = branch.arguments[0]
     assert argument.value_mode is ConstraintValueMode.ANY_SAFE_RAW
-    assert argument.proof.guarantee is GenerationGuarantee.SCHEMA
+    assert argument.guarantee is GenerationGuarantee.SCHEMA
     assert branch.guarantee is GenerationGuarantee.SCHEMA
     assert bundle.constraint is not None
     assert bundle.grammar_fingerprint == bundle.plan.constraint_fingerprint
@@ -159,79 +172,68 @@ def test_qwen_a2a_format_mode_uses_same_raw_close_exclusion_language() -> None:
     argument = bundle.plan.tool("write").arguments[0]
     assert bundle.constrained
     assert argument.value_mode is ConstraintValueMode.ANY_SAFE_RAW
-    assert argument.proof.guarantee is GenerationGuarantee.FORMAT
+    assert argument.guarantee is GenerationGuarantee.FORMAT
     assert bundle.plan.tool("write").guarantee is GenerationGuarantee.FORMAT
     assert bundle.constraint is not None
     assert "/[^<]/" not in bundle.constraint.lark_grammar
 
 
-def test_qwen_a2a_raw_codec_normalizes_only_outer_presentation_whitespace() -> None:
+def test_qwen_a2a_raw_codec_preserves_native_whitespace_exactly() -> None:
     bundle = _compile(
         {"content": {"type": "string"}, "count": {"type": "integer"}},
         presentation=("content", "count"),
     )
     compact = _wire(bundle, (("content", "hello<world"), ("count", "3")))
-    template = (
-        "<tool_call>\n<function=write>\n"
-        "<parameter=content>\nhello<world\n</parameter>\n"
-        "<parameter=count>\n3\n</parameter>\n"
-        "</function>\n</tool_call>"
-    )
+    padded = _wire(bundle, (("content", "\nhello<world\n"), ("count", "3")))
     interior = _wire(bundle, (("content", "line1\nline2"), ("count", "3")))
 
     compact_result = _finish(bundle, compact, (compact,))
-    template_result = _finish(bundle, template, tuple(template))
+    padded_result = _finish(bundle, padded, tuple(padded))
     interior_result = _finish(bundle, interior, (interior,))
-    for result in (compact_result, template_result, interior_result):
+    for result in (compact_result, padded_result, interior_result):
         assert result.is_complete and result.sequence is not None
         assert admit_tool_sequence(bundle.spec, bundle.plan, result.sequence).is_valid
 
     compact_values = [parse_json_strict(item.canonical_value_json) for item in compact_result.sequence.calls[0].occurrences]
-    template_values = [parse_json_strict(item.canonical_value_json) for item in template_result.sequence.calls[0].occurrences]
+    padded_values = [parse_json_strict(item.canonical_value_json) for item in padded_result.sequence.calls[0].occurrences]
     interior_values = [parse_json_strict(item.canonical_value_json) for item in interior_result.sequence.calls[0].occurrences]
     assert compact_values == ["hello<world", 3]
-    assert template_values == compact_values
+    assert padded_values == ["\nhello<world\n", 3]
     assert interior_values == ["line1\nline2", 3]
 
 
 @pytest.mark.parametrize(
-    ("wire_value", "semantic"),
+    "wire_value",
     (
-        ("foo", "foo"),
-        ("123", "123"),
-        ("true", "true"),
-        ("false", "false"),
-        ("null", "null"),
-        ('{"x":1}', '{"x":1}'),
-        ("[1,2]", "[1,2]"),
-        ('"foo"', "foo"),
-        ('"a\\nb"', "a\nb"),
-        ('"a\\\"b"', 'a"b'),
-        ('"a\\\\b"', "a\\b"),
-        ('"\\u4f60"', "你"),
-        ('""', ""),
-        ("\nfoo\n", "foo"),
-        ("line1\nline2", "line1\nline2"),
-        ('" leading"', " leading"),
-        ('"trailing "', "trailing "),
-        ('"x\\u003c/parameter>y"', "x</parameter>y"),
+        "foo",
+        "123",
+        "true",
+        "false",
+        "null",
+        '{"x":1}',
+        "[1,2]",
+        '"foo"',
+        '"a\\nb"',
+        '"a\\\"b"',
+        '"a\\\\b"',
+        '"\\u4f60"',
+        '""',
+        "\nfoo\n",
+        "line1\nline2",
+        '" leading"',
+        '"trailing "',
+        '"x\\u003c/parameter>y"',
     ),
 )
-def test_qwen_a2a_raw_string_decoder_matches_frozen_production_semantics(
-    wire_value: str,
-    semantic: str,
-) -> None:
+def test_qwen_a2a_raw_string_decoder_preserves_direct_native_payload(wire_value: str) -> None:
     bundle = _compile({"content": {"type": "string"}})
     wire = _wire(bundle, (("content", wire_value),))
     result = _finish(bundle, wire, (wire,))
     assert result.is_complete and result.sequence is not None
     assert admit_tool_sequence(bundle.spec, bundle.plan, result.sequence).is_valid
     occurrence = result.sequence.calls[0].occurrences[0]
-    assert occurrence.canonical_value_json == _parameter_value_json(
-        wire_value,
-        string_parameter=True,
-    )
-    assert parse_json_strict(occurrence.canonical_value_json) == semantic
+    assert occurrence.canonical_value_json == canonical_json_dumps(wire_value)
+    assert parse_json_strict(occurrence.canonical_value_json) == wire_value
 
 
 @pytest.mark.parametrize("wire_value", ('"a\\nb"', '"\\u4f60"', '"x\\u003c/parameter>y"'))
@@ -245,21 +247,19 @@ def test_qwen_a2a_raw_string_decoder_is_chunk_invariant(wire_value: str) -> None
         assert result == baseline
 
 
-def test_qwen_a2a_finite_raw_values_use_lossless_encoder_not_identity_only() -> None:
+def test_qwen_a2a_finite_raw_values_use_direct_native_spelling_and_filter_reserved_close() -> None:
     values = ["safe", " safe", "safe ", "\tbad", '"quoted"', "x</parameter>y"]
+    admitted = values[:-1]
     bundle = _compile({"content": {"type": "string", "enum": values}})
     argument = bundle.plan.tool("write").arguments[0]
     assert bundle.constrained
     assert argument.value_mode is ConstraintValueMode.FINITE_VALUES
-    assert argument.admitted_values_json == tuple(canonical_json_dumps(value) for value in values)
+    assert argument.admitted_wire_payloads == tuple(admitted)
     raw = bundle.spec.framing_variant("qwen-raw-string").value_framing
-    for semantic_json in argument.admitted_values_json:
-        semantic = parse_json_strict(semantic_json)
-        assert isinstance(semantic, str)
+    for semantic in admitted:
         wire = encode_lossless_raw_string(semantic, raw)
-        assert wire is not None
+        assert wire == semantic
         assert "</parameter>" not in wire
-        assert raw.codec.decode_raw_payload(wire) == semantic
 
 
 @pytest.mark.parametrize("count", (1, 10, 100))
@@ -316,7 +316,6 @@ def test_qwen_a2a_finite_raw_emission_reuses_semantic_wire_payloads(count: int) 
     )
     argument = bundle.plan.tool("write").arguments[0]
     assert bundle.constrained
-    assert argument.admitted_values_json is not None
     assert argument.admitted_wire_payloads is not None
     assert len(argument.admitted_wire_payloads) == count
 
@@ -425,7 +424,10 @@ def test_qwen_a2a_hard_required_name_envelope_rejects_before_semantic_compile(
 @pytest.mark.parametrize("mode", (ToolConstraintMode.SCHEMA, ToolConstraintMode.FORMAT))
 def test_qwen_a2a_v31_unselected_optional_finite_only_pays_source_bytes(
     mode: ToolConstraintMode,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Force optional omission through the real wire-payload limit, not permutation count.
+    monkeypatch.setattr(tool_wire_compiler, "_HARD_MAX_FINITE_WIRE_PAYLOAD_BYTES_TOTAL", 0)
     def compile_count(count: int):
         schema = _schema(
             {
@@ -470,22 +472,22 @@ def test_qwen_a2a_v31_selected_optional_finite_commits_wire_product() -> None:
     )
     request_policy = policy(tool("write", schema, strict=False), allow_parallel=False)
     orders = {"write": ("r", "o")}
-    narrow = compile_qwen_a2a_shadow(
-        request_policy,
-        orders,
-        mode=ToolConstraintMode.FORMAT,
-        budget=CompileBudget(1, 1_000_000, 100_000_000, 10_000_000),
-    )
     rich = compile_qwen_a2a_shadow(
         request_policy,
         orders,
         mode=ToolConstraintMode.FORMAT,
         budget=CompileBudget(3, 1_000_000, 100_000_000, 10_000_000),
     )
+    narrow = compile_qwen_a2a_shadow(
+        request_policy,
+        orders,
+        mode=ToolConstraintMode.FORMAT,
+        budget=CompileBudget(3, rich.plan.budget_result.estimated_rules - 1, 100_000_000, 10_000_000),
+    )
 
     assert narrow.constrained and rich.constrained
     assert narrow.plan.tool("write").order_plan.orders == (("r",),)
-    assert len(rich.plan.tool("write").order_plan.orders) == 3
+    assert rich.plan.tool("write").order_plan.optional_names == frozenset({"o"})
     assert not narrow.plan.tool("write").arguments[1].generated
     rich_optional = rich.plan.tool("write").arguments[1]
     assert rich_optional.generated
@@ -513,47 +515,6 @@ def test_v31_schema_node_hard_allowance_bounds_child_iteration() -> None:
         tool_wire_compiler._SCHEMA_NODE_LIMIT_CONTEXT.reset(context_handle)
 
     assert children.reads == 4
-
-
-def test_qwen_a2a_v31_required_finite_wire_hard_allowance_stops_before_second_encode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    semantic = "x</parameter>y"
-    framing = qwen_a2a_single_call_spec().framing_variant("qwen-raw-string").value_framing
-    first_payload = encode_lossless_raw_string(semantic, framing)
-    assert first_payload is not None
-    first_payload_bytes = len(first_payload.encode("utf-8"))
-    monkeypatch.setattr(
-        tool_wire_compiler,
-        "_HARD_MAX_FINITE_WIRE_PAYLOAD_BYTES_TOTAL",
-        first_payload_bytes + 1,
-    )
-    materialization_calls = 0
-    original_materialize = tool_wire_compiler._boundary_safe_json_string_literal
-
-    def counted_materialize(value: str, close_forms: tuple[str, ...]) -> str:
-        nonlocal materialization_calls
-        materialization_calls += 1
-        return original_materialize(value, close_forms)
-
-    monkeypatch.setattr(
-        tool_wire_compiler,
-        "_boundary_safe_json_string_literal",
-        counted_materialize,
-    )
-    schema = _schema({"r": {"type": "string", "const": semantic}}, required=("r",))
-    bundle = compile_qwen_a2a_shadow(
-        policy(
-            tool("first", schema, strict=True),
-            tool("second", schema, strict=True),
-            allow_parallel=False,
-        ),
-        {"first": ("r",), "second": ("r",)},
-        budget=CompileBudget(2, 1_000_000, 100_000_000, 10_000_000),
-    )
-
-    assert bundle.plan.disposition is PlanCompileDisposition.REJECTED
-    assert materialization_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -604,21 +565,29 @@ def test_qwen_a2a_artifact_optional_order_enrichment_is_monotonic() -> None:
     )
     assert narrow_perm.constrained and rich_perm.constrained
     assert len(narrow_perm.plan.tool("write").order_plan.orders) == 1
-    assert len(rich_perm.plan.tool("write").order_plan.orders) == 11
+    assert len(rich_perm.plan.tool("write").order_plan.orders) == 1
+    assert narrow_perm.plan.tool("write").order_plan.optional_names == frozenset({"o1", "o2"})
+    assert narrow_perm.plan.tools == rich_perm.plan.tools
+    assert narrow_perm.plan.budget_result == rich_perm.plan.budget_result
+
+    rich_rule_cost = rich_perm.plan.budget_result.estimated_rules
 
     narrow_rules = compile_qwen_a2a_shadow(
         request_policy,
         orders,
-        budget=CompileBudget(20, 74, 1_000_000, 3_000),
+        budget=CompileBudget(20, rich_rule_cost - 1, 1_000_000, 3_000),
     )
     rich_rules = compile_qwen_a2a_shadow(
         request_policy,
         orders,
-        budget=CompileBudget(20, 75, 1_000_000, 3_000),
+        budget=CompileBudget(20, rich_rule_cost, 1_000_000, 3_000),
     )
     assert narrow_rules.constrained and rich_rules.constrained
     assert len(narrow_rules.plan.tool("write").order_plan.orders) == 1
-    assert len(rich_rules.plan.tool("write").order_plan.orders) == 11
+    assert not narrow_rules.plan.tool("write").order_plan.optional_names
+    assert narrow_rules.plan.budget_result.estimated_rules < rich_rule_cost
+    assert rich_rules.plan.tool("write").order_plan.optional_names == frozenset({"o1", "o2"})
+    assert rich_rules.plan.budget_result.estimated_rules == rich_rule_cost
 
 
 @pytest.mark.parametrize(
@@ -761,12 +730,12 @@ def test_qwen_a2a_v31_multitool_budget_swap_keeps_minimal_baseline_and_is_determ
 
     assert low.constrained and high.constrained and high_repeat.constrained
     for bundle in (low, high, high_repeat):
-        assert ("r",) in bundle.plan.tool("a").order_plan.orders
-        assert ("r",) in bundle.plan.tool("b").order_plan.orders
-    assert len(low.plan.tool("b").order_plan.orders) == 3
-    assert len(high.plan.tool("a").order_plan.orders) == 11
-    assert low.plan.tool("a").order_plan.orders != high.plan.tool("a").order_plan.orders
-    assert low.plan.tool("b").order_plan.orders != high.plan.tool("b").order_plan.orders
+        assert bundle.plan.tool("a").order_plan.accepts(("r",))
+        assert bundle.plan.tool("b").order_plan.accepts(("r",))
+        assert bundle.plan.tool("a").order_plan.optional_names == frozenset({"o1", "o2"})
+        assert bundle.plan.tool("b").order_plan.optional_names == frozenset({"o"})
+    assert low.plan.tools == high.plan.tools
+    assert low.plan.budget_result == high.plan.budget_result
     assert high.plan == high_repeat.plan
     assert high.constraint == high_repeat.constraint
     assert high.grammar_fingerprint == high_repeat.grammar_fingerprint
@@ -779,9 +748,9 @@ def test_qwen_a2a_artifact_is_built_and_fingerprinted_once_for_minimal_plan(
     finalize_calls = 0
     plan_calls = 0
     fingerprint_calls = 0
-    original_build = qwen_control.build_lark_tool_constraint_candidate
-    original_finalize = qwen_control.finalize_lark_tool_constraint_candidate
-    original_compile_plan = qwen_control.compile_tool_wire_plan
+    original_build = qwen_a2a_control.build_lark_tool_constraint_candidate
+    original_finalize = qwen_a2a_control.finalize_lark_tool_constraint_candidate
+    original_compile_plan = qwen_a2a_control.compile_tool_wire_plan
     original_sha256 = tool_wire_lark.sha256
 
     def counted_build(*args: object, **kwargs: object):
@@ -804,9 +773,9 @@ def test_qwen_a2a_artifact_is_built_and_fingerprinted_once_for_minimal_plan(
         fingerprint_calls += 1
         return original_sha256(*args, **kwargs)
 
-    monkeypatch.setattr(qwen_control, "build_lark_tool_constraint_candidate", counted_build)
-    monkeypatch.setattr(qwen_control, "finalize_lark_tool_constraint_candidate", counted_finalize)
-    monkeypatch.setattr(qwen_control, "compile_tool_wire_plan", counted_compile_plan)
+    monkeypatch.setattr(qwen_a2a_control, "build_lark_tool_constraint_candidate", counted_build)
+    monkeypatch.setattr(qwen_a2a_control, "finalize_lark_tool_constraint_candidate", counted_finalize)
+    monkeypatch.setattr(qwen_a2a_control, "compile_tool_wire_plan", counted_compile_plan)
     monkeypatch.setattr(tool_wire_lark, "sha256", counted_sha256)
 
     bundle = compile_qwen_a2a_shadow(
@@ -869,7 +838,6 @@ def test_qwen_a2a_const_enum_budget_counts_domain_scan_and_effective_intersectio
     assert bundle.plan.disposition is PlanCompileDisposition.CONSTRAINED_EXECUTABLE
     assert bundle.plan.budget_result.within_budget
     assert bundle.plan.budget_result.work_units == exact_work
-    assert argument.admitted_values_json == (canonical_json_dumps("target"),)
     assert argument.admitted_wire_payloads == ("target",)
 
     rejected = compile_qwen_a2a_shadow(
@@ -891,7 +859,7 @@ def test_qwen_a2a_large_finite_budget_stops_before_validation_or_encoding(
     def unexpected_semantic_work(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("candidate validation/encoding must not run after domain scan exhausts budget")
 
-    monkeypatch.setattr(tool_wire_compiler, "schema_value_is_valid", unexpected_semantic_work)
+    monkeypatch.setattr(tool_wire_compiler, "exact_finite_non_emptiness", unexpected_semantic_work)
     monkeypatch.setattr(tool_wire_compiler, "encode_lossless_raw_string", unexpected_semantic_work)
     values = [f"value-{index}" for index in range(5000)]
     schema = _schema({"content": {"type": "string", "enum": values}})
@@ -910,80 +878,6 @@ def test_qwen_a2a_large_finite_budget_stops_before_validation_or_encoding(
     assert bundle.plan.budget_result.work_units > 4
     assert not bundle.plan.budget_result.within_budget
     assert bundle.constraint is None
-
-
-def test_qwen_a2a_metered_support_scan_stops_before_wide_schema_walk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def unexpected_legacy_scan(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("semantic-final SCHEMA must not use the legacy unmetered support scan")
-
-    original_charge = tool_wire_compiler._SemanticBudgetMeter.charge_work
-    charge_calls = 0
-
-    def counted_charge(self: object, units: int = 1) -> None:
-        nonlocal charge_calls
-        charge_calls += 1
-        original_charge(self, units)
-
-    monkeypatch.setattr(tool_wire_compiler, "_unsupported_schema_keyword", unexpected_legacy_scan)
-    monkeypatch.setattr(tool_wire_compiler._SemanticBudgetMeter, "charge_work", counted_charge)
-    children = {f"p{index}": {"type": "integer"} for index in range(1000)}
-    schema = _schema(
-        {
-            "value": {
-                "type": "object",
-                "properties": children,
-                "required": list(children),
-                "additionalProperties": False,
-            }
-        }
-    )
-    bundle = compile_qwen_a2a_shadow(
-        policy(tool("write", schema, strict=True), allow_parallel=False),
-        {"write": ("value",)},
-        budget=CompileBudget(
-            max_permutations=1000,
-            max_estimated_rules=100_000,
-            max_estimated_bytes=10_000_000,
-            max_work_units=2,
-        ),
-    )
-    assert bundle.plan.disposition is PlanCompileDisposition.REJECTED
-    assert not bundle.plan.budget_result.within_budget
-    assert bundle.plan.budget_result.work_units > 2
-    assert charge_calls == 0
-
-
-def test_qwen_a2a_metered_support_walker_precharges_wide_child_container() -> None:
-    class CountingDict(dict[str, object]):
-        def __init__(self, values: dict[str, object]) -> None:
-            super().__init__(values)
-            self.values_reads = 0
-
-        def values(self):
-            for value in super().values():
-                self.values_reads += 1
-                yield value
-
-    properties = CountingDict(
-        {f"p{index}": {"type": "integer"} for index in range(10_000)}
-    )
-    root = {
-        "type": "object",
-        "properties": properties,
-        "required": [],
-        "additionalProperties": False,
-    }
-    meter = tool_wire_compiler._SemanticBudgetMeter(max_bytes=10_000_000, max_work_units=4)
-    with pytest.raises(tool_wire_compiler._BranchBudgetExceeded):
-        tool_wire_compiler._unsupported_schema_keyword_metered(
-            root,
-            frozenset({"type", "properties", "required", "additionalProperties"}),
-            meter,
-        )
-    assert meter.work_units == 10_004
-    assert properties.values_reads == 0
 
 
 def test_legacy_raw_finite_scalable_work_uses_the_plan_budget_owner() -> None:
@@ -1012,9 +906,9 @@ def test_legacy_raw_finite_scalable_work_uses_the_plan_budget_owner() -> None:
     assert plan.budget_result.within_budget
     assert plan.budget_result.work_units == exact_work
     assert argument.generated
-    assert argument.proof.guarantee is GenerationGuarantee.SCHEMA
-    assert argument.admitted_values_json is not None
-    assert len(argument.admitted_values_json) == 10
+    assert argument.guarantee is GenerationGuarantee.SCHEMA
+    assert argument.admitted_wire_payloads is not None
+    assert len(argument.admitted_wire_payloads) == 10
 
     rejected = schema_plan(
         raw_spec(),
@@ -1037,7 +931,7 @@ def test_qwen_a2a_structured_format_discards_large_finite_cardinality_from_work_
     def unexpected_candidate_validation(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("FORMAT skeleton must not validate discarded enum candidates")
 
-    monkeypatch.setattr(tool_wire_compiler, "schema_value_is_valid", unexpected_candidate_validation)
+    monkeypatch.setattr(tool_wire_compiler, "exact_finite_non_emptiness", unexpected_candidate_validation)
     schema = _schema({"count": {"type": "integer", "enum": list(range(5000))}})
     request_policy = policy(tool("write", schema, strict=False), allow_parallel=False)
     roomy = compile_qwen_a2a_shadow(
@@ -1254,7 +1148,8 @@ def test_qwen_a2a_structured_const_enum_uses_draft_json_equality(
 ) -> None:
     bundle = _compile({"value": property_schema})
     argument = bundle.plan.tool("write").arguments[0]
-    assert (argument.proof.non_empty.value == "proven_non_empty") is expected_nonempty
+    assert argument.generated is expected_nonempty
+    assert (argument.guarantee is GenerationGuarantee.SCHEMA) is expected_nonempty
     assert bundle.constrained is expected_nonempty
 
 
@@ -1293,30 +1188,6 @@ def test_qwen_a2a_structured_numeric_equality_keeps_exact_budget_boundary() -> N
     )
     assert exact.constrained
     assert exact.plan.budget_result.work_units == exact_work
-
-
-def test_qwen_a2a_structured_const_identity_waits_for_first_semantic_charge(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def unexpected_equality(*_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("const equality work must not start before an affordable charge")
-
-    monkeypatch.setattr(tool_wire_compiler, "schema_values_equal", unexpected_equality)
-    schema: dict[str, object] = {
-        "type": "array",
-        "items": {"type": "integer"},
-        "const": list(range(10_000)),
-        "enum": [list(range(10_000))],
-    }
-    meter = tool_wire_compiler._SemanticBudgetMeter(max_bytes=10_000_000, max_work_units=0)
-    meter.provide_schema_json(canonical_json_dumps(schema))
-    with pytest.raises(tool_wire_compiler._BranchBudgetExceeded):
-        tool_wire_compiler._exact_non_emptiness(
-            qwen_a2a_compiler_capabilities(),
-            schema,
-            semantic_budget=meter,
-        )
-    assert meter.work_units == 1
 
 
 def test_qwen_a2a_hard_property_cardinality_rejects_before_semantic_compile(
@@ -1367,9 +1238,9 @@ def test_qwen_a2a_hard_tool_count_rejects_before_schema_parse(
     assert parse_calls == 0
 
 
-def test_v3_exhaustive_permutation_width_has_hard_ceiling() -> None:
+def test_compact_order_has_no_exhaustive_permutation_width_cliff() -> None:
     spec = qwen_a2a_single_call_spec()
-    within = tuple(f"p{index}" for index in range(tool_wire_compiler._MAX_EXHAUSTIVE_PERMUTABLE_WIDTH))
+    within = tuple(f"p{index}" for index in range(6))
     over = (*within, "p6")
 
     within_prepared = tool_wire_compiler._PreparedOrderState(
@@ -1377,51 +1248,21 @@ def test_v3_exhaustive_permutation_width_has_hard_ceiling() -> None:
         required_names=frozenset(),
         required=(),
         optional=within,
-        minimum_order_bytes=0,
     )
     over_prepared = tool_wire_compiler._PreparedOrderState(
         presentation_order=over,
         required_names=frozenset(),
         required=(),
         optional=over,
-        minimum_order_bytes=0,
     )
 
-    assert tool_wire_compiler._full_order_candidate_v3(spec, within_prepared, 10_000) is not None
-    assert tool_wire_compiler._full_order_candidate_v3(spec, over_prepared, 10_000) is None
+    for prepared in (within_prepared, over_prepared):
+        plan = tool_wire_compiler._declared_order_plan(prepared, spec)
+        assert len(plan.orders) == 1
+        assert plan.accepts(())
+        assert plan.accepts(prepared.presentation_order)
+        assert plan.accepts((prepared.presentation_order[-1],))
     assert tool_wire_compiler._minimal_order_plan(over_prepared, spec).orders == ((),)
-
-
-@pytest.mark.parametrize("width", (10, 1000, 10_000))
-def test_decoder_safe_nested_required_precharges_before_scan(width: int) -> None:
-    class TrackingList(list[str]):
-        def __init__(self, values: list[str]) -> None:
-            super().__init__(values)
-            self.iter_reads = 0
-
-        def __iter__(self):
-            for value in super().__iter__():
-                self.iter_reads += 1
-                yield value
-
-    required = TrackingList([f"r{index}" for index in range(width)])
-    meter = tool_wire_compiler._SemanticBudgetMeter(
-        max_bytes=100_000_000,
-        max_work_units=2,
-    )
-    with pytest.raises(tool_wire_compiler._BranchBudgetExceeded):
-        tool_wire_compiler._decoder_safe_generation_schema(
-            {
-                "type": "object",
-                "properties": {},
-                "required": required,
-                "additionalProperties": False,
-            },
-            preserve_schema_semantics=False,
-            semantic_budget=meter,
-        )
-    assert required.iter_reads == 0
-    assert meter.work_units == width + 1
 
 
 def test_qwen_a2a_static_tool_count_rejects_before_order_mapping_or_rejection_replay() -> None:
@@ -1465,7 +1306,6 @@ def test_qwen_a2a_static_tool_count_rejects_before_order_mapping_or_rejection_re
     # V3 hard-tool admission rejects before any order mapping access and does not synthesize
     # instruction-level attempted-work telemetry for an inadmissible request.
     assert (orders.iter_reads, orders.contains_reads, orders.getitem_reads) == (0, 0, 0)
-    assert bundle.plan.presentation_orders == ()
 
 
 def test_qwen_a2a_tool_source_byte_lower_bound_rejects_before_schema_parse(
@@ -1744,33 +1584,6 @@ def test_qwen_a2a_root_exact_witness_stops_before_unaffordable_validation(
     assert validations == 0
 
 
-def test_qwen_a2a_close_safe_finite_wire_expansion_counts_toward_byte_budget() -> None:
-    semantic = "</parameter>" * 50
-    schema = _schema({"content": {"type": "string", "const": semantic}})
-    spec = qwen_a2a_single_call_spec()
-    minimum_source_bytes = (
-        len(spec.spec_id.encode("utf-8"))
-        + len(b"write")
-        + len(schema.encode("utf-8"))
-        + len(b"content")
-    )
-    max_bytes = minimum_source_bytes + 100
-    bundle = compile_qwen_a2a_shadow(
-        policy(tool("write", schema, strict=True), allow_parallel=False),
-        {"write": ("content",)},
-        budget=CompileBudget(
-            max_permutations=1000,
-            max_estimated_rules=100_000,
-            max_estimated_bytes=max_bytes,
-            max_work_units=100_000,
-        ),
-    )
-    assert bundle.plan.disposition is PlanCompileDisposition.REJECTED
-    assert not bundle.plan.budget_result.within_budget
-    assert bundle.plan.budget_result.estimated_bytes > max_bytes
-    assert not bundle.constrained
-
-
 def test_qwen_a2a_structured_format_has_emit_capable_value_mode() -> None:
     schema = _schema({"count": {"type": "integer", "multipleOf": 2}})
     fn = tool("write", schema, strict=False)
@@ -1785,7 +1598,7 @@ def test_qwen_a2a_structured_format_has_emit_capable_value_mode() -> None:
     assert bundle.plan.tool("write").guarantee is GenerationGuarantee.FORMAT
     assert argument.generated
     assert argument.value_mode is ConstraintValueMode.STRUCTURED_FORMAT
-    assert argument.proof.guarantee is GenerationGuarantee.FORMAT
+    assert argument.guarantee is GenerationGuarantee.FORMAT
     assert argument.generation_schema_json == (
         '{"maximum":1000000000000000000,"minimum":-1000000000000000000,"type":"integer"}'
     )
@@ -1802,7 +1615,7 @@ def test_qwen_a2a_structured_format_has_emit_capable_value_mode() -> None:
     assert not strict_bundle.constrained
     assert not strict_argument.generated
     assert strict_argument.value_mode is ConstraintValueMode.VALIDATION_ONLY
-    assert strict_argument.proof.guarantee is GenerationGuarantee.NONE
+    assert strict_argument.guarantee is GenerationGuarantee.NONE
     assert strict_argument.generation_schema_json is None
 
 
@@ -1833,34 +1646,26 @@ def test_qwen_a2a_generated_value_modes_are_all_emitter_owned() -> None:
     assert all(bundle.constraint is not None for bundle in (raw, finite, structured_schema, structured_format))
 
 
-def test_qwen_a2a_finite_string_language_preserves_close_semantics_via_safe_alias() -> None:
+def test_qwen_a2a_finite_string_language_filters_reserved_close_values() -> None:
     values = ["safe", "a<b", "bad</parameter>value"]
     bundle = _compile({"content": {"type": "string", "enum": values}})
     argument = bundle.plan.tool("write").arguments[0]
     assert bundle.constrained
     assert argument.value_mode is ConstraintValueMode.FINITE_VALUES
-    assert argument.proof.guarantee is GenerationGuarantee.SCHEMA
-    assert argument.admitted_values_json == tuple(canonical_json_dumps(value) for value in values)
+    assert argument.guarantee is GenerationGuarantee.SCHEMA
+    assert argument.admitted_wire_payloads == tuple(values[:-1])
     framing = bundle.spec.framing_variant("qwen-raw-string").value_framing
-    encoded = encode_lossless_raw_string("bad</parameter>value", framing)
-    assert encoded == '"bad\\u003c/parameter>value"'
-    assert "</parameter>" not in encoded
-    assert framing.codec.decode_raw_payload(encoded) == "bad</parameter>value"
+    assert encode_lossless_raw_string("bad</parameter>value", framing) is None
 
 
-def test_qwen_a2a_required_close_text_const_is_executable_via_safe_json_string_wire() -> None:
+def test_qwen_a2a_required_close_text_const_fails_closed() -> None:
     semantic = "x</parameter>y"
     bundle = _compile({"content": {"type": "string", "const": semantic}})
     argument = bundle.plan.tool("write").arguments[0]
-    assert bundle.plan.disposition is PlanCompileDisposition.CONSTRAINED_EXECUTABLE
-    assert argument.admitted_values_json == (canonical_json_dumps(semantic),)
-    assert argument.generated
-    assert argument.proof.guarantee is GenerationGuarantee.SCHEMA
-    assert bundle.constraint is not None
-    framing = bundle.spec.framing_variant("qwen-raw-string").value_framing
-    encoded = encode_lossless_raw_string(semantic, framing)
-    assert encoded == '"x\\u003c/parameter>y"'
-    assert canonical_json_dumps(encoded) in bundle.constraint.lark_grammar
+    assert bundle.plan.disposition is PlanCompileDisposition.REJECTED
+    assert argument.generated is False
+    assert argument.guarantee is GenerationGuarantee.NONE
+    assert bundle.constraint is None
 
 
 @pytest.mark.parametrize(
@@ -1882,7 +1687,7 @@ def test_qwen_a2a_unsupported_string_semantics_never_claim_schema(
     bundle = _compile({"content": property_schema}, strict=True)
     argument = bundle.plan.tool("write").arguments[0]
     assert not bundle.constrained
-    assert argument.proof.guarantee is GenerationGuarantee.NONE
+    assert argument.guarantee is GenerationGuarantee.NONE
     assert not argument.generated
 
 
@@ -1904,7 +1709,7 @@ def test_qwen_a2a_refs_are_inventoried_as_unsupported_without_false_schema() -> 
     argument = bundle.plan.tool("write").arguments[0]
     assert not bundle.constrained
     assert argument.value_mode is ConstraintValueMode.VALIDATION_ONLY
-    assert argument.proof.guarantee is GenerationGuarantee.NONE
+    assert argument.guarantee is GenerationGuarantee.NONE
     assert not argument.generated
 
 
@@ -1990,7 +1795,7 @@ def test_qwen_a2a_file_path_before_content_presentation_order_is_preserved() -> 
     )
     branch = bundle.plan.tool("write")
     assert branch.order_plan.orders[0] == ("file_path", "content")
-    assert ("content", "file_path") in branch.order_plan.orders
+    assert not branch.order_plan.accepts(("content", "file_path"))
     assert bundle.parallel_generation_narrowed
     assert bundle.spec.multiplicity.max_calls_per_sequence == 1
     wire = _wire(bundle, (("file_path", "/tmp/a.py"), ("content", "print(1)")))

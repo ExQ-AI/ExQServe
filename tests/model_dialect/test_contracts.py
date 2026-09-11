@@ -12,6 +12,7 @@ from exqserve.model.contracts import (
     TemplateRequest,
     TemplateTool,
     TemplateToolCall,
+    ToolRegionDecodeResult,
 )
 
 
@@ -96,4 +97,36 @@ def test_rendered_and_compiled_prompt_validate_token_ids() -> None:
             prompt_hash="short",
             stop_conditions=(),
             template_request=TemplateRequest(messages=(), tools=(), template_kwargs=()),
+        )
+
+
+def test_tool_region_literal_offsets_are_exact_sorted_remainder_coordinates() -> None:
+    remainder = "lead <tool_call> middle <tool_call> tail"
+    first = remainder.index("<tool_call>")
+    second = remainder.index("<tool_call>", first + 1)
+
+    result = ToolRegionDecodeResult(
+        True,
+        remainder=remainder,
+        literal_tool_open_offsets=(first, second),
+    )
+    assert result.literal_tool_open_offsets == (first, second)
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        ToolRegionDecodeResult(
+            True,
+            remainder=remainder,
+            literal_tool_open_offsets=(second, first),
+        )
+    with pytest.raises(ValueError, match="exact remainder markers"):
+        ToolRegionDecodeResult(
+            True,
+            remainder=remainder,
+            literal_tool_open_offsets=(0,),
+        )
+    with pytest.raises(TypeError, match="integer offsets"):
+        ToolRegionDecodeResult(
+            True,
+            remainder=remainder,
+            literal_tool_open_offsets=(True,),  # type: ignore[arg-type]
         )

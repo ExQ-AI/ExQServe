@@ -1,4 +1,5 @@
 """A0 constrained and validation-only Tool-wire sequence admission authorities."""
+# Historical test helper; not production authority.
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from exqserve.tool_wire.contracts import (
     CompiledToolWirePlan,
     ConstraintValueMode,
     PlanCompileDisposition,
+    SchemaSemanticAuthority,
     ToolWireSpec,
     ValueFramingKind,
     WireToolSequence,
@@ -114,9 +116,15 @@ def _admit_sequence(
                 "static Tool wire does not admit adjacent Tool calls",
             )
         )
+    if len(sequence.calls) > 1 and not plan.allow_parallel:
+        issues.append(
+            PlanAdmissionIssue(
+                "request_parallel_tools_forbidden",
+                "compiled request policy does not admit adjacent Tool calls",
+            )
+        )
 
     require_explicit_variant = len(spec.argument_framings) > 1
-    presentation_orders = dict(plan.presentation_orders)
     for position, call in enumerate(sequence.calls):
         if call.index != position:
             issues.append(
@@ -145,13 +153,6 @@ def _admit_sequence(
                 )
             )
             continue
-        if not branch.name_representable:
-            issues.append(
-                PlanAdmissionIssue(
-                    "tool_name_unrepresentable",
-                    f"Tool branch {call.name!r} is not losslessly representable",
-                )
-            )
         if constrained and not branch.representable:
             issues.append(
                 PlanAdmissionIssue(
@@ -208,7 +209,7 @@ def _admit_sequence(
                         variant.argument_open,
                     )
                 )
-            if not argument.name_representable or not argument_terminal_representable:
+            if not argument_terminal_representable:
                 issues.append(
                     PlanAdmissionIssue(
                         "argument_name_unrepresentable",
@@ -268,25 +269,25 @@ def _admit_sequence(
                 )
                 continue
 
-            if (
-                constrained
-                and argument.value_mode is ConstraintValueMode.FINITE_VALUES
-                and (
-                    argument.admitted_values_json is None
-                    or occurrence.canonical_value_json not in argument.admitted_values_json
-                )
-            ):
-                issues.append(
-                    PlanAdmissionIssue(
-                        "value_not_admitted_by_plan",
-                        f"value for {occurrence.name!r} is outside the compiled finite language",
+            if constrained and argument.value_mode is ConstraintValueMode.FINITE_VALUES:
+                variant = spec.framing_variant(argument.framing_variant_id)
+                payloads = argument.admitted_wire_payloads or ()
+                admitted_values = {
+                    canonical_json_dumps(variant.value_framing.codec.decode_raw_payload(payload))
+                    for payload in payloads
+                }
+                if occurrence.canonical_value_json not in admitted_values:
+                    issues.append(
+                        PlanAdmissionIssue(
+                            "value_not_admitted_by_plan",
+                            f"value for {occurrence.name!r} is outside the compiled finite language",
+                        )
                     )
-                )
             if (
                 constrained
                 and argument.value_mode is ConstraintValueMode.STRUCTURED_SCHEMA
                 and not schema_value_is_valid(
-                    plan.schema_semantic_authority,
+                    SchemaSemanticAuthority.DRAFT_2020_12,
                     argument.schema_json,
                     decoded_value,
                 )
@@ -333,12 +334,16 @@ def _admit_sequence(
                         )
                     )
         occurrence_order = tuple(occurrence_names)
+        presentation_order = tuple(
+            argument.name
+            for argument in sorted(branch.arguments, key=lambda item: item.presentation_index)
+        )
         order_valid = (
-            occurrence_order in branch.order_plan.orders
+            branch.order_plan.accepts(occurrence_order)
             if constrained
             else _validation_only_order_valid(
                 spec,
-                presentation_orders.get(call.name, ()),
+                presentation_order,
                 occurrence_order,
             )
         )

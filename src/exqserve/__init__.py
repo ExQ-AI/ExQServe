@@ -1,1 +1,6 @@
 """ExQServe serving runtime package."""
+
+from exqserve.model.registry import configure_qwen_compatibility_decoder_factory
+from exqserve.tool_wire.controls.qwen import build_qwen_compatibility_tool_region_decoder
+
+configure_qwen_compatibility_decoder_factory(build_qwen_compatibility_tool_region_decoder)

@@ -24,15 +24,13 @@ from exqserve.model.contracts import (
     TemplateTool,
 )
 from exqserve.model.qwen import QwenPromptCompiler
-from exqserve.tool_wire import (
+from tests.tool_wire._legacy_api import (
     DeterministicToolWireEngine,
     admit_tool_sequence,
     certify_prompt_template_parity,
 )
-from exqserve.tool_wire.controls.qwen import (
-    compile_qwen_a2a_shadow,
-    qwen_a2a_prompt_observation,
-)
+from tests.tool_wire._legacy_qwen_a2a import compile_qwen_a2a_shadow
+from tests.tool_wire._qwen_prompt_observation import qwen_a2a_prompt_observation
 
 _MODEL_ENV = "EXQSERVE_QWEN_MODEL_DIR"
 
@@ -352,7 +350,7 @@ def test_qwen38_real_template_roundtrips_a2a_finite_raw_const() -> None:
 
     bundle = compile_qwen_a2a_shadow(policy, {"list_files": ("path",)})
     argument = bundle.plan.tool("list_files").arguments[0]
-    assert argument.admitted_values_json == ('"/tmp"',)
+    assert argument.admitted_wire_payloads == ("/tmp",)
     engine = DeterministicToolWireEngine(bundle.spec, bundle.plan)
     engine.feed(tool_wire)
     result = engine.finish()

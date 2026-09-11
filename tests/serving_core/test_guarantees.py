@@ -11,11 +11,13 @@ from exqserve.model.contracts import (
     ToolConstraintUnsupported,
     ToolGenerationConstraint,
 )
-from exqserve.model.qwen import qwen_tool_constraint
 from exqserve.serving.guarantees import (
     GenerationCapabilitySnapshot,
     RequestGuaranteeResolver,
     guarantee_satisfies,
+)
+from exqserve.tool_wire.controls.qwen import (
+    qwen_production_tool_constraint as qwen_tool_constraint,
 )
 
 
@@ -97,7 +99,7 @@ def test_non_strict_structured_resolver_allows_validation_only_and_opportunistic
     assert constrained.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
 
 
-def test_tool_resolver_preserves_strict_request_and_mixed_runtime_unknown() -> None:
+def test_tool_resolver_preserves_strict_request_and_mixed_runtime_format() -> None:
     strict = _tool("strict", strict=True)
     loose = _tool("loose")
     constraint = _constraint(
@@ -110,7 +112,7 @@ def test_tool_resolver_preserves_strict_request_and_mixed_runtime_unknown() -> N
 
     assert plan.requested_guarantee is GenerationGuarantee.SCHEMA
     assert plan.fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
-    assert plan.runtime_guarantee is GenerationGuarantee.UNKNOWN
+    assert plan.runtime_guarantee is GenerationGuarantee.FORMAT
     assert plan.constraint is constraint
 
 
@@ -159,7 +161,7 @@ def test_tool_resolver_homogeneous_constraint_reports_exact_runtime_guarantee() 
     assert plan.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
 
 
-def test_qwen_unsound_raw_string_schema_reuses_validation_only_fallback() -> None:
+def test_qwen_raw_string_schema_uses_tool_wire_schema_constraint() -> None:
     write = FunctionTool(
         "write",
         None,
@@ -176,9 +178,9 @@ def test_qwen_unsound_raw_string_schema_reuses_validation_only_fallback() -> Non
     plan = resolver.resolve_tool_policy(_policy(write))
 
     assert plan.requested_guarantee is GenerationGuarantee.NONE
-    assert plan.runtime_guarantee is GenerationGuarantee.NONE
+    assert plan.runtime_guarantee is GenerationGuarantee.SCHEMA
     assert plan.fallback_policy is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
-    assert plan.constraint is None
+    assert plan.constraint is not None
 
 
 def test_required_and_named_non_strict_tools_do_not_request_schema_guarantee() -> None:

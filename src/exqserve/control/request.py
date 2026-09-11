@@ -12,6 +12,7 @@ from typing import Protocol, Self
 
 from exqserve.core.errors import CanonicalError, ErrorCategory
 from exqserve.runtime.contracts import (
+    ConstraintInstallation,
     RuntimeCancelled,
     RuntimeEvent,
     RuntimeFailed,
@@ -213,6 +214,15 @@ class ControlledSession:
     @property
     def request_id(self) -> str:
         return self._request_id
+
+    @property
+    def constraint_installation(self) -> ConstraintInstallation | None:
+        installation = getattr(self._runtime_session, "constraint_installation", None)
+        if installation is None:
+            return None
+        if not isinstance(installation, ConstraintInstallation):
+            raise TypeError("runtime constraint_installation must be ConstraintInstallation or None")
+        return installation
 
     def __aiter__(self) -> ControlledSession:
         return self

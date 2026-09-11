@@ -12,6 +12,7 @@ import pytest
 
 import exqserve.server.app as app_module
 from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
+from exqserve.core.generation_guarantees import GenerationGuarantee
 from exqserve.core.sampling import SamplingOverride, SamplingOverridePolicy
 from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
@@ -26,6 +27,7 @@ from exqserve.model.muse_glimmer import (
 from exqserve.model.registry import GenericHFDialect, MuseGlimmerDialect, QwenDialect
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import (
+    ConstraintInstallation,
     ExLlamaV3LoadConfig,
     RuntimeCapabilities,
     RuntimeFinished,
@@ -46,6 +48,17 @@ class _FakeRuntimeSession:
     def __init__(self, request: RuntimeGenerationRequest) -> None:
         self._request = request
         self.cancel_calls = 0
+        constraint = request.generation_constraint
+        self.constraint_installation = (
+            ConstraintInstallation(False, None, (), GenerationGuarantee.NONE)
+            if constraint is None
+            else ConstraintInstallation(
+                True,
+                constraint.constraint_fingerprint or "test-runtime-constraint",
+                (42,),
+                request.generation_guarantee,
+            )
+        )
 
     def __aiter__(self) -> AsyncIterator[object]:
         async def stream() -> AsyncIterator[object]:
@@ -832,7 +845,7 @@ def test_qwen_strict_tool_escalates_constraint_when_global_mode_is_off(tmp_path:
         assert len(runtime.submit_calls) == 1
         constraint = runtime.submit_calls[0].generation_constraint
         assert constraint is not None
-        assert '"<parameter=id>"' in constraint.lark_grammar
+        assert '"<parameter=id>\\n"' in constraint.lark_grammar
 
     asyncio.run(scenario())
 
@@ -1020,7 +1033,10 @@ def test_qwen_constrained_parallel_restores_runtime_constraint(tmp_path: Path) -
         assert len(runtime.submit_calls) == 1
         constraint = runtime.submit_calls[0].generation_constraint
         assert constraint is not None
-        assert "(WS? <tool_call> WS? function WS? </tool_call>)*" in constraint.lark_grammar
+        assert (
+            '(WS? "<tool_call>" WS? function WS? "</tool_call>"){0,7}'
+            in constraint.lark_grammar
+        )
 
     asyncio.run(scenario())
 

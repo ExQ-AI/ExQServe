@@ -20,6 +20,8 @@ from exqserve.control.request import RequestController
 from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
 from exqserve.core.model import ServedModelInfo
 from exqserve.model.contracts import (
+    ContextualParserProvider,
+    ParserCreationContext,
     ReasoningControlProvider,
     ReasoningControlSpec,
     StructuralTokenRequirements,
@@ -68,6 +70,7 @@ from exqserve.server.model_manager import (
     ModelManagerState,
     discover_model_directories,
 )
+from exqserve.server.qwen_parser_binding import resolve_qwen_parser_context
 from exqserve.server.security import BearerAuthMiddleware
 from exqserve.serving.contracts import (
     BestEffortMidSystemLowering,
@@ -78,6 +81,7 @@ from exqserve.serving.engine import RequestControllerLike, RuntimeTemplateAdapte
 from exqserve.serving.preprocessing import RendererLane, RendererLanePool, await_task_termination
 from exqserve.serving.raw import RawRequestController, RawServingEngine
 from exqserve.state.store import InMemoryResponseStore
+from exqserve.tool_wire.controls.qwen import qwen_production_tool_constraint
 
 
 class ServerRuntimeLike(Protocol):
@@ -355,7 +359,18 @@ def _build_model_bundle(
             runtime_object.model_metadata.architecture,
             config.model_dialect,
         )
-        effective = resolve_effective_model_snapshot(config, dialect, runtime_object)
+        builtin_qwen_tool_wire_provider = type(dialect) is QwenDialect
+        effective = resolve_effective_model_snapshot(
+            config,
+            dialect,
+            runtime_object,
+            tool_constraint_provider_available=(
+                True if builtin_qwen_tool_wire_provider else None
+            ),
+            strict_tool_constraint_provider_available=(
+                True if builtin_qwen_tool_wire_provider else None
+            ),
+        )
         validate_heterogeneous_switch_overrides(config, model_directory, dialect, effective)
         served_model = ServedModelInfo(
             public_model_id,
@@ -395,7 +410,19 @@ def _build_model_bundle(
         preprocessing_pool = RendererLanePool(tuple(lanes), metrics)
 
         raw_tool_constraint_factory: Callable[[ToolPolicy], ToolGenerationConstraint | None] | None = None
-        if isinstance(dialect, ToolConstraintProvider):
+        if type(dialect) is QwenDialect:
+
+            def create_qwen_tool_constraint(
+                tool_policy: ToolPolicy,
+            ) -> ToolGenerationConstraint | None:
+                return qwen_production_tool_constraint(
+                    tool_policy,
+                    tool_options.constraint_mode,
+                    max_parallel_calls=tool_options.constrained_parallel_limit,
+                )
+
+            raw_tool_constraint_factory = create_qwen_tool_constraint
+        elif isinstance(dialect, ToolConstraintProvider):
             constraint_provider = dialect
 
             def create_tool_constraint(tool_policy: ToolPolicy) -> ToolGenerationConstraint | None:
@@ -418,7 +445,15 @@ def _build_model_bundle(
             request_id: str,
             reasoning: ReasoningPolicy,
             tool_policy: ToolPolicy,
+            context: ParserCreationContext | None,
         ) -> IncrementalParserLike:
+            if isinstance(dialect, ContextualParserProvider):
+                return dialect.create_parser_with_context(
+                    request_id,
+                    reasoning,
+                    tool_policy,
+                    context,
+                )
             return _dialect_parser(dialect, request_id, reasoning, tool_policy)
 
         reasoning_control_factory: Callable[[ReasoningPolicy, ToolPolicy], ReasoningControlSpec | None] | None = None
@@ -450,6 +485,9 @@ def _build_model_bundle(
             preprocessing_pool=preprocessing_pool,
             mid_system_capability=_builtin_mid_system_capability(dialect),
             best_effort_mid_system_lowering=_builtin_best_effort_mid_system_lowering(dialect),
+            parser_context_factory=(
+                resolve_qwen_parser_context if type(dialect) is QwenDialect else None
+            ),
         )
         raw_engine = RawServingEngine(
             None,

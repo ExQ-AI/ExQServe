@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_left
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from exqserve.agent._json import (
-    InvalidJsonError,
-    JsonValue,
-    canonical_json_dumps,
-    parse_json_strict,
-)
 from exqserve.agent.reasoning import ReasoningEffort, ReasoningMode, ReasoningPolicy
 from exqserve.agent.tools import FunctionTool, ToolChoiceMode, ToolPolicy
-from exqserve.agent.validation import validate_tool_calls_with_canonical_arguments
 from exqserve.core.events import (
     GenerationEvent,
     ReasoningCompleted,
@@ -41,10 +35,13 @@ from exqserve.core.items import (
 from exqserve.core.request import CanonicalRequest
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.model.contracts import (
+    CompatibilityToolRegionDecoderLike,
     ModelCapabilities,
     NativeTokenAwareIncrementalParser,
+    NativeTokenConstraintIntegrityError,
     NativeTokenProvenanceError,
     ParserAmbiguityDetail,
+    ParserCreationContext,
     ParserTerminalIssue,
     ParserTerminalIssueKind,
     TemplateImagePart,
@@ -53,20 +50,11 @@ from exqserve.model.contracts import (
     TemplateTextPart,
     TemplateTool,
     TemplateToolCall,
-    ToolConstraintGuarantee,
-    ToolConstraintMode,
-    ToolConstraintUnsupported,
-    ToolGenerationConstraint,
+    ToolRegionDecodeResult,
+    ToolRegionDecoderLike,
     incomplete_tool_terminal_issue,
 )
 from exqserve.model.hf_template import HFTemplatePromptCompiler
-from exqserve.model.tool_constraints import (
-    exposed_tools,
-    lark_literal,
-    qwen_parameter_schema,
-    qwen_property_schema,
-    schema_lark,
-)
 
 QWEN38_CAPABILITIES = ModelCapabilities(
     reasoning=True,
@@ -79,200 +67,6 @@ QWEN38_CAPABILITIES = ModelCapabilities(
 )
 
 _QWEN_TOOL_TRIGGER = "<tool_call>"
-_QWEN_STRUCTURAL_WS_MAX = 8
-_QWEN_AMBIGUOUS_SUFFIX_MAX_BYTES = 64 * 1024
-_QWEN_AMBIGUOUS_SUFFIX_WORK_FACTOR = 8
-_QWEN_NATIVE_STRING_ALLOWED_KEYS = frozenset(
-    {
-        "$defs",
-        "definitions",
-        "type",
-        "enum",
-        "const",
-        "title",
-        "description",
-        "default",
-        "examples",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-    }
-)
-_QWEN_PARAMETER_CLOSE = "</parameter>"
-
-
-def _qwen_native_string_lark(schema: dict[str, JsonValue]) -> tuple[str | None, bool]:
-    schema_type = schema.get("type")
-    if isinstance(schema_type, list):
-        if "string" in schema_type:
-            raise ToolConstraintUnsupported(
-                "mixed string/non-string unions are not supported in Qwen schema mode"
-            )
-        return None, False
-    if schema_type != "string":
-        return None, False
-
-    unsupported = sorted(set(schema) - _QWEN_NATIVE_STRING_ALLOWED_KEYS)
-    if unsupported:
-        raise ToolConstraintUnsupported(
-            "unsupported Qwen native string schema keyword: " + unsupported[0]
-        )
-
-    allowed_values: set[str] | None = None
-    if "enum" in schema:
-        enum = schema["enum"]
-        if not isinstance(enum, list):
-            raise ToolConstraintUnsupported("Qwen string enum must be an array")
-        allowed_values = {item for item in enum if isinstance(item, str)}
-        if not allowed_values:
-            raise ToolConstraintUnsupported("Qwen string enum has no string values")
-
-    if "const" in schema:
-        const = schema["const"]
-        if not isinstance(const, str):
-            raise ToolConstraintUnsupported("Qwen string const must be a string")
-        allowed_values = {const} if allowed_values is None else allowed_values & {const}
-        if not allowed_values:
-            raise ToolConstraintUnsupported("Qwen string enum and const have no common value")
-
-    if allowed_values is not None:
-        for value in allowed_values:
-            if value != value.strip() or _QWEN_PARAMETER_CLOSE in value:
-                raise ToolConstraintUnsupported(
-                    "Qwen native string enum/const value cannot be represented losslessly"
-                )
-        alternatives = " | ".join(lark_literal(value) for value in sorted(allowed_values))
-        return f"({alternatives})", False
-    return "qwen_raw_string", True
-
-
-def _qwen_schema_requires_unrestricted_raw_string(tool: FunctionTool) -> bool:
-    schema = qwen_parameter_schema(tool.parameters)
-    properties = schema.get("properties", {})
-    assert isinstance(properties, dict)
-    for name in properties:
-        if not _valid_tag_name(name):
-            raise ToolConstraintUnsupported(
-                f"Qwen constrained generation cannot represent parameter name {name!r}"
-            )
-
-    requires_raw_string = False
-    for property_schema in properties.values():
-        assert isinstance(property_schema, dict)
-        resolved_schema = qwen_property_schema(schema, property_schema)
-        _, raw_string = _qwen_native_string_lark(resolved_schema)
-        requires_raw_string = requires_raw_string or raw_string
-    return requires_raw_string
-
-
-def qwen_tool_constraint(
-    tool_policy: ToolPolicy,
-    mode: ToolConstraintMode,
-) -> ToolGenerationConstraint | None:
-    if not isinstance(mode, ToolConstraintMode):
-        raise TypeError("mode must be a ToolConstraintMode")
-
-    tools = tuple(sorted(exposed_tools(tool_policy), key=lambda item: item.name))
-    if not tools:
-        return None
-    if mode is ToolConstraintMode.OFF and not any(tool.strict for tool in tools):
-        return None
-    branch_modes = tuple(
-        ToolConstraintMode.SCHEMA
-        if mode is ToolConstraintMode.SCHEMA or tool.strict
-        else ToolConstraintMode.FORMAT
-        for tool in tools
-    )
-    for tool in tools:
-        if not _valid_tag_name(tool.name):
-            raise ToolConstraintUnsupported(
-                f"Qwen constrained generation cannot represent tool name {tool.name!r}"
-            )
-    raw_string_branches = tuple(
-        branch_mode is ToolConstraintMode.SCHEMA
-        and _qwen_schema_requires_unrestricted_raw_string(tool)
-        for tool, branch_mode in zip(tools, branch_modes, strict=True)
-    )
-    for tool, requires_raw_string in zip(tools, raw_string_branches, strict=True):
-        if requires_raw_string and tool.strict:
-            raise ToolConstraintUnsupported(
-                "Qwen strict Tool schema cannot soundly represent unrestricted raw string parameters"
-            )
-    if any(raw_string_branches):
-        return None
-
-    if tool_policy.allow_parallel:
-        start_rule = (
-            "start: WS? function WS? </tool_call> "
-            "(WS? <tool_call> WS? function WS? </tool_call>)*"
-        )
-    else:
-        start_rule = "start: WS? function WS? </tool_call>"
-    lines = ["%llguidance {}", start_rule]
-    lines.append("function: " + " | ".join(f"function_{index}" for index in range(len(tools))))
-
-    if ToolConstraintMode.FORMAT in branch_modes:
-        lines.extend(
-            [
-                'parameter: "<parameter=" NAME ">" value "</parameter>" WS?',
-                "value: VALUE_CHAR*",
-                "NAME: /[^\\s<>]+/",
-                "VALUE_CHAR: /[^<]/",
-            ]
-        )
-
-    for index, (tool, branch_mode) in enumerate(zip(tools, branch_modes, strict=True)):
-        open_tag = lark_literal(f"<function={tool.name}>")
-        if branch_mode is ToolConstraintMode.FORMAT:
-            lines.append(f'function_{index}: {open_tag} WS? parameter* "</function>"')
-            continue
-
-        schema = qwen_parameter_schema(tool.parameters)
-        properties = schema.get("properties", {})
-        assert isinstance(properties, dict)
-        required = schema.get("required", [])
-        assert isinstance(required, list)
-        required_names = set(required)
-        parameter_rules: list[str] = []
-        for parameter_index, name in enumerate(sorted(properties)):
-            if not _valid_tag_name(name):
-                raise ToolConstraintUnsupported(
-                    f"Qwen constrained generation cannot represent parameter name {name!r}"
-                )
-            property_schema = properties[name]
-            assert isinstance(property_schema, dict)
-            property_schema = qwen_property_schema(schema, property_schema)
-            value_lark, raw_string = _qwen_native_string_lark(property_schema)
-            assert not raw_string
-            if value_lark is None:
-                value_lark = schema_lark(property_schema)
-            rule_name = f"function_{index}_parameter_{parameter_index}"
-            suffix = "" if name in required_names else "?"
-            parameter_rules.append(rule_name + suffix)
-            lines.append(
-                f"{rule_name}: {lark_literal(f'<parameter={name}>')} WS? "
-                f'{value_lark} WS? "</parameter>" WS?'
-            )
-        parameter_body = " ".join(parameter_rules)
-        if parameter_body:
-            parameter_body += " "
-        lines.append(f'function_{index}: {open_tag} WS? {parameter_body}"</function>"')
-
-    lines.append(f"WS: /[ \\t\\r\\n]{{1,{_QWEN_STRUCTURAL_WS_MAX}}}/")
-    return ToolGenerationConstraint(
-        trigger=_QWEN_TOOL_TRIGGER,
-        lark_grammar="\n".join(lines),
-        eos_after_completed=True,
-        branch_guarantees=tuple(
-            (
-                tool.name,
-                ToolConstraintGuarantee.SCHEMA
-                if branch_mode is ToolConstraintMode.SCHEMA
-                else ToolConstraintGuarantee.FORMAT,
-            )
-            for tool, branch_mode in zip(tools, branch_modes, strict=True)
-        ),
-    )
 
 
 def _reasoning_kwargs(
@@ -537,13 +331,6 @@ class _QwenMode(Enum):
     TOOL = auto()
 
 
-class _QwenToolState(Enum):
-    FUNCTION = auto()
-    PARAMETERS = auto()
-    OUTER = auto()
-    MALFORMED = auto()
-
-
 class _QwenMarkerDisposition(Enum):
     LITERAL = auto()
     STRUCTURAL = auto()
@@ -558,7 +345,7 @@ _PARAMETER_OPEN = "<parameter="
 _PARAMETER_CLOSE = "</parameter>"
 _TOOL_OPEN = "<tool_call>"
 _TOOL_CLOSE = "</tool_call>"
-_TOOL_MODE_NATIVE_MARKERS = frozenset({_TOOL_OPEN, _TOOL_CLOSE})
+_TOOL_MODE_NATIVE_MARKERS = frozenset((*_PLAIN_MARKERS, _TOOL_CLOSE))
 _LITERAL_MARKER_QUOTES = frozenset({"'", '"', "`"})
 
 
@@ -761,6 +548,7 @@ class _QwenMarkerBoundaryTracker:
         self._last_content_character: str | None = None
         self._pending_native_marker: tuple[str, str, bool] | None = None
         self._pending_inline_native_marker: tuple[str, bool] | None = None
+        self._pending_reasoning_close_boundary = False
         self._unverified_marker_prefix = ""
         self._held_bytes = 0
         self._peak_held_bytes = 0
@@ -865,6 +653,7 @@ class _QwenMarkerBoundaryTracker:
 
     def _clear_unresolved(self) -> None:
         self._pending_inline_native_marker = None
+        self._pending_reasoning_close_boundary = False
         self._pending_close_width = None
         self._pending_close_is_fence = False
         self._held_bytes = 0
@@ -956,6 +745,39 @@ class _QwenMarkerBoundaryTracker:
             return self._pending_close_tail_candidate or self._pending_run_is_fence_close()
         return self._pending_close_run == width
 
+    def _resolve_pending_reasoning_close(
+        self,
+        following_text: str,
+        *,
+        final: bool,
+    ) -> _QwenMarkerDisposition:
+        if self._scan_pending_close(following_text, final=final):
+            self._clear_unresolved()
+            return _QwenMarkerDisposition.LITERAL
+        if self._terminal_issue is not None:
+            return _QwenMarkerDisposition.PENDING
+        if "\n" in following_text or final:
+            self._literal_context.abandon_provisional_inline()
+            self._last_content_character = None
+            self._clear_unresolved()
+            return _QwenMarkerDisposition.STRUCTURAL
+        return _QwenMarkerDisposition.PENDING
+
+    def resolve_provisional_reasoning_close(
+        self,
+        following_text: str,
+    ) -> _QwenMarkerDisposition | None:
+        context = self._literal_context
+        if (
+            context.delimiter_width is None
+            or context.delimiter_is_fence
+            or not context.inline_crossed_newline
+        ):
+            return None
+        self._start_unresolved("</think>", verified=True)
+        self._pending_reasoning_close_boundary = True
+        return self._resolve_pending_reasoning_close(following_text, final=False)
+
     def classify_native_marker(
         self,
         marker: str,
@@ -999,6 +821,11 @@ class _QwenMarkerBoundaryTracker:
         marker, verified = pending
         if self._terminal_issue is not None:
             return marker, _QwenMarkerDisposition.PENDING
+        if self._pending_reasoning_close_boundary:
+            return marker, self._resolve_pending_reasoning_close(
+                following_text,
+                final=final,
+            )
         if self._scan_pending_close(following_text, final=final):
             self._clear_unresolved()
             return marker, _QwenMarkerDisposition.LITERAL
@@ -1067,1214 +894,12 @@ def _deterministic_call_id(request_id: str, index: int) -> str:
     return f"call_{digest[:24]}"
 
 
-def _parameter_value_json(value_text: str, *, string_parameter: bool = False) -> str:
-    stripped = value_text.strip()
-    try:
-        value = parse_json_strict(stripped)
-    except InvalidJsonError:
-        value = stripped
-    else:
-        if string_parameter and not isinstance(value, str):
-            value = stripped
-    return canonical_json_dumps(value)
-
-
-class _QwenParameterCloseKind(Enum):
-    NONE = auto()
-    STRUCTURAL = auto()
-    TENTATIVE = auto()
-    AMBIGUOUS = auto()
-    MALFORMED = auto()
-
-
-@dataclass(frozen=True, slots=True)
-class _QwenParameterCloseDecision:
-    kind: _QwenParameterCloseKind
-    close_at: int = -1
-
-
-class _QwenParameterCandidateStage(Enum):
-    AFTER_PARAMETER = auto()
-    AFTER_FUNCTION = auto()
-    AFTER_TOOL = auto()
-    AFTER_NEXT_TOOL = auto()
-
-
-@dataclass(slots=True)
-class _QwenParameterScanState:
-    value_start: int
-    cursor: int
-    in_string: bool = False
-    escaped: bool = False
-    first_full_close: int | None = None
-    multiple_full_closes: bool = False
-    pending_close_at: int | None = None
-    pending_probe_cursor: int | None = None
-    pending_stage: _QwenParameterCandidateStage | None = None
-    pending_full_close_end: int | None = None
-
-
-def _record_qwen_full_close(state: _QwenParameterScanState, close_at: int) -> None:
-    if state.first_full_close is None:
-        state.first_full_close = close_at
-    elif state.first_full_close != close_at:
-        state.multiple_full_closes = True
-
-
-def _clear_qwen_parameter_candidate(state: _QwenParameterScanState) -> None:
-    state.pending_close_at = None
-    state.pending_probe_cursor = None
-    state.pending_stage = None
-    state.pending_full_close_end = None
-
-
-def _skip_pending_qwen_whitespace(text: str, state: _QwenParameterScanState) -> int:
-    assert state.pending_probe_cursor is not None
-    position = state.pending_probe_cursor
-    while position < len(text) and text[position].isspace():
-        position += 1
-    state.pending_probe_cursor = position
-    return position
-
-
-def _qwen_candidate_becomes_raw(
-    state: _QwenParameterScanState,
-    *,
-    resume_at: int,
-) -> None:
-    _clear_qwen_parameter_candidate(state)
-    state.cursor = resume_at
-
-
-def _qwen_candidate_becomes_full_close(
-    state: _QwenParameterScanState,
-    *,
-    resume_at: int,
-) -> None:
-    assert state.pending_close_at is not None
-    _record_qwen_full_close(state, state.pending_close_at)
-    _clear_qwen_parameter_candidate(state)
-    state.cursor = resume_at
-
-
-def _qwen_suffix_after_full_close(text: str, close_at: int) -> str | None:
-    position = close_at + len(_PARAMETER_CLOSE)
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if not text.startswith(_FUNCTION_CLOSE, position):
-        return None
-    position += len(_FUNCTION_CLOSE)
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if not text.startswith(_TOOL_CLOSE, position):
-        return None
-    return text[position + len(_TOOL_CLOSE) :]
-
-
-def _qwen_full_close_chain_end(text: str, close_at: int) -> int | None:
-    position = close_at + len(_PARAMETER_CLOSE)
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if not text.startswith(_FUNCTION_CLOSE, position):
-        return None
-    position += len(_FUNCTION_CLOSE)
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if not text.startswith(_TOOL_CLOSE, position):
-        return None
-    return position + len(_TOOL_CLOSE)
-
-
-def _qwen_full_close_start_from_tool_end(text: str, tool_close_end: int) -> int | None:
-    if tool_close_end < len(_TOOL_CLOSE):
-        return None
-    tool_close_at = tool_close_end - len(_TOOL_CLOSE)
-    if text[tool_close_at:tool_close_end] != _TOOL_CLOSE:
-        return None
-
-    position = tool_close_at
-    while position > 0 and text[position - 1].isspace():
-        position -= 1
-    function_close_at = position - len(_FUNCTION_CLOSE)
-    if function_close_at < 0 or text[function_close_at:position] != _FUNCTION_CLOSE:
-        return None
-
-    position = function_close_at
-    while position > 0 and text[position - 1].isspace():
-        position -= 1
-    parameter_close_at = position - len(_PARAMETER_CLOSE)
-    if parameter_close_at < 0 or text[parameter_close_at:position] != _PARAMETER_CLOSE:
-        return None
-    return parameter_close_at
-
-
-def _qwen_parameter_close_is_presentation_vetoed(
-    text: str,
-    value_start: int,
-    close_at: int,
-) -> bool:
-    if close_at < value_start:
-        return True
-    boundary = _QwenMarkerBoundaryTracker()
-    boundary.observe_content(text[value_start:close_at])
-    disposition = boundary.classify_native_marker(
-        _PARAMETER_CLOSE,
-        text[close_at + len(_PARAMETER_CLOSE) :],
-        verified=True,
-    )
-    return disposition is not _QwenMarkerDisposition.STRUCTURAL
-
-
-def _qwen_first_complete_tool_end(
-    text: str,
-    *,
-    work_remaining: int,
-) -> tuple[int | None, int]:
-    search_at = 0
-    while True:
-        close_at = text.find(_TOOL_CLOSE, search_at)
-        if close_at < 0:
-            return None, work_remaining
-        candidate_end = close_at + len(_TOOL_CLOSE)
-        candidate = text[:candidate_end]
-        work_remaining -= len(candidate)
-        if work_remaining < 0:
-            return None, work_remaining
-
-        probe = _QwenToolCallParser(
-            "qwen-suffix-tool-probe",
-            0,
-            {},
-            allow_suffix_adjudication=False,
-        )
-        result = probe.feed(candidate)
-        if not result.closed:
-            result = probe.finish()
-        if (
-            result.closed
-            and result.completed_call
-            and not result.incomplete
-            and not result.remainder
-        ):
-            return candidate_end, work_remaining
-        search_at = candidate_end
-
-
-def _qwen_suffix_is_clean_top_level_continuation(text: str, close_at: int) -> bool:
-    suffix = _qwen_suffix_after_full_close(text, close_at)
-    if suffix is None:
-        return False
-    suffix_bytes = len(suffix.encode("utf-8"))
-    if suffix_bytes > _QWEN_AMBIGUOUS_SUFFIX_MAX_BYTES:
-        return False
-
-    work_remaining = max(1, len(suffix)) * _QWEN_AMBIGUOUS_SUFFIX_WORK_FACTOR
-    boundary = _QwenMarkerBoundaryTracker()
-    cursor = 0
-    while cursor < len(suffix):
-        marker_at = suffix.find("<", cursor)
-        if marker_at < 0:
-            boundary.observe_content(suffix[cursor:])
-            return True
-
-        work_remaining -= marker_at - cursor + 1
-        if work_remaining < 0:
-            return False
-        boundary.observe_content(suffix[cursor:marker_at])
-
-        if suffix.startswith(_PARAMETER_CLOSE, marker_at):
-            disposition = boundary.classify_plain_marker(
-                suffix[marker_at:],
-                _PARAMETER_CLOSE,
-                final=True,
-            )
-            if disposition in {_QwenMarkerDisposition.PENDING, _QwenMarkerDisposition.FAIL_CLOSED}:
-                return False
-            if (
-                disposition is _QwenMarkerDisposition.STRUCTURAL
-                and _qwen_full_close_chain_end(suffix, marker_at) is not None
-            ):
-                return False
-            boundary.observe_content(_PARAMETER_CLOSE)
-            cursor = marker_at + len(_PARAMETER_CLOSE)
-            continue
-
-        if suffix.startswith(_TOOL_OPEN, marker_at):
-            disposition = boundary.classify_plain_marker(
-                suffix[marker_at:],
-                _TOOL_OPEN,
-                final=True,
-            )
-            if disposition in {_QwenMarkerDisposition.PENDING, _QwenMarkerDisposition.FAIL_CLOSED}:
-                return False
-            if disposition is _QwenMarkerDisposition.LITERAL:
-                boundary.observe_content(_TOOL_OPEN)
-                cursor = marker_at + len(_TOOL_OPEN)
-                continue
-
-            after_marker = suffix[marker_at + len(_TOOL_OPEN) :]
-            candidate = after_marker.lstrip()
-            if not candidate or (
-                _FUNCTION_OPEN.startswith(candidate) and not candidate.startswith(_FUNCTION_OPEN)
-            ):
-                return False
-            if not candidate.startswith(_FUNCTION_OPEN):
-                boundary.observe_content(_TOOL_OPEN)
-                cursor = marker_at + len(_TOOL_OPEN)
-                continue
-
-            tool_end, work_remaining = _qwen_first_complete_tool_end(
-                after_marker,
-                work_remaining=work_remaining,
-            )
-            if tool_end is None:
-                return False
-            cursor = marker_at + len(_TOOL_OPEN) + tool_end
-            continue
-
-        boundary.observe_content("<")
-        cursor = marker_at + 1
-
-    return True
-
-
-def _resume_qwen_parameter_candidate(
-    text: str,
-    state: _QwenParameterScanState,
-    *,
-    current_parameter_name: str,
-    seen_parameter_names: frozenset[str],
-    declared_parameter_names: frozenset[str],
-    declared_names_exhaustive: bool,
-    allow_suffix_adjudication: bool,
-    final: bool,
-) -> _QwenParameterCloseDecision | None:
-    """Advance one pending close candidate without rescanning earlier whitespace."""
-
-    assert state.pending_close_at is not None
-    assert state.pending_stage is not None
-    while True:
-        position = _skip_pending_qwen_whitespace(text, state)
-        remainder = text[position:]
-
-        if state.pending_stage is _QwenParameterCandidateStage.AFTER_PARAMETER:
-            if not remainder:
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            if remainder.startswith(_PARAMETER_OPEN):
-                name_start = position + len(_PARAMETER_OPEN)
-                header_end = text.find(">", name_start)
-                if header_end < 0:
-                    return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-                next_name = text[name_start:header_end]
-                if _valid_tag_name(next_name):
-                    if next_name == current_parameter_name or next_name in seen_parameter_names:
-                        return _QwenParameterCloseDecision(_QwenParameterCloseKind.MALFORMED)
-                    if declared_names_exhaustive and next_name not in declared_parameter_names:
-                        resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
-                        _qwen_candidate_becomes_raw(state, resume_at=resume_at)
-                        return None
-                    return _QwenParameterCloseDecision(
-                        _QwenParameterCloseKind.STRUCTURAL,
-                        state.pending_close_at,
-                    )
-                resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
-                _qwen_candidate_becomes_raw(state, resume_at=resume_at)
-                return None
-            if _PARAMETER_OPEN.startswith(remainder):
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            if remainder.startswith(_FUNCTION_CLOSE):
-                state.pending_probe_cursor = position + len(_FUNCTION_CLOSE)
-                state.pending_stage = _QwenParameterCandidateStage.AFTER_FUNCTION
-                continue
-            if _FUNCTION_CLOSE.startswith(remainder):
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
-            _qwen_candidate_becomes_raw(state, resume_at=resume_at)
-            return None
-
-        if state.pending_stage is _QwenParameterCandidateStage.AFTER_FUNCTION:
-            if not remainder:
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            if remainder.startswith(_TOOL_CLOSE):
-                state.pending_full_close_end = position + len(_TOOL_CLOSE)
-                state.pending_probe_cursor = state.pending_full_close_end
-                state.pending_stage = _QwenParameterCandidateStage.AFTER_TOOL
-                continue
-            if _TOOL_CLOSE.startswith(remainder):
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            resume_at = state.pending_close_at + len(_PARAMETER_CLOSE)
-            _qwen_candidate_becomes_raw(state, resume_at=resume_at)
-            return None
-
-        if state.pending_stage is _QwenParameterCandidateStage.AFTER_TOOL:
-            if not remainder:
-                if final:
-                    _qwen_candidate_becomes_full_close(state, resume_at=len(text))
-                    return None
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            if remainder.startswith(_TOOL_OPEN):
-                state.pending_probe_cursor = position + len(_TOOL_OPEN)
-                state.pending_stage = _QwenParameterCandidateStage.AFTER_NEXT_TOOL
-                continue
-            if _TOOL_OPEN.startswith(remainder):
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            _qwen_candidate_becomes_full_close(state, resume_at=position)
-            return None
-
-        if not remainder:
-            if final:
-                assert state.pending_full_close_end is not None
-                _qwen_candidate_becomes_full_close(
-                    state,
-                    resume_at=state.pending_full_close_end,
-                )
-                return None
-            return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-        if remainder.startswith(_FUNCTION_OPEN):
-            name_start = position + len(_FUNCTION_OPEN)
-            header_end = text.find(">", name_start)
-            if header_end < 0:
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-            if _valid_tag_name(text[name_start:header_end]):
-                if not final:
-                    return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-                adjudicate_at = (
-                    state.first_full_close
-                    if state.first_full_close is not None
-                    else state.pending_close_at
-                )
-                if allow_suffix_adjudication and _qwen_suffix_is_clean_top_level_continuation(
-                    text,
-                    adjudicate_at,
-                ):
-                    return _QwenParameterCloseDecision(
-                        _QwenParameterCloseKind.STRUCTURAL,
-                        adjudicate_at,
-                    )
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.AMBIGUOUS)
-        elif _FUNCTION_OPEN.startswith(remainder):
-            return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-        assert state.pending_full_close_end is not None
-        _qwen_candidate_becomes_full_close(
-            state,
-            resume_at=state.pending_full_close_end,
-        )
-        return None
-
-
-def _scan_qwen_parameter_close(
-    text: str,
-    state: _QwenParameterScanState,
-    *,
-    current_parameter_name: str,
-    seen_parameter_names: frozenset[str],
-    declared_parameter_names: frozenset[str],
-    declared_names_exhaustive: bool,
-    allow_suffix_adjudication: bool,
-    verified_tool_close_end: int | None,
-    final: bool,
-) -> _QwenParameterCloseDecision:
-    """Incrementally resolve Qwen raw-parameter close precedence."""
-
-    verified_close_at = None
-    if verified_tool_close_end is not None:
-        verified_close_at = _qwen_full_close_start_from_tool_end(text, verified_tool_close_end)
-        if verified_close_at is not None and verified_close_at < state.value_start:
-            verified_close_at = None
-
-    if state.pending_close_at is not None:
-        if (
-            verified_close_at == state.pending_close_at
-            and not state.in_string
-            and not state.escaped
-            and not _qwen_parameter_close_is_presentation_vetoed(
-                text,
-                state.value_start,
-                state.pending_close_at,
-            )
-        ):
-            return _QwenParameterCloseDecision(
-                _QwenParameterCloseKind.STRUCTURAL,
-                state.pending_close_at,
-            )
-        decision = _resume_qwen_parameter_candidate(
-            text,
-            state,
-            current_parameter_name=current_parameter_name,
-            seen_parameter_names=seen_parameter_names,
-            declared_parameter_names=declared_parameter_names,
-            declared_names_exhaustive=declared_names_exhaustive,
-            allow_suffix_adjudication=allow_suffix_adjudication,
-            final=final,
-        )
-        if decision is not None:
-            return decision
-
-    position = state.cursor
-    while position < len(text):
-        character = text[position]
-        if state.in_string:
-            if state.escaped:
-                state.escaped = False
-            elif character == "\\":
-                state.escaped = True
-            elif character == '"':
-                state.in_string = False
-            position += 1
-            state.cursor = position
-            continue
-        if character == '"':
-            state.in_string = True
-            position += 1
-            state.cursor = position
-            continue
-
-        remainder = text[position:]
-        if _PARAMETER_CLOSE.startswith(remainder) and len(remainder) < len(_PARAMETER_CLOSE):
-            if final:
-                state.cursor = len(text)
-                break
-            state.cursor = position
-            return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-        if not text.startswith(_PARAMETER_CLOSE, position):
-            position += 1
-            state.cursor = position
-            continue
-
-        if (
-            verified_close_at == position
-            and not state.in_string
-            and not state.escaped
-            and not _qwen_parameter_close_is_presentation_vetoed(
-                text,
-                state.value_start,
-                position,
-            )
-        ):
-            return _QwenParameterCloseDecision(
-                _QwenParameterCloseKind.STRUCTURAL,
-                position,
-            )
-
-        state.pending_close_at = position
-        state.pending_probe_cursor = position + len(_PARAMETER_CLOSE)
-        state.pending_stage = _QwenParameterCandidateStage.AFTER_PARAMETER
-        decision = _resume_qwen_parameter_candidate(
-            text,
-            state,
-            current_parameter_name=current_parameter_name,
-            seen_parameter_names=seen_parameter_names,
-            declared_parameter_names=declared_parameter_names,
-            declared_names_exhaustive=declared_names_exhaustive,
-            allow_suffix_adjudication=allow_suffix_adjudication,
-            final=final,
-        )
-        if decision is not None:
-            return decision
-        position = state.cursor
-
-    if state.first_full_close is not None:
-        if final:
-            if state.multiple_full_closes:
-                if allow_suffix_adjudication and _qwen_suffix_is_clean_top_level_continuation(
-                    text,
-                    state.first_full_close,
-                ):
-                    return _QwenParameterCloseDecision(
-                        _QwenParameterCloseKind.STRUCTURAL,
-                        state.first_full_close,
-                    )
-                return _QwenParameterCloseDecision(_QwenParameterCloseKind.AMBIGUOUS)
-            return _QwenParameterCloseDecision(
-                _QwenParameterCloseKind.STRUCTURAL,
-                state.first_full_close,
-            )
-        return _QwenParameterCloseDecision(_QwenParameterCloseKind.TENTATIVE)
-    return _QwenParameterCloseDecision(_QwenParameterCloseKind.NONE)
-
-
-@dataclass(frozen=True, slots=True)
-class _QwenParameterTyping:
-    declared_names: frozenset[str]
-    string_names: frozenset[str]
-    dynamic_string: bool
-    declared_names_exhaustive: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _QwenWholeToolCandidate:
-    first_close_at: int
-    tool_end: int
-    arguments_json: str
-    lexically_contained: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _QwenWholeToolSearchState:
-    position: int
-    seen_names: frozenset[str]
-    argument_parts: tuple[str, ...]
-    first_close_at: int
-    first_close_lexically_contained: bool
-
-
-def _qwen_parameter_is_string(
-    typing: _QwenParameterTyping | None,
-    parameter_name: str,
-) -> bool:
-    if typing is None:
-        return False
-    if parameter_name in typing.declared_names:
-        return parameter_name in typing.string_names
-    return typing.dynamic_string
-
-
-def _qwen_parameter_close_positions(
-    text: str,
-    value_start: int,
-) -> tuple[tuple[int, bool], ...]:
-    positions: list[tuple[int, bool]] = []
-    in_string = False
-    escaped = False
-    position = value_start
-    while position < len(text):
-        if text.startswith(_PARAMETER_CLOSE, position):
-            positions.append((position, in_string))
-            position += len(_PARAMETER_CLOSE)
-            continue
-        character = text[position]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-        elif character == '"':
-            in_string = True
-        position += 1
-    return tuple(positions)
-
-
-def _qwen_has_adjacent_tool_header(text: str, tool_end: int) -> bool:
-    position = tool_end
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if not text.startswith(_TOOL_OPEN, position):
-        return False
-    position += len(_TOOL_OPEN)
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if not text.startswith(_FUNCTION_OPEN, position):
-        return False
-    name_start = position + len(_FUNCTION_OPEN)
-    header_end = text.find(">", name_start)
-    return header_end >= 0 and _valid_tag_name(text[name_start:header_end])
-
-
-def _qwen_candidate_close_action(
-    text: str,
-    close_at: int,
-    *,
-    current_parameter_name: str,
-    seen_parameter_names: frozenset[str],
-    typing: _QwenParameterTyping | None,
-    lexically_contained: bool,
-) -> tuple[bool, bool]:
-    """Return ``(allow_candidate, stop_later_closes)`` for existing next-parameter precedence."""
-
-    position = close_at + len(_PARAMETER_CLOSE)
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if text.startswith(_FUNCTION_CLOSE, position):
-        return True, False
-    if not text.startswith(_PARAMETER_OPEN, position):
-        return False, False
-    name_start = position + len(_PARAMETER_OPEN)
-    header_end = text.find(">", name_start)
-    if header_end < 0:
-        return False, False
-    next_name = text[name_start:header_end]
-    if not _valid_tag_name(next_name):
-        return False, False
-    if lexically_contained:
-        return True, False
-    if next_name == current_parameter_name or next_name in seen_parameter_names:
-        return False, True
-    if typing is not None and typing.declared_names_exhaustive and next_name not in typing.declared_names:
-        return False, False
-    return True, True
-
-
-def _qwen_whole_tool_candidates(
-    text: str,
-    *,
-    value_start: int,
-    current_parameter_name: str,
-    seen_parameter_names: frozenset[str],
-    existing_argument_parts: tuple[str, ...],
-    tool_name: str,
-    call_id: str,
-    index: int,
-    typing: _QwenParameterTyping | None,
-    tool_policy: ToolPolicy,
-) -> tuple[_QwenWholeToolCandidate, ...] | None:
-    """Return bounded canonical-valid decompositions for the active raw Tool parameter.
-
-    ``None`` means the bounded search budget was exhausted; callers must fail closed.
-    The search is iterative and treats parameter-close spellings only as candidates.
-    """
-
-    close_positions = _qwen_parameter_close_positions(text, value_start)
-    if not close_positions:
-        return ()
-    first_close_at = close_positions[0][0]
-    if len(text[first_close_at:].encode("utf-8")) > _QWEN_AMBIGUOUS_SUFFIX_MAX_BYTES:
-        return None
-
-    ambiguity_characters = len(text) - first_close_at
-    max_work = max(1, _QWEN_AMBIGUOUS_SUFFIX_WORK_FACTOR * ambiguity_characters)
-    work = 0
-    stack: list[_QwenWholeToolSearchState] = []
-
-    for close_at, lexically_contained in close_positions:
-        work += 1
-        if work > max_work:
-            return None
-        allow_candidate, stop_later = _qwen_candidate_close_action(
-            text,
-            close_at,
-            current_parameter_name=current_parameter_name,
-            seen_parameter_names=seen_parameter_names,
-            typing=typing,
-            lexically_contained=lexically_contained,
-        )
-        if allow_candidate:
-            value_json = _parameter_value_json(
-                text[value_start:close_at],
-                string_parameter=_qwen_parameter_is_string(typing, current_parameter_name),
-            )
-            prefix = "{" if not existing_argument_parts else ","
-            fragment = f"{prefix}{canonical_json_dumps(current_parameter_name)}:{value_json}"
-            stack.append(
-                _QwenWholeToolSearchState(
-                    close_at + len(_PARAMETER_CLOSE),
-                    seen_parameter_names | {current_parameter_name},
-                    (*existing_argument_parts, fragment),
-                    close_at,
-                    lexically_contained,
-                )
-            )
-        if stop_later:
-            break
-
-    valid: dict[tuple[int, str], _QwenWholeToolCandidate] = {}
-    while stack:
-        work += 1
-        if work > max_work:
-            return None
-        state = stack.pop()
-        position = state.position
-        while position < len(text) and text[position].isspace():
-            position += 1
-
-        if text.startswith(_FUNCTION_CLOSE, position):
-            position += len(_FUNCTION_CLOSE)
-            while position < len(text) and text[position].isspace():
-                position += 1
-            if not text.startswith(_TOOL_CLOSE, position):
-                continue
-            tool_end = position + len(_TOOL_CLOSE)
-            arguments_json = (
-                "{}" if not state.argument_parts else "".join(state.argument_parts) + "}"
-            )
-            call = ToolCallItem(
-                call_id=call_id,
-                name=tool_name,
-                arguments_json=arguments_json,
-                index=index,
-            )
-            validation = validate_tool_calls_with_canonical_arguments((call,), tool_policy)
-            if validation.result.is_valid:
-                candidate = _QwenWholeToolCandidate(
-                    state.first_close_at,
-                    tool_end,
-                    arguments_json,
-                    state.first_close_lexically_contained,
-                )
-                valid[(tool_end, arguments_json)] = candidate
-            continue
-
-        if not text.startswith(_PARAMETER_OPEN, position):
-            continue
-        header_end = text.find(">", position + len(_PARAMETER_OPEN))
-        if header_end < 0:
-            continue
-        parameter_name = text[position + len(_PARAMETER_OPEN) : header_end]
-        if not _valid_tag_name(parameter_name) or parameter_name in state.seen_names:
-            continue
-        parameter_value_start = header_end + 1
-        parameter_close_positions = _qwen_parameter_close_positions(text, parameter_value_start)
-        for parameter_close, lexically_contained in parameter_close_positions:
-            work += 1
-            if work > max_work:
-                return None
-            allow_candidate, stop_later = _qwen_candidate_close_action(
-                text,
-                parameter_close,
-                current_parameter_name=parameter_name,
-                seen_parameter_names=state.seen_names,
-                typing=typing,
-                lexically_contained=lexically_contained,
-            )
-            if allow_candidate:
-                value_json = _parameter_value_json(
-                    text[parameter_value_start:parameter_close],
-                    string_parameter=_qwen_parameter_is_string(typing, parameter_name),
-                )
-                prefix = "{" if not state.argument_parts else ","
-                fragment = f"{prefix}{canonical_json_dumps(parameter_name)}:{value_json}"
-                stack.append(
-                    _QwenWholeToolSearchState(
-                        parameter_close + len(_PARAMETER_CLOSE),
-                        state.seen_names | {parameter_name},
-                        (*state.argument_parts, fragment),
-                        state.first_close_at,
-                        state.first_close_lexically_contained,
-                    )
-                )
-            if stop_later:
-                break
-
-    candidates = tuple(valid.values())
-    adjacent_ends = tuple(
-        candidate.tool_end
-        for candidate in candidates
-        if _qwen_has_adjacent_tool_header(text, candidate.tool_end)
-    )
-    if adjacent_ends:
-        cutoff = min(adjacent_ends)
-        candidates = tuple(candidate for candidate in candidates if candidate.tool_end <= cutoff)
-
-    return candidates
-
-
-def _qwen_parameter_typing(tool_policy: ToolPolicy | None) -> dict[str, _QwenParameterTyping]:
-    if tool_policy is None:
-        return {}
-
-    result: dict[str, _QwenParameterTyping] = {}
-    for tool in tool_policy.tools:
-        schema = parse_json_strict(tool.parameters.canonical_json)
-        if not isinstance(schema, dict):
-            continue
-        properties = schema.get("properties")
-        declared_names = frozenset(
-            name for name in properties if isinstance(name, str)
-        ) if isinstance(properties, dict) else frozenset()
-        string_names = frozenset(
-            name
-            for name, property_schema in properties.items()
-            if isinstance(properties, dict)
-            and isinstance(name, str)
-            and isinstance(property_schema, dict)
-            and property_schema.get("type") == "string"
-        ) if isinstance(properties, dict) else frozenset()
-        additional = schema.get("additionalProperties")
-        dynamic_string = isinstance(additional, dict) and additional.get("type") == "string"
-        pattern_properties = schema.get("patternProperties")
-        declared_names_exhaustive = additional is False and (
-            pattern_properties is None
-            or (isinstance(pattern_properties, dict) and not pattern_properties)
-        )
-        if declared_names or dynamic_string or declared_names_exhaustive:
-            result[tool.name] = _QwenParameterTyping(
-                declared_names=declared_names,
-                string_names=string_names,
-                dynamic_string=dynamic_string,
-                declared_names_exhaustive=declared_names_exhaustive,
-            )
-    return result
-
-
-@dataclass(frozen=True, slots=True)
-class _QwenToolFeedResult:
-    events: tuple[GenerationEvent, ...]
-    remainder: str
-    closed: bool
-    completed_call: bool
-    incomplete: bool
-    protocol_terminal_issue: ParserTerminalIssue | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class _QwenNativeReplaySegment:
     text: str
     verified_marker: str | None = None
     native_id: int | None = None
-
-
-class _QwenToolCallParser:
-    """Parse exactly one Qwen native Tool Call envelope."""
-
-    def __init__(
-        self,
-        request_id: str,
-        index: int,
-        parameter_typing: dict[str, _QwenParameterTyping],
-        *,
-        tool_policy: ToolPolicy | None = None,
-        allow_suffix_adjudication: bool = True,
-    ) -> None:
-        self._request_id = request_id
-        self._index = index
-        self._parameter_typing = dict(parameter_typing)
-        self._tool_policy = tool_policy
-        self._allow_suffix_adjudication = allow_suffix_adjudication
-        self._buffer = ""
-        self._state = _QwenToolState.FUNCTION
-        self._name: str | None = None
-        self._call_id: str | None = None
-        self._started = False
-        self._seen_parameter_names: set[str] = set()
-        self._parameter_scan: _QwenParameterScanState | None = None
-        self._argument_parts: list[str] = []
-        self._arguments_json: str | None = None
-        self._closed = False
-        self._completed_call = False
-        self._incomplete = False
-        self._protocol_terminal_issue: ParserTerminalIssue | None = None
-        self._pending_events: list[GenerationEvent] = []
-        self._verified_tool_close_tail_chars: int | None = None
-
-    def _consume_whitespace(self) -> bool:
-        stripped = self._buffer.lstrip()
-        if len(stripped) == len(self._buffer):
-            return False
-        self._buffer = stripped
-        return True
-
-    def _mark_malformed(self) -> None:
-        self._incomplete = True
-        self._state = _QwenToolState.MALFORMED
-
-    def _ensure_started(self, events: list[GenerationEvent]) -> None:
-        if self._started:
-            return
-        assert self._name is not None
-        assert self._call_id is not None
-        events.append(
-            ToolCallStarted(
-                request_id=self._request_id,
-                call_id=self._call_id,
-                name=self._name,
-                index=self._index,
-            )
-        )
-        self._started = True
-
-    def _emit_delta(self, delta: str, events: list[GenerationEvent]) -> None:
-        assert self._call_id is not None
-        events.append(
-            ToolCallArgumentsDelta(
-                request_id=self._request_id,
-                call_id=self._call_id,
-                delta=delta,
-                index=self._index,
-            )
-        )
-
-    def _complete_arguments(self, events: list[GenerationEvent]) -> None:
-        self._ensure_started(events)
-        if not self._argument_parts:
-            self._arguments_json = "{}"
-            self._emit_delta("{}", events)
-        else:
-            self._arguments_json = "".join(self._argument_parts) + "}"
-            self._emit_delta("}", events)
-        self._state = _QwenToolState.OUTER
-
-    def _process_function(self) -> bool:
-        if self._consume_whitespace():
-            return True
-        if not self._buffer:
-            return False
-        if _FUNCTION_OPEN.startswith(self._buffer):
-            return False
-        if not self._buffer.startswith(_FUNCTION_OPEN):
-            self._mark_malformed()
-            return True
-
-        header_end = self._buffer.find(">", len(_FUNCTION_OPEN))
-        if header_end < 0:
-            return False
-        name = self._buffer[len(_FUNCTION_OPEN) : header_end]
-        if not _valid_tag_name(name):
-            self._mark_malformed()
-            return True
-
-        self._name = name
-        self._call_id = _deterministic_call_id(self._request_id, self._index)
-        self._buffer = self._buffer[header_end + 1 :]
-        self._state = _QwenToolState.PARAMETERS
-        return True
-
-    def _process_parameters(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
-        if self._consume_whitespace():
-            return True
-        if not self._buffer:
-            return False
-
-        if self._buffer.startswith(_FUNCTION_CLOSE):
-            self._buffer = self._buffer[len(_FUNCTION_CLOSE) :]
-            self._complete_arguments(events)
-            return True
-        if _FUNCTION_CLOSE.startswith(self._buffer):
-            return False
-
-        if self._buffer.startswith(_PARAMETER_OPEN):
-            header_end = self._buffer.find(">", len(_PARAMETER_OPEN))
-            if header_end < 0:
-                return False
-            parameter_name = self._buffer[len(_PARAMETER_OPEN) : header_end]
-            if not _valid_tag_name(parameter_name) or parameter_name in self._seen_parameter_names:
-                self._mark_malformed()
-                return True
-
-            value_start = header_end + 1
-            assert self._name is not None
-            if self._parameter_scan is None:
-                self._parameter_scan = _QwenParameterScanState(value_start, value_start)
-            elif self._parameter_scan.value_start != value_start:
-                raise RuntimeError("Qwen parameter scan state does not match the active parameter")
-            typing = self._parameter_typing.get(self._name)
-            string_parameter = _qwen_parameter_is_string(typing, parameter_name)
-            decision: _QwenParameterCloseDecision
-            if string_parameter and self._tool_policy is not None:
-                assert self._call_id is not None
-                candidates = _qwen_whole_tool_candidates(
-                    self._buffer,
-                    value_start=value_start,
-                    current_parameter_name=parameter_name,
-                    seen_parameter_names=frozenset(self._seen_parameter_names),
-                    existing_argument_parts=tuple(self._argument_parts),
-                    tool_name=self._name,
-                    call_id=self._call_id,
-                    index=self._index,
-                    typing=typing,
-                    tool_policy=self._tool_policy,
-                )
-                if candidates is None:
-                    self.finish_ambiguous(ParserAmbiguityDetail.HOLD_LIMIT)
-                    return True
-                if len(candidates) > 1:
-                    self.finish_ambiguous(ParserAmbiguityDetail.UNRESOLVED_BOUNDARY)
-                    return True
-                if len(candidates) == 1:
-                    candidate = candidates[0]
-                    if not final and not _qwen_has_adjacent_tool_header(
-                        self._buffer,
-                        candidate.tool_end,
-                    ):
-                        return False
-                    if final and candidate.lexically_contained:
-                        remainder = self._buffer[candidate.tool_end :].lstrip()
-                        if remainder and _is_pending_tool_candidate(remainder):
-                            self.finish_ambiguous(ParserAmbiguityDetail.UNRESOLVED_BOUNDARY)
-                            return True
-                    decision = _QwenParameterCloseDecision(
-                        _QwenParameterCloseKind.STRUCTURAL,
-                        candidate.first_close_at,
-                    )
-                elif not final:
-                    return False
-                else:
-                    verified_tool_close_end = None
-                    if self._verified_tool_close_tail_chars is not None:
-                        candidate_end = len(self._buffer) - self._verified_tool_close_tail_chars
-                        if candidate_end >= 0:
-                            verified_tool_close_end = candidate_end
-                    decision = _scan_qwen_parameter_close(
-                        self._buffer,
-                        self._parameter_scan,
-                        current_parameter_name=parameter_name,
-                        seen_parameter_names=frozenset(self._seen_parameter_names),
-                        declared_parameter_names=(
-                            frozenset() if typing is None else typing.declared_names
-                        ),
-                        declared_names_exhaustive=(
-                            False if typing is None else typing.declared_names_exhaustive
-                        ),
-                        allow_suffix_adjudication=self._allow_suffix_adjudication,
-                        verified_tool_close_end=verified_tool_close_end,
-                        final=final,
-                    )
-            else:
-                verified_tool_close_end = None
-                if self._verified_tool_close_tail_chars is not None:
-                    candidate_end = len(self._buffer) - self._verified_tool_close_tail_chars
-                    if candidate_end >= 0:
-                        verified_tool_close_end = candidate_end
-                decision = _scan_qwen_parameter_close(
-                    self._buffer,
-                    self._parameter_scan,
-                    current_parameter_name=parameter_name,
-                    seen_parameter_names=frozenset(self._seen_parameter_names),
-                    declared_parameter_names=(
-                        frozenset() if typing is None else typing.declared_names
-                    ),
-                    declared_names_exhaustive=(
-                        False if typing is None else typing.declared_names_exhaustive
-                    ),
-                    allow_suffix_adjudication=self._allow_suffix_adjudication,
-                    verified_tool_close_end=verified_tool_close_end,
-                    final=final,
-                )
-            if decision.kind in {_QwenParameterCloseKind.NONE, _QwenParameterCloseKind.TENTATIVE}:
-                return False
-            if decision.kind is _QwenParameterCloseKind.AMBIGUOUS:
-                self.finish_incomplete()
-                return True
-            if decision.kind is _QwenParameterCloseKind.MALFORMED:
-                self._mark_malformed()
-                return True
-
-            close_at = decision.close_at
-            value_json = _parameter_value_json(
-                self._buffer[value_start:close_at],
-                string_parameter=string_parameter,
-            )
-            prefix = "{" if not self._argument_parts else ","
-            fragment = f"{prefix}{canonical_json_dumps(parameter_name)}:{value_json}"
-            self._ensure_started(events)
-            self._seen_parameter_names.add(parameter_name)
-            self._argument_parts.append(fragment)
-            self._emit_delta(fragment, events)
-            self._buffer = self._buffer[close_at + len(_PARAMETER_CLOSE) :]
-            self._parameter_scan = None
-            return True
-        if _PARAMETER_OPEN.startswith(self._buffer):
-            return False
-
-        self._mark_malformed()
-        return True
-
-    def _process_outer(self, events: list[GenerationEvent]) -> bool:
-        if self._consume_whitespace():
-            return True
-        if not self._buffer:
-            return False
-        if self._buffer.startswith(_TOOL_CLOSE):
-            assert self._name is not None
-            assert self._call_id is not None
-            assert self._arguments_json is not None
-            self._buffer = self._buffer[len(_TOOL_CLOSE) :]
-            events.append(
-                ToolCallCompleted(
-                    self._request_id,
-                    ToolCallItem(
-                        call_id=self._call_id,
-                        name=self._name,
-                        arguments_json=self._arguments_json,
-                        index=self._index,
-                    ),
-                )
-            )
-            self._closed = True
-            self._completed_call = True
-            return True
-        if _TOOL_CLOSE.startswith(self._buffer):
-            return False
-        self._mark_malformed()
-        return True
-
-    def _process_malformed(self) -> bool:
-        close_at = self._buffer.find(_TOOL_CLOSE)
-        if close_at < 0:
-            return False
-        self._buffer = self._buffer[close_at + len(_TOOL_CLOSE) :]
-        self._closed = True
-        return True
-
-    def _process(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
-        if self._state is _QwenToolState.FUNCTION:
-            return self._process_function()
-        if self._state is _QwenToolState.PARAMETERS:
-            return self._process_parameters(events, final=final)
-        if self._state is _QwenToolState.OUTER:
-            return self._process_outer(events)
-        return self._process_malformed()
-
-    @property
-    def buffered_text_length(self) -> int:
-        return len(self._buffer)
-
-    def _result(self, events: list[GenerationEvent]) -> _QwenToolFeedResult:
-        self._pending_events.extend(events)
-        remainder = ""
-        published: tuple[GenerationEvent, ...] = ()
-        if self._closed:
-            remainder = self._buffer
-            self._buffer = ""
-            if self._completed_call and not self._incomplete:
-                published = tuple(self._pending_events)
-            self._pending_events = []
-            self._verified_tool_close_tail_chars = None
-        return _QwenToolFeedResult(
-            published,
-            remainder,
-            self._closed,
-            self._completed_call,
-            self._incomplete,
-            self._protocol_terminal_issue,
-        )
-
-    def feed(
-        self,
-        text: str,
-        *,
-        verified_tool_close_end: int | None = None,
-    ) -> _QwenToolFeedResult:
-        if self._closed:
-            raise RuntimeError("cannot feed a closed Qwen Tool Call parser")
-        if self._verified_tool_close_tail_chars is not None:
-            self._verified_tool_close_tail_chars += len(text)
-        self._buffer += text
-        if verified_tool_close_end is not None:
-            if verified_tool_close_end < 0 or verified_tool_close_end > len(self._buffer):
-                raise ValueError("verified Qwen Tool close boundary is outside the buffered Tool text")
-            self._verified_tool_close_tail_chars = len(self._buffer) - verified_tool_close_end
-        events: list[GenerationEvent] = []
-        while not self._closed and self._process(events):
-            pass
-        return self._result(events)
-
-    def finish(self) -> _QwenToolFeedResult:
-        if self._closed:
-            return self._result([])
-        events: list[GenerationEvent] = []
-        while not self._closed and self._process(events, final=True):
-            pass
-        if not self._closed:
-            self.finish_incomplete()
-        return self._result(events)
-
-    def finish_ambiguous(self, detail: ParserAmbiguityDetail) -> None:
-        if self._closed:
-            return
-        self._buffer = ""
-        self._protocol_terminal_issue = ParserTerminalIssue(
-            ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
-            detail,
-        )
-        self._closed = True
-
-    def finish_incomplete(self) -> None:
-        if self._closed:
-            return
-        self._buffer = ""
-        self._incomplete = True
-        self._closed = True
+    literal_tool_opener: bool = False
 
 
 class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
@@ -2286,6 +911,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         *,
         start_in_reasoning: bool = False,
         tool_policy: ToolPolicy | None = None,
+        parser_context: ParserCreationContext | None = None,
     ) -> None:
         if not isinstance(request_id, str):
             raise TypeError("request_id must be a string")
@@ -2295,10 +921,28 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             raise TypeError("start_in_reasoning must be a bool")
         if tool_policy is not None and not isinstance(tool_policy, ToolPolicy):
             raise TypeError("tool_policy must be a ToolPolicy or None")
-        self._parameter_typing = _qwen_parameter_typing(tool_policy)
-        self._tool_policy = tool_policy
+        if parser_context is not None and not isinstance(parser_context, ParserCreationContext):
+            raise TypeError("parser_context must be a ParserCreationContext or None")
+        self._parser_context = parser_context
+        decoder = None if parser_context is None else parser_context.tool_region_decoder
+        factory = None if parser_context is None else parser_context.tool_region_decoder_factory
+        if decoder is None and factory is not None:
+            decoder = factory(tool_policy)
+        self._shared_tool_decoder_template: ToolRegionDecoderLike | None = decoder
+        self._shared_tool_decoder: ToolRegionDecoderLike | None = (
+            None if decoder is None else decoder.fresh(0)
+        )
+        self._active_tool_decoder: ToolRegionDecoderLike | None = None
+        self._constraint_trigger_token_ids = frozenset(
+            () if parser_context is None else parser_context.trigger_token_ids
+        )
+        self._pending_native_tool_trigger_id: int | None = None
+        self._shared_tool_stream_chars = 0
+        self._shared_tool_native_markers: list[tuple[int, int, str, int]] = []
         self._request_id = request_id
         self._buffer = ""
+        self._literal_tool_open_offsets: tuple[int, ...] = ()
+        self._literal_tool_buffer_origin = 0
         self._mode = _QwenMode.REASONING if start_in_reasoning else _QwenMode.TEXT
         self._text_open = False
         self._text_value = ""
@@ -2306,8 +950,6 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         self._reasoning_value = ""
         self._call_index = 0
         self._tool_return_mode = _QwenMode.TEXT
-        self._tool_parser: _QwenToolCallParser | None = None
-        self._tool_native_segments: list[_QwenNativeReplaySegment] = []
         self._pending_native_replay: tuple[_QwenNativeReplaySegment, ...] = ()
         self._pending_inline_native_chunks: list[
             tuple[str, tuple[NativeTokenSpan, ...] | None]
@@ -2322,8 +964,35 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         return self._protocol_terminal_issue or self._marker_boundaries.terminal_issue
 
     @property
+    def requires_native_token_provenance(self) -> bool:
+        return bool(
+            self._shared_tool_decoder_template is not None
+            and self._parser_context is not None
+            and self._parser_context.hard_constraint_installed is True
+        )
+
+    @property
     def peak_semantic_hold_bytes(self) -> int:
         return self._marker_boundaries.peak_held_bytes
+
+    def _set_literal_tool_open_offsets(self, offsets: tuple[int, ...]) -> None:
+        self._literal_tool_open_offsets = offsets
+        self._literal_tool_buffer_origin = 0
+
+    def _literal_tool_veto_at_buffer_start(self) -> bool:
+        index = bisect_left(self._literal_tool_open_offsets, self._literal_tool_buffer_origin)
+        return bool(
+            index < len(self._literal_tool_open_offsets)
+            and self._literal_tool_open_offsets[index] == self._literal_tool_buffer_origin
+        )
+
+    def _consume_buffer_prefix(self, count: int) -> None:
+        if count < 0 or count > len(self._buffer):
+            raise RuntimeError("Qwen plain buffer consumption exceeded available text")
+        if count == 0:
+            return
+        self._buffer = self._buffer[count:]
+        self._literal_tool_buffer_origin += count
 
     def _emit_content(self, text: str, events: list[GenerationEvent]) -> None:
         if not text:
@@ -2355,108 +1024,129 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             self._text_open = False
             self._text_value = ""
 
-    def _enter_tool(self, events: list[GenerationEvent]) -> None:
+    def _enter_tool(
+        self,
+        events: list[GenerationEvent],
+        *,
+        verified_native_opener: bool = False,
+    ) -> None:
         self._close_current_channel(events)
         self._tool_return_mode = self._mode
         self._mode = _QwenMode.TOOL
-        self._tool_parser = _QwenToolCallParser(
-            self._request_id,
-            self._call_index,
-            self._parameter_typing,
-            tool_policy=self._tool_policy,
-        )
-        self._tool_native_segments = []
+        self._literal_tool_open_offsets = ()
+        self._literal_tool_buffer_origin = 0
+        decoder_template = self._shared_tool_decoder_template
+        if decoder_template is None:
+            raise RuntimeError("Qwen Tool mode requires a shared Tool-region decoder")
+        if self.requires_native_token_provenance and not verified_native_opener:
+            raise NativeTokenProvenanceError(
+                "Qwen constrained Tool opener requires verified native provenance"
+            )
+        if self._shared_tool_decoder is not None:
+            decoder = self._shared_tool_decoder
+            self._shared_tool_decoder = None
+        else:
+            decoder = decoder_template.fresh(self._call_index)
+        self._active_tool_decoder = decoder
+        self._shared_tool_stream_chars = len(_TOOL_OPEN)
+        self._shared_tool_native_markers = []
+        self._active_tool_decoder.feed(_TOOL_OPEN)
 
     def _restore_after_tool(self) -> None:
         self._mode = self._tool_return_mode
-        self._tool_parser = None
+        self._active_tool_decoder = None
+        self._shared_tool_stream_chars = 0
+        self._shared_tool_native_markers = []
 
-    def _discard_incomplete_tool(self) -> None:
-        parser = self._tool_parser
-        if parser is not None:
-            parser.finish_incomplete()
-        self._had_incomplete_tool = True
-        self._buffer = ""
-        self._tool_native_segments = []
-        self._pending_native_replay = ()
-        self._restore_after_tool()
-
-    def _record_tool_native_segment(
+    def _record_shared_tool_native_marker(
         self,
         text: str,
         verified_marker: str | None,
         native_id: int | None,
     ) -> None:
-        if not text:
+        if self._active_tool_decoder is None or verified_marker is None:
             return
-        segment = _QwenNativeReplaySegment(text, verified_marker, native_id)
-        if (
-            verified_marker is None
-            and self._tool_native_segments
-            and self._tool_native_segments[-1].verified_marker is None
-        ):
-            previous = self._tool_native_segments[-1]
-            self._tool_native_segments[-1] = _QwenNativeReplaySegment(previous.text + text)
-            return
-        self._tool_native_segments.append(segment)
+        if native_id is None:
+            raise NativeTokenProvenanceError("shared Tool marker lost native token identity")
+        start = self._shared_tool_stream_chars + len(self._buffer)
+        self._shared_tool_native_markers.append(
+            (start, start + len(text), verified_marker, native_id)
+        )
 
-    def _trim_tool_native_segments(self, keep_suffix: int) -> None:
-        if keep_suffix <= 0:
-            self._tool_native_segments = []
-            return
-        total = sum(len(segment.text) for segment in self._tool_native_segments)
-        if keep_suffix >= total:
-            return
-        remove = total - keep_suffix
-        trimmed: list[_QwenNativeReplaySegment] = []
-        for segment in self._tool_native_segments:
-            if remove >= len(segment.text):
-                remove -= len(segment.text)
+    def _shared_remainder_replay_segments(
+        self,
+        remainder: str,
+        literal_tool_open_offsets: tuple[int, ...],
+    ) -> tuple[_QwenNativeReplaySegment, ...]:
+        if not remainder or not self._shared_tool_native_markers:
+            return ()
+        remainder_start = self._shared_tool_stream_chars - len(remainder)
+        retained = [
+            marker
+            for marker in self._shared_tool_native_markers
+            if marker[1] > remainder_start
+        ]
+        if not retained:
+            return ()
+
+        annotations: list[tuple[int, int, str | None, int | None, bool]] = []
+        verified_ranges: list[tuple[int, int]] = []
+        for start, end, marker, native_id in retained:
+            if start < remainder_start:
+                raise RuntimeError("shared Tool marker crosses the decoder remainder boundary")
+            relative_start = start - remainder_start
+            relative_end = end - remainder_start
+            if relative_end > len(remainder) or remainder[relative_start:relative_end] != marker:
+                raise RuntimeError("shared Tool remainder lost native marker alignment")
+            annotations.append((relative_start, relative_end, marker, native_id, False))
+            verified_ranges.append((relative_start, relative_end))
+
+        for offset in literal_tool_open_offsets:
+            end = offset + len(_TOOL_OPEN)
+            if any(start <= offset < verified_end for start, verified_end in verified_ranges):
                 continue
-            if remove:
-                trimmed.append(_QwenNativeReplaySegment(segment.text[remove:]))
-                remove = 0
-            else:
-                trimmed.append(segment)
-        self._tool_native_segments = trimmed
+            annotations.append((offset, end, None, None, True))
 
-    def _verified_adjacent_tool_close_end(self) -> int | None:
-        segments = self._tool_native_segments
-        if not segments or segments[-1].verified_marker != _TOOL_OPEN:
-            return None
-
-        positions: list[tuple[int, int, _QwenNativeReplaySegment]] = []
+        annotations.sort(key=lambda annotation: annotation[0])
+        segments: list[_QwenNativeReplaySegment] = []
         cursor = 0
-        for segment in segments:
-            end = cursor + len(segment.text)
-            positions.append((cursor, end, segment))
-            cursor = end
-        opener_start = positions[-1][0]
-        full_text = "".join(segment.text for segment in segments)
+        for ann_start, ann_end, ann_marker, ann_native_id, literal_tool_opener in annotations:
+            if ann_start < cursor:
+                raise RuntimeError("shared Tool replay annotations overlap")
+            if ann_start > cursor:
+                segments.append(_QwenNativeReplaySegment(remainder[cursor:ann_start]))
+            if literal_tool_opener:
+                segments.append(
+                    _QwenNativeReplaySegment(
+                        remainder[ann_start:ann_end],
+                        literal_tool_opener=True,
+                    )
+                )
+            else:
+                assert ann_marker is not None
+                segments.append(_QwenNativeReplaySegment(ann_marker, ann_marker, ann_native_id))
+            cursor = ann_end
+        if cursor < len(remainder):
+            segments.append(_QwenNativeReplaySegment(remainder[cursor:]))
+        return tuple(segments)
 
-        for _, end, segment in reversed(positions[:-1]):
-            if full_text[end:opener_start].strip():
-                return None
-            if segment.verified_marker == _TOOL_CLOSE and segment.text == _TOOL_CLOSE:
-                return end
-            if segment.text.strip():
-                return None
-        return None
-
-    def _capture_native_remainder(self, remainder: str) -> bool:
-        self._trim_tool_native_segments(len(remainder))
-        if not remainder or not self._tool_native_segments:
-            self._tool_native_segments = []
-            return False
-        if "".join(segment.text for segment in self._tool_native_segments) != remainder:
-            self._tool_native_segments = []
-            return False
-        if not any(segment.verified_marker is not None for segment in self._tool_native_segments):
-            self._tool_native_segments = []
-            return False
-        self._pending_native_replay = tuple(self._tool_native_segments)
-        self._tool_native_segments = []
-        return True
+    def _validate_constraint_tool_trigger(
+        self,
+        marker: str,
+        native_id: int | None,
+    ) -> None:
+        if self._shared_tool_decoder_template is None or marker != _TOOL_OPEN:
+            return
+        if not self._constraint_trigger_token_ids:
+            return
+        if native_id is None:
+            raise NativeTokenProvenanceError(
+                "Qwen constrained Tool opener lost native token identity"
+            )
+        if native_id not in self._constraint_trigger_token_ids:
+            raise NativeTokenConstraintIntegrityError(
+                "Qwen native Tool opener token does not match the installed constraint trigger"
+            )
 
     def _process_plain(self, events: list[GenerationEvent], *, final: bool = False) -> bool:
         match: tuple[int, str] | None = None
@@ -2469,7 +1159,12 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             position, marker = match
             if position > 0:
                 self._emit_content(self._buffer[:position], events)
-                self._buffer = self._buffer[position:]
+                self._consume_buffer_prefix(position)
+                return True
+
+            if marker == _TOOL_OPEN and self._literal_tool_veto_at_buffer_start():
+                self._emit_content(marker, events)
+                self._consume_buffer_prefix(len(marker))
                 return True
 
             disposition = self._marker_boundaries.classify_plain_marker(
@@ -2481,23 +1176,23 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 return False
             if disposition is _QwenMarkerDisposition.LITERAL:
                 self._emit_content(marker, events)
-                self._buffer = self._buffer[len(marker) :]
+                self._consume_buffer_prefix(len(marker))
                 return True
 
-            if marker == "<tool_call>":
+            if marker == _TOOL_OPEN:
                 after_marker = self._buffer[len(marker) :]
                 candidate = after_marker.lstrip()
                 if candidate.startswith(_FUNCTION_OPEN):
-                    self._buffer = after_marker
+                    self._consume_buffer_prefix(len(marker))
                     self._enter_tool(events)
                     return True
                 if not candidate or _FUNCTION_OPEN.startswith(candidate):
                     return False
                 self._emit_content(marker, events)
-                self._buffer = after_marker
+                self._consume_buffer_prefix(len(marker))
                 return True
 
-            self._buffer = self._buffer[len(marker) :]
+            self._consume_buffer_prefix(len(marker))
             if marker == "<think>":
                 if self._mode is not _QwenMode.REASONING:
                     self._close_current_channel(events)
@@ -2512,60 +1207,111 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         safe_length = len(self._buffer) - held
         if safe_length > 0:
             self._emit_content(self._buffer[:safe_length], events)
-            self._buffer = self._buffer[safe_length:]
+            self._consume_buffer_prefix(safe_length)
         return False
 
     def _process_tool(self, events: list[GenerationEvent]) -> bool:
-        parser = self._tool_parser
-        if parser is None:
-            raise RuntimeError("Qwen Tool Call mode requires an active Tool Call parser")
+        shared = self._active_tool_decoder
+        if shared is None:
+            raise RuntimeError("Qwen Tool mode requires an active shared Tool-region decoder")
         text = self._buffer
         self._buffer = ""
-        verified_tool_close_end = self._verified_adjacent_tool_close_end()
-        if verified_tool_close_end is not None:
-            prospective_length = parser.buffered_text_length + len(text)
-            native_length = sum(len(segment.text) for segment in self._tool_native_segments)
-            if prospective_length != native_length:
-                verified_tool_close_end = None
-        result = parser.feed(
-            text,
-            verified_tool_close_end=verified_tool_close_end,
-        )
-        events.extend(result.events)
-        if not result.closed:
-            self._trim_tool_native_segments(parser.buffered_text_length)
-            return False
-        if result.protocol_terminal_issue is not None:
-            self._protocol_terminal_issue = result.protocol_terminal_issue
-        elif result.incomplete:
-            self._had_incomplete_tool = True
-        if result.completed_call:
+        shared.feed(text)
+        self._shared_tool_stream_chars += len(text)
+        return False
+
+    def _publish_shared_tool_result(
+        self,
+        shared_result: ToolRegionDecodeResult,
+        events: list[GenerationEvent],
+    ) -> None:
+        for decoded_call in shared_result.calls:
+            index = self._call_index
+            call_id = _deterministic_call_id(self._request_id, index)
+            events.append(ToolCallStarted(self._request_id, call_id, decoded_call.name, index))
+            events.append(
+                ToolCallArgumentsDelta(
+                    self._request_id,
+                    call_id,
+                    decoded_call.arguments_json,
+                    index,
+                )
+            )
+            events.append(
+                ToolCallCompleted(
+                    self._request_id,
+                    ToolCallItem(
+                        call_id=call_id,
+                        name=decoded_call.name,
+                        arguments_json=decoded_call.arguments_json,
+                        index=index,
+                    ),
+                )
+            )
             self._call_index += 1
-        native_remainder = self._capture_native_remainder(result.remainder)
+        remainder = shared_result.remainder
+        literal_offsets = shared_result.literal_tool_open_offsets
+        native_replay = self._shared_remainder_replay_segments(remainder, literal_offsets)
         self._restore_after_tool()
-        self._buffer = "" if native_remainder else result.remainder
+        self._buffer = ""
+        self._literal_tool_open_offsets = ()
+        self._literal_tool_buffer_origin = 0
+        if native_replay:
+            self._pending_native_replay = native_replay
+        else:
+            self._buffer = remainder
+            self._set_literal_tool_open_offsets(literal_offsets)
+
+    def _try_finish_shared_before_verified_opener(
+        self,
+        events: list[GenerationEvent],
+    ) -> bool:
+        shared = self._active_tool_decoder
+        if not isinstance(shared, CompatibilityToolRegionDecoderLike):
+            return False
+        if not shared.can_probe_compatibility_finish():
+            return False
+        shared_result = shared.probe_compatibility_finish()
+        if shared_result is None:
+            return False
+        self._publish_shared_tool_result(shared_result, events)
+        if self._pending_native_replay:
+            self._drain_pending_native_replay(events)
+        while self._mode is not _QwenMode.TOOL and self._buffer and self._process_plain(events):
+            pass
         return True
 
     def _finish_tool(self, events: list[GenerationEvent]) -> bool:
-        parser = self._tool_parser
-        if parser is None:
-            raise RuntimeError("Qwen Tool Call mode requires an active Tool Call parser")
-        result = parser.finish()
-        events.extend(result.events)
-        if result.protocol_terminal_issue is not None:
-            self._protocol_terminal_issue = result.protocol_terminal_issue
-        elif result.incomplete:
-            self._had_incomplete_tool = True
-        if result.completed_call:
-            self._call_index += 1
-        native_remainder = self._capture_native_remainder(result.remainder)
-        self._restore_after_tool()
-        self._buffer = "" if native_remainder else result.remainder
-        return result.incomplete or result.protocol_terminal_issue is not None
+        shared = self._active_tool_decoder
+        if shared is None:
+            raise RuntimeError("Qwen Tool mode requires an active shared Tool-region decoder")
+        if self._buffer:
+            text = self._buffer
+            shared.feed(text)
+            self._shared_tool_stream_chars += len(text)
+            self._buffer = ""
+        shared_result = shared.finish()
+        if not shared_result.complete:
+            if shared_result.issue_code == "raw_boundary_ambiguous":
+                self._protocol_terminal_issue = ParserTerminalIssue(
+                    ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+                    ParserAmbiguityDetail.UNRESOLVED_BOUNDARY,
+                )
+            elif shared_result.issue_code == "compatibility_semantic_work_exceeded":
+                self._protocol_terminal_issue = ParserTerminalIssue(
+                    ParserTerminalIssueKind.PROTOCOL_AMBIGUITY,
+                    ParserAmbiguityDetail.HOLD_LIMIT,
+                )
+            else:
+                self._had_incomplete_tool = True
+            self._restore_after_tool()
+            return True
+        self._publish_shared_tool_result(shared_result, events)
+        return False
 
     def _apply_native_marker(self, marker: str, events: list[GenerationEvent]) -> None:
         if marker == "<tool_call>":
-            self._enter_tool(events)
+            self._enter_tool(events, verified_native_opener=True)
             return
         if marker == "<think>":
             if self._mode is _QwenMode.REASONING:
@@ -2623,6 +1369,31 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             cursor += len(segment.text)
         return "".join(parts), tuple(spans)
 
+    def _feed_replayed_plain_text(
+        self,
+        text: str,
+        events: list[GenerationEvent],
+        *,
+        literal_tool_opener: bool = False,
+    ) -> None:
+        if not text:
+            return
+        if self._mode is _QwenMode.TOOL:
+            self._feed_native_text_segment(text, events, _drain_replay=False)
+            return
+        if literal_tool_opener:
+            offset = self._literal_tool_buffer_origin + len(self._buffer)
+            self._literal_tool_open_offsets = (*self._literal_tool_open_offsets, offset)
+        self._buffer += text
+        while True:
+            progressed = (
+                self._process_tool(events)
+                if self._in_tool_mode()
+                else self._process_plain(events)
+            )
+            if not progressed:
+                break
+
     def _drain_pending_native_replay(self, events: list[GenerationEvent]) -> None:
         while self._pending_native_replay:
             segments = self._pending_native_replay
@@ -2630,7 +1401,11 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             for index, segment in enumerate(segments):
                 marker = segment.verified_marker
                 if marker is None:
-                    self._feed_native_text_segment(segment.text, events, _drain_replay=False)
+                    self._feed_replayed_plain_text(
+                        segment.text,
+                        events,
+                        literal_tool_opener=segment.literal_tool_opener,
+                    )
                 elif self._mode is _QwenMode.TOOL:
                     self._feed_native_text_segment(
                         segment.text,
@@ -2646,6 +1421,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                         following_text,
                         events,
                         verified=True,
+                        native_id=segment.native_id,
                     )
                     if (
                         disposition is _QwenMarkerDisposition.PENDING
@@ -2674,7 +1450,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         if self._mode is not _QwenMode.TOOL:
             self._emit_content(text, events)
             return
-        self._record_tool_native_segment(text, verified_marker, native_id)
+        self._record_shared_tool_native_marker(text, verified_marker, native_id)
         self._buffer += text
         while self._mode is _QwenMode.TOOL and self._process_tool(events):
             pass
@@ -2759,8 +1535,19 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                 self._buffer_pending_inline_native_chunk(following_text, native_token_spans)
             return False
 
+        if disposition is _QwenMarkerDisposition.STRUCTURAL:
+            held_chunks = tuple(self._pending_inline_native_chunks)
+            self._pending_inline_native_chunks = []
+            self._pending_native_replay = ()
+            self._apply_native_marker(marker, events)
+            for held_chunk, held_spans in held_chunks:
+                events.extend(self.feed_with_native_tokens(held_chunk, held_spans))
+            if following_text:
+                events.extend(self.feed_with_native_tokens(following_text, native_token_spans))
+            return True
+
         if disposition is not _QwenMarkerDisposition.LITERAL:
-            raise RuntimeError("Qwen semantic barrier may only resolve as literal")
+            raise RuntimeError("Qwen semantic barrier resolved to an unsupported disposition")
 
         consumed = self._marker_boundaries.last_scan_consumed_characters
         if consumed < 0 or consumed > len(following_text):
@@ -2792,6 +1579,10 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         if resolved is None:
             return
         marker, disposition = resolved
+        native_id = self._pending_native_tool_trigger_id
+        self._pending_native_tool_trigger_id = None
+        if disposition is _QwenMarkerDisposition.STRUCTURAL:
+            self._validate_constraint_tool_trigger(marker, native_id)
         self._apply_marker_disposition(marker, disposition, events)
 
     def _handle_marker_candidate(
@@ -2801,12 +1592,31 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
         events: list[GenerationEvent],
         *,
         verified: bool,
+        native_id: int | None = None,
     ) -> _QwenMarkerDisposition:
-        disposition = self._marker_boundaries.classify_native_marker(
-            marker,
-            following_text,
-            verified=verified,
-        )
+        disposition = None
+        if verified and marker == "</think>" and self._mode is _QwenMode.REASONING:
+            disposition = self._marker_boundaries.resolve_provisional_reasoning_close(
+                following_text
+            )
+        if disposition is None:
+            disposition = self._marker_boundaries.classify_native_marker(
+                marker,
+                following_text,
+                verified=verified,
+            )
+        if verified and marker == _TOOL_OPEN and self._shared_tool_decoder_template is not None:
+            if disposition is _QwenMarkerDisposition.STRUCTURAL:
+                self._validate_constraint_tool_trigger(marker, native_id)
+            elif (
+                disposition is _QwenMarkerDisposition.PENDING
+                and not self._marker_boundaries.has_pending_inline_native_marker
+            ):
+                if native_id is None:
+                    raise NativeTokenProvenanceError(
+                        "Qwen constrained Tool opener lost native token identity"
+                    )
+                self._pending_native_tool_trigger_id = native_id
         self._apply_marker_disposition(marker, disposition, events)
         return disposition
 
@@ -2917,6 +1727,12 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
             if span.start < cursor or span.end > len(chunk) or chunk[span.start : span.end] != span.text:
                 raise ValueError("native token spans do not match the supplied chunk")
             self._feed_native_text_segment(chunk[cursor : span.start], events)
+            if (
+                self._mode is _QwenMode.TOOL
+                and span.text == _TOOL_OPEN
+                and self._try_finish_shared_before_verified_opener(events)
+            ):
+                pass
             if self._mode is _QwenMode.TOOL:
                 verified_tool_marker = (
                     span.text if span.text in _TOOL_MODE_NATIVE_MARKERS else None
@@ -2935,6 +1751,7 @@ class QwenIncrementalParser(NativeTokenAwareIncrementalParser):
                     chunk[span.end :],
                     events,
                     verified=True,
+                    native_id=span.token_id,
                 )
                 if (
                     disposition is _QwenMarkerDisposition.PENDING

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from importlib import metadata
 
@@ -15,10 +15,12 @@ from exqserve.model.contracts import (
     ModelCapabilities,
     ModelDialect,
     ModelDialectPluginRegistration,
+    ParserCreationContext,
     ReasoningControlSpec,
     StructuralTokenRequirements,
     ToolConstraintMode,
     ToolGenerationConstraint,
+    ToolRegionDecoderLike,
 )
 from exqserve.model.deepseek_v4 import (
     DEEPSEEK_V4_CAPABILITIES,
@@ -54,8 +56,36 @@ from exqserve.model.qwen import (
     QWEN38_CAPABILITIES,
     QwenIncrementalParser,
     QwenPromptCompiler,
-    qwen_tool_constraint,
 )
+
+_QWEN_COMPATIBILITY_DECODER_FACTORY: (
+    Callable[[ToolPolicy | None], ToolRegionDecoderLike] | None
+) = None
+
+
+def configure_qwen_compatibility_decoder_factory(
+    factory: Callable[[ToolPolicy | None], ToolRegionDecoderLike],
+) -> None:
+    """Install the built-in Qwen compatibility decoder at the package composition boundary."""
+
+    if not callable(factory):
+        raise TypeError("factory must be callable")
+    global _QWEN_COMPATIBILITY_DECODER_FACTORY
+    current = _QWEN_COMPATIBILITY_DECODER_FACTORY
+    if current is not None and current is not factory:
+        raise RuntimeError("Qwen compatibility decoder factory is already configured")
+    _QWEN_COMPATIBILITY_DECODER_FACTORY = factory
+
+
+def _qwen_compatibility_parser_context() -> ParserCreationContext | None:
+    factory = _QWEN_COMPATIBILITY_DECODER_FACTORY
+    if factory is None:
+        return None
+    return ParserCreationContext(
+        hard_constraint_installed=False,
+        tool_region_decoder_factory=factory,
+    )
+
 
 _GLM5_ARCHITECTURES = frozenset(
     {
@@ -115,6 +145,21 @@ class QwenDialect:
             request_id,
             start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
             tool_policy=tool_policy,
+            parser_context=_qwen_compatibility_parser_context(),
+        )
+
+    def create_parser_with_context(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+        context: ParserCreationContext | None,
+    ) -> QwenIncrementalParser:
+        return QwenIncrementalParser(
+            request_id,
+            start_in_reasoning=reasoning.mode is not ReasoningMode.DISABLED,
+            tool_policy=tool_policy,
+            parser_context=context if context is not None else _qwen_compatibility_parser_context(),
         )
 
     def create_reasoning_control(
@@ -124,14 +169,6 @@ class QwenDialect:
         if reasoning_policy.mode is ReasoningMode.DISABLED:
             return None
         return ReasoningControlSpec("</think>", True)
-
-    def create_tool_constraint(
-        self,
-        tool_policy: ToolPolicy,
-        mode: ToolConstraintMode,
-    ) -> ToolGenerationConstraint | None:
-        return qwen_tool_constraint(tool_policy, mode)
-
 
 @dataclass(frozen=True, slots=True)
 class Gemma4Dialect:

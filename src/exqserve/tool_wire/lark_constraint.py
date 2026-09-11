@@ -1,8 +1,8 @@
-"""A2 shadow-only Lark constraint generation from Tool-wire static/request facts.
+"""Lark/LLGuidance artifact lowering from certified Tool-Wire static/request facts.
 
-This module is deliberately not imported by production runtime paths.  It turns an already
-certified ``ToolWireSpec`` / ``CompiledToolWirePlan`` into a backend-neutral
-``ToolGenerationConstraint`` for CPU feasibility and semantic-consistency tests.
+This module owns only backend representation. It lowers an already-certified ``ToolWireSpec`` /
+``CompiledToolWirePlan`` into ``ToolGenerationConstraint`` artifacts for shadow and production
+Qwen paths without becoming a second source of Tool/schema semantics.
 """
 
 from __future__ import annotations
@@ -18,8 +18,9 @@ from exqserve.tool_wire.compiler import (
     _ConstraintArtifactCandidate,
 )
 from exqserve.tool_wire.contracts import (
+    STRUCTURAL_WS_LARK_CLASS,
+    STRUCTURAL_WS_MAX,
     ArgumentBranchPlan,
-    CompiledToolWirePlan,
     ConstraintValueMode,
     ToolBranchPlan,
     ToolWireSpec,
@@ -29,79 +30,29 @@ from exqserve.tool_wire.contracts import (
 
 
 class ToolWireConstraintCompileError(ValueError):
-    """Raised when the isolated shadow compiler cannot represent a certified plan."""
+    """Raised when the Lark artifact emitter cannot represent a certified plan."""
+
+
+class ToolWireConstraintLoweringUnsupported(ToolWireConstraintCompileError):
+    """Raised when a certified branch has no supported production backend lowering."""
 
 
 def _lark_literal(value: str) -> str:
     return canonical_json_dumps(value)
 
 
-def _escape_char_class(value: str) -> str:
-    pieces: list[str] = []
-    for character in value:
-        if character in "\\/-]^":
-            pieces.append("\\" + character)
-        elif ord(character) < 0x20:
-            pieces.append(f"\\u{ord(character):04x}")
-        else:
-            pieces.append(character)
-    return "".join(pieces)
-
-
-def _prefix_states(close_forms: tuple[str, ...]) -> tuple[str, ...]:
-    if any(
-        left != right and right.startswith(left)
-        for left in close_forms
-        for right in close_forms
-    ):
-        raise ToolWireConstraintCompileError(
-            "RAW_UNTIL shadow compiler requires a prefix-free close language"
-        )
-    states = {""}
-    for close in close_forms:
-        states.update(close[:length] for length in range(1, len(close)))
-    return tuple(sorted(states, key=lambda value: (len(value), value)))
-
-
-def _next_prefix(state: str, character: str, prefixes: tuple[str, ...]) -> str:
-    candidate = state + character
-    matches = tuple(prefix for prefix in prefixes if candidate.endswith(prefix))
-    return max(matches, key=len)
-
-
-def _raw_value_and_close_rules(
-    rule_prefix: str,
+def _raw_value_and_close_suffix_rule(
+    rule_name: str,
     close_forms: tuple[str, ...],
 ) -> tuple[str, tuple[str, ...]]:
-    """Compile ``raw-without-close + final-close`` as one deterministic DFA.
+    """Lower one certified RAW_UNTIL close literal to LLGuidance's native lazy suffix terminal."""
 
-    Folding the final structural close into the DFA is important for LLGuidance: a grammar
-    shaped as ``safe_raw CLOSE`` can commit to ``CLOSE`` too early and reject a proper close
-    prefix that was intended as raw data.  The DFA instead accepts only when the first full
-    close-language match is the final structural suffix.
-    """
-
-    prefixes = _prefix_states(close_forms)
-    state_index = {prefix: index for index, prefix in enumerate(prefixes)}
-    alphabet = tuple(sorted(set("".join(close_forms))))
-    other_class = _escape_char_class("".join(alphabet))
-    done_rule = f"{rule_prefix}_done"
-    lines: list[str] = []
-
-    for state in prefixes:
-        rule_name = f"{rule_prefix}_{state_index[state]}"
-        alternatives = [f"/[^{other_class}]/ {rule_prefix}_{state_index['']}"]
-        for character in alphabet:
-            candidate = state + character
-            if any(candidate.endswith(close) for close in close_forms):
-                destination = done_rule
-            else:
-                next_state = _next_prefix(state, character, prefixes)
-                destination = f"{rule_prefix}_{state_index[next_state]}"
-            alternatives.append(f"{_lark_literal(character)} {destination}")
-        lines.append(f"{rule_name}: " + " | ".join(alternatives))
-    lines.append(f"{done_rule}:")
-    return f"{rule_prefix}_{state_index['']}", tuple(lines)
+    if len(close_forms) != 1:
+        raise ToolWireConstraintLoweringUnsupported(
+            "production RAW_UNTIL lowering requires one canonical literal close form"
+        )
+    suffix = _lark_literal(close_forms[0])
+    return rule_name, (f'{rule_name}[suffix={suffix}]: /[\\s\\S]*/',)
 
 
 def _argument_rule(
@@ -129,7 +80,10 @@ def _argument_rule(
             }
         ):
             raise ToolWireConstraintCompileError("ANY_SAFE_RAW branch is not RAW_UNTIL/raw-string")
-        raw_start, raw_rules = _raw_value_and_close_rules(rule_prefix + "_raw", close_forms)
+        raw_start, raw_rules = _raw_value_and_close_suffix_rule(
+            rule_prefix + "_raw",
+            close_forms,
+        )
         return f"{open_literal} {raw_start}", raw_rules
 
     if argument.value_mode is ConstraintValueMode.FINITE_VALUES:
@@ -156,17 +110,7 @@ def _argument_rule(
             # Keep the payload and canonical close in one literal whenever they are adjacent.
             # Otherwise a lexer can let a longer finite payload consume the first byte(s) of the
             # close delimiter (for example enum ["<", "<<"] at "<</parameter>").
-            direct = _lark_literal(wire_payload + close)
-            if raw_codec is ValueCodecKind.RAW_STRING_STRIP_JSON_STRING_OR_TEXT:
-                if wire_payload:
-                    padded = (
-                        f"{_lark_literal(wire_payload)} WS {_lark_literal(close)}"
-                    )
-                    values.append(f"WS? ({direct} | {padded})")
-                else:
-                    values.append(f"WS? ({direct} | WS {_lark_literal(close)})")
-            else:
-                values.append(direct)
+            values.append(_lark_literal(wire_payload + close))
         value_rule = " | ".join(values)
         return f"{open_literal} ({value_rule})", ()
 
@@ -212,6 +156,8 @@ def _render_lark_artifact(
     activation_trigger_ids: tuple[str, ...],
     *,
     structural_ws_max: int,
+    allow_parallel: bool,
+    max_parallel_calls: int | None,
 ) -> _LarkArtifactDraft:
     """Build one bounded temporary grammar product without mutating CompileBudget telemetry."""
 
@@ -223,10 +169,18 @@ def _render_lark_artifact(
         raise ToolWireConstraintCompileError("shadow grammar requires one exact activation trigger")
     if not isinstance(structural_ws_max, int) or isinstance(structural_ws_max, bool) or structural_ws_max <= 0:
         raise ValueError("structural_ws_max must be a positive integer")
-    if spec.multiplicity.max_calls_per_sequence != 1 or spec.multiplicity.min_calls_per_sequence != 1:
-        raise ToolWireConstraintCompileError(
-            "A2 shadow grammar currently requires exact single-call Tool multiplicity"
-        )
+    if not isinstance(allow_parallel, bool):
+        raise TypeError("allow_parallel must be a bool")
+    if max_parallel_calls is not None and (
+        not isinstance(max_parallel_calls, int)
+        or isinstance(max_parallel_calls, bool)
+        or max_parallel_calls <= 0
+    ):
+        raise ValueError("max_parallel_calls must be a positive integer or None")
+    if spec.multiplicity.min_calls_per_sequence != 1:
+        raise ToolWireConstraintCompileError("Tool grammar requires one mandatory first Tool call")
+    if allow_parallel and not spec.multiplicity.adjacent_tools:
+        raise ToolWireConstraintCompileError("static ToolWireSpec does not allow adjacent Tool calls")
     trigger_id = activation_trigger_ids[0]
     trigger = next(
         (candidate for candidate in spec.activation_triggers if candidate.trigger_id == trigger_id),
@@ -241,20 +195,43 @@ def _render_lark_artifact(
             "A2 shadow grammar currently requires canonical single Tool/function closes"
         )
 
+    generated_tools = tuple(
+        tool
+        for tool in tools
+        if tool.representable
+        and tool.guarantee in {GenerationGuarantee.FORMAT, GenerationGuarantee.SCHEMA}
+    )
+    if not generated_tools:
+        raise ToolWireConstraintCompileError("Tool artifact has no generation-authorized branch")
+    close_literal = _lark_literal(spec.tool_close.canonical.text)
+    start_rule = f"start: WS? function WS? {close_literal}"
+    if allow_parallel:
+        static_max = spec.multiplicity.max_calls_per_sequence
+        effective_max = (
+            max_parallel_calls
+            if static_max is None
+            else static_max
+            if max_parallel_calls is None
+            else min(static_max, max_parallel_calls)
+        )
+        if effective_max is None:
+            start_rule += (
+                f" (WS? {_lark_literal(spec.tool_open.text)} WS? function WS? {close_literal})*"
+            )
+        elif effective_max > 1:
+            additional = effective_max - 1
+            start_rule += (
+                f" (WS? {_lark_literal(spec.tool_open.text)} WS? function WS? {close_literal})"
+                f"{{0,{additional}}}"
+            )
     lines = [
         "%llguidance {}",
-        f"start: WS? function WS? {_lark_literal(spec.tool_close.canonical.text)}",
-        "function: " + " | ".join(f"function_{index}" for index in range(len(tools))),
+        start_rule,
+        "function: "
+        + " | ".join(f"function_{index}" for index in range(len(generated_tools))),
     ]
     extra_rules: list[str] = []
-    for tool_index, tool in enumerate(tools):
-        if not tool.representable or tool.guarantee not in {
-            GenerationGuarantee.FORMAT,
-            GenerationGuarantee.SCHEMA,
-        }:
-            raise ToolWireConstraintCompileError(
-                f"Tool branch is not generation-authorized: {tool.tool_name!r}"
-            )
+    for tool_index, tool in enumerate(generated_tools):
         encoded_tool = spec.function_name_codec.encode(tool.tool_name)
         function_open = _lark_literal(spec.function_open.render(encoded_tool))
         function_close = _lark_literal(spec.function_close.canonical.text)
@@ -275,16 +252,21 @@ def _render_lark_artifact(
         order_rules: list[str] = []
         for order_index, order in enumerate(tool.order_plan.orders):
             order_rule = f"function_{tool_index}_order_{order_index}"
-            pieces = [argument_rules[name] for name in order]
-            extra_rules.append(f"{order_rule}: " + (" WS? ".join(pieces) if pieces else ""))
+            pieces = [
+                f"(WS? {argument_rules[name]})?"
+                if name in tool.order_plan.optional_names
+                else f"WS? {argument_rules[name]}"
+                for name in order
+            ]
+            extra_rules.append(f"{order_rule}: " + " ".join(pieces))
             order_rules.append(order_rule)
         lines.append(
-            f"function_{tool_index}: {function_open} WS? "
+            f"function_{tool_index}: {function_open} "
             f"({' | '.join(order_rules)}) WS? {function_close}"
         )
 
     lines.extend(extra_rules)
-    lines.append(f"WS: /[ \\t\\r\\n]{{1,{structural_ws_max}}}/")
+    lines.append(f"WS: /[{STRUCTURAL_WS_LARK_CLASS}]{{1,{structural_ws_max}}}/")
     return _LarkArtifactDraft(
         trigger=trigger.terminal.text,
         grammar="\n".join(lines),
@@ -297,13 +279,17 @@ def build_lark_tool_constraint_candidate(
     tools: tuple[ToolBranchPlan, ...],
     activation_trigger_ids: tuple[str, ...],
     *,
-    structural_ws_max: int = 8,
+    structural_ws_max: int = STRUCTURAL_WS_MAX,
+    allow_parallel: bool = False,
+    max_parallel_calls: int | None = None,
 ) -> _ConstraintArtifactCandidate:
     draft = _render_lark_artifact(
         spec,
         tools,
         activation_trigger_ids,
         structural_ws_max=structural_ws_max,
+        allow_parallel=allow_parallel,
+        max_parallel_calls=max_parallel_calls,
     )
     grammar_bytes = len(draft.grammar.encode("utf-8"))
     rule_count = sum(
@@ -346,31 +332,6 @@ def finalize_lark_tool_constraint_candidate(
     )
     fingerprint = sha256(draft.grammar.encode("utf-8")).hexdigest()
     return constraint, fingerprint
-
-
-def compile_lark_tool_constraint(
-    spec: ToolWireSpec,
-    plan: CompiledToolWirePlan,
-    *,
-    structural_ws_max: int = 8,
-) -> ToolGenerationConstraint:
-    """Reject legacy post-finalization request-specific emission.
-
-    V3 request-specific Lark artifacts are built as bounded candidates and finalized once by
-    ``build_lark_tool_constraint_candidate`` / ``finalize_lark_tool_constraint_candidate``.
-    Keeping this importable compatibility entry point prevents silent fallback to the former
-    post-snapshot emitter.
-    """
-
-    if not isinstance(spec, ToolWireSpec):
-        raise TypeError("spec must be a ToolWireSpec")
-    if not isinstance(plan, CompiledToolWirePlan):
-        raise TypeError("plan must be a CompiledToolWirePlan")
-    if not isinstance(structural_ws_max, int) or isinstance(structural_ws_max, bool) or structural_ws_max <= 0:
-        raise ValueError("structural_ws_max must be a positive integer")
-    raise ToolWireConstraintCompileError(
-        "request-specific Lark emission must occur inside the originating compile-budget session"
-    )
 
 
 def constraint_grammar_fingerprint(constraint: ToolGenerationConstraint) -> str:

@@ -5,7 +5,7 @@ import json
 import pytest
 
 from exqserve.model.contracts import ToolConstraintMode
-from exqserve.tool_wire.controls.qwen import compile_qwen_a2a_shadow
+from tests.tool_wire._legacy_qwen_a2a import compile_qwen_a2a_shadow
 from tests.tool_wire._support import policy, tool
 
 llguidance = pytest.importorskip("llguidance")
@@ -338,7 +338,7 @@ def test_qwen_a2a_exact_close_collision_rejects_across_every_byte_partition() ->
         assert not (second_ok and matcher.is_accepting() and not matcher.is_error())
 
 
-def test_qwen_a2a_finite_enum_constraint_uses_safe_wire_alias_for_close_semantics() -> None:
+def test_qwen_a2a_finite_enum_constraint_filters_reserved_close_value() -> None:
     bundle = _compile_bundle(
         {
             "content": {
@@ -351,30 +351,28 @@ def test_qwen_a2a_finite_enum_constraint_uses_safe_wire_alias_for_close_semantic
     assert _accepts(bundle, _suffix("a<b"))
     assert _accepts(bundle, _suffix("<"))
     assert _accepts(bundle, _suffix("<<"))
-    assert _accepts(bundle, _suffix('"bad\\u003c/parameter>value"'))
+    assert not _accepts(bundle, _suffix('"bad\\u003c/parameter>value"'))
     assert not _accepts(bundle, _suffix("bad</parameter>value"))
     assert not _accepts(bundle, _suffix("other"))
 
 
-def test_qwen_a2a_finite_normalized_value_accepts_compact_and_template_padding() -> None:
+def test_qwen_a2a_finite_value_accepts_only_exact_native_raw_spelling() -> None:
     bundle = _compile_bundle({"content": {"type": "string", "const": "safe"}})
     assert _accepts(bundle, _suffix("safe"))
-    assert _accepts(bundle, _suffix("\nsafe\n"))
-    assert _accepts(bundle, _suffix(" \t safe \r\n"))
+    assert not _accepts(bundle, _suffix("\nsafe\n"))
+    assert not _accepts(bundle, _suffix(" \t safe \r\n"))
     assert not _accepts(bundle, _suffix(" safe value "))
 
 
-def test_qwen_a2a_finite_alias_shaped_values_have_distinct_lossless_wire_forms() -> None:
+def test_qwen_a2a_finite_alias_shaped_values_use_their_direct_native_forms() -> None:
     bundle = _compile_bundle(
         {"content": {"type": "string", "enum": ["foo", '"foo"', " leading", "trailing "]}}
     )
     assert _accepts(bundle, _suffix("foo"))
-    assert _accepts(bundle, _suffix('"\\"foo\\""'))
-    assert _accepts(bundle, _suffix('" leading"'))
-    assert _accepts(bundle, _suffix('"trailing "'))
-    assert not _accepts(bundle, _suffix('"foo"'))
-    assert not _accepts(bundle, _suffix(" leading"))
-    assert not _accepts(bundle, _suffix("trailing "))
+    assert _accepts(bundle, _suffix('"foo"'))
+    assert _accepts(bundle, _suffix(" leading"))
+    assert _accepts(bundle, _suffix("trailing "))
+    assert not _accepts(bundle, _suffix('"\\"foo\\""'))
 
 
 def test_qwen_a2a_structured_format_grammar_is_json_only_not_schema_upgraded() -> None:

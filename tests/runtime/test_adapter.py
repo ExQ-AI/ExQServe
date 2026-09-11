@@ -106,6 +106,8 @@ class _FakeTokenizer:
             return _FakeTensor([[10, 11, 12, 13]])
         if text == "</think>":
             return _FakeTensor([[248069]])
+        if text == "<tool_call>":
+            return _FakeTensor([[self.unspecial_piece_to_id[text]]])
         return _FakeTensor([[1, 2, 3]])
 
 
@@ -2269,27 +2271,70 @@ def test_submit_rejects_inline_json_schema_that_llguidance_cannot_enforce(
     )
 
     async def scenario() -> None:
-        with pytest.raises(RuntimeConstraintUnsupported, match="cannot enforce"):
-            runtime.submit(
-                RuntimeGenerationRequest(
-                    "req-tool-constraint",
-                    (1, 2, 3),
-                    8,
-                    generation_constraint=RuntimeGenerationConstraint(
-                        "</think>",
-                        grammar,
-                        False,
-                    ),
-                )
+        runtime.submit(
+            RuntimeGenerationRequest(
+                "req-tool-constraint",
+                (1, 2, 3),
+                8,
+                generation_constraint=RuntimeGenerationConstraint(
+                    "</think>",
+                    grammar,
+                    False,
+                ),
             )
+        )
 
     asyncio.run(scenario())
 
     assert _FakeLLGuidanceFilter.calls == []
-    assert _FakeAsyncJob.calls == []
+    assert len(_FakeAsyncJob.calls) == 1
+    assert "filters" not in _FakeAsyncJob.calls[0][3]
 
 
-def test_submit_fails_when_explicit_generation_constraint_trigger_is_not_one_token(
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_submit_falls_back_when_tool_constraint_trigger_tokenization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    tokenizer = backend._state["tokenizer"]
+    original_encode = tokenizer.encode
+
+    def rejecting_encode(text: str, **kwargs: object) -> _FakeTensor:
+        if text == "broken-tool-trigger":
+            raise error_type("cannot tokenize tool trigger")
+        return original_encode(text, **kwargs)
+
+    tokenizer.encode = rejecting_encode
+
+    async def scenario() -> None:
+        runtime.submit(
+            RuntimeGenerationRequest(
+                "req-tool-tokenize-fallback",
+                (1, 2, 3),
+                8,
+                generation_constraint=RuntimeGenerationConstraint(
+                    "broken-tool-trigger",
+                    'start: "ok"',
+                    False,
+                ),
+            )
+        )
+
+    asyncio.run(scenario())
+    assert _FakeLLGuidanceFilter.calls == []
+    assert len(_FakeAsyncJob.calls) == 1
+    assert "filters" not in _FakeAsyncJob.calls[0][3]
+
+
+def test_submit_falls_back_when_explicit_generation_constraint_trigger_is_not_one_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from exqserve.runtime import exllamav3 as module
@@ -2304,27 +2349,27 @@ def test_submit_fails_when_explicit_generation_constraint_trigger_is_not_one_tok
     grammar = "%llguidance {}" + chr(10) + 'start: "ok"'
 
     async def scenario() -> None:
-        with pytest.raises(RuntimeError, match="single-token"):
-            runtime.submit(
-                RuntimeGenerationRequest(
-                    "req-tool-constraint",
-                    (1, 2, 3),
-                    8,
-                    generation_constraint=RuntimeGenerationConstraint(
-                        "not-a-single-token",
-                        grammar,
-                        False,
-                    ),
-                )
+        runtime.submit(
+            RuntimeGenerationRequest(
+                "req-tool-constraint",
+                (1, 2, 3),
+                8,
+                generation_constraint=RuntimeGenerationConstraint(
+                    "not-a-single-token",
+                    grammar,
+                    False,
+                ),
             )
+        )
 
     asyncio.run(scenario())
 
     assert _FakeLLGuidanceFilter.calls == []
-    assert _FakeAsyncJob.calls == []
+    assert len(_FakeAsyncJob.calls) == 1
+    assert "filters" not in _FakeAsyncJob.calls[0][3]
 
 
-def test_submit_fails_when_runtime_rejects_explicit_generation_constraint(
+def test_submit_falls_back_when_runtime_rejects_explicit_generation_constraint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from exqserve.runtime import exllamav3 as module
@@ -2345,23 +2390,23 @@ def test_submit_fails_when_runtime_rejects_explicit_generation_constraint(
     grammar = "%llguidance {}" + chr(10) + 'start: "ok"'
 
     async def scenario() -> None:
-        with pytest.raises(RuntimeError, match="grammar could not be initialized"):
-            runtime.submit(
-                RuntimeGenerationRequest(
-                    "req-tool-constraint",
-                    (1, 2, 3),
-                    8,
-                    generation_constraint=RuntimeGenerationConstraint(
-                        "</think>",
-                        grammar,
-                        False,
-                    ),
-                )
+        runtime.submit(
+            RuntimeGenerationRequest(
+                "req-tool-constraint",
+                (1, 2, 3),
+                8,
+                generation_constraint=RuntimeGenerationConstraint(
+                    "</think>",
+                    grammar,
+                    False,
+                ),
             )
+        )
 
     asyncio.run(scenario())
 
-    assert _FakeAsyncJob.calls == []
+    assert len(_FakeAsyncJob.calls) == 1
+    assert "filters" not in _FakeAsyncJob.calls[0][3]
 
 
 
@@ -2399,8 +2444,10 @@ def test_strict_tool_constraint_fail_closes_when_trigger_is_not_one_token(
     assert _FakeAsyncJob.calls == []
 
 
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
 def test_strict_tool_constraint_fail_closes_when_trigger_tokenization_fails(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     from exqserve.runtime import exllamav3 as module
 
@@ -2415,7 +2462,7 @@ def test_strict_tool_constraint_fail_closes_when_trigger_tokenization_fails(
 
     def rejecting_encode(text: str, **kwargs: object) -> _FakeTensor:
         if text == "broken-tool-trigger":
-            raise ValueError("cannot tokenize tool trigger")
+            raise error_type("cannot tokenize tool trigger")
         return original_encode(text, **kwargs)
 
     tokenizer.encode = rejecting_encode
@@ -3603,3 +3650,44 @@ def test_runtime_refuses_double_load(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(RuntimeError, match="already loaded"):
         runtime.load(config)
+def test_submit_maps_qwen_tool_opener_to_model_native_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+    grammar = '%llguidance {}\nstart: "ok"'
+
+    async def scenario() -> None:
+        session = runtime.submit(
+            RuntimeGenerationRequest(
+                "req-qwen-tool-opener",
+                (1, 2, 3),
+                8,
+                generation_constraint=RuntimeGenerationConstraint(
+                    "<tool_call>",
+                    grammar,
+                    True,
+                ),
+                generation_guarantee=GenerationGuarantee.SCHEMA,
+                constraint_fallback_policy=ConstraintFallbackPolicy.FAIL_CLOSED,
+            )
+        )
+        events = [event async for event in session]
+        finished = next(event for event in events if isinstance(event, RuntimeFinished))
+        assert finished.hard_constraint_installed is True
+        assert finished.hard_constraint_activated is False
+        assert finished.effective_generation_guarantee is GenerationGuarantee.NONE
+
+    asyncio.run(scenario())
+
+    tokenizer = backend._state["tokenizer"]
+    assert tokenizer.encode_calls[-1] == ("<tool_call>", False, False, True)
+    _, filter_kwargs = _FakeLLGuidanceFilter.calls[0]
+    assert filter_kwargs["trigger_token"] == tokenizer.unspecial_piece_to_id["<tool_call>"]
+    assert filter_kwargs["lark_grammar"] == grammar

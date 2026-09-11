@@ -77,3 +77,14 @@ def canonical_json_dumps(value: JsonValue) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
+
+
+def canonical_utf8_json_dumps(value: JsonValue) -> str:
+    """Serialize JSON and reject text that cannot be transported as UTF-8."""
+
+    serialized = canonical_json_dumps(value)
+    try:
+        serialized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise InvalidJsonError("JSON contains a non-UTF8 surrogate scalar") from exc
+    return serialized

@@ -7,14 +7,13 @@ import pytest
 from exqserve.agent._json import parse_json_strict
 from exqserve.core.generation_guarantees import GenerationGuarantee
 from exqserve.model.contracts import ToolConstraintMode
-from exqserve.tool_wire import (
+from tests.tool_wire._legacy_api import (
     ArgumentFramingVariant,
     ArgumentOccurrenceCapabilities,
     ArgumentOrderingMode,
     CloseLanguage,
     LiteralTerminal,
     NamedTerminal,
-    RepresentabilityStatus,
     ToolMultiplicity,
     ToolWireCompileError,
     ToolWireSpec,
@@ -70,24 +69,16 @@ def test_static_spec_is_request_neutral_and_fingerprint_is_deterministic() -> No
     assert raw_close.forms[1].native_token_ids == (501,)
 
 
-def test_raw_codec_normalization_and_json_string_probe_are_explicit_not_generic() -> None:
-    exact = ValueCodecKind.RAW_STRING
-    native = ValueCodecKind.RAW_STRING_STRIP_JSON_STRING_OR_TEXT
+def test_raw_codec_uses_only_direct_native_spelling() -> None:
+    codec = ValueCodecKind.RAW_STRING
     close = CloseLanguage((LiteralTerminal("</parameter>"),))
-    framing = ValueFraming(ValueFramingKind.RAW_UNTIL, native, close)
+    framing = ValueFraming(ValueFramingKind.RAW_UNTIL, codec, close)
 
-    assert exact.decode_raw_payload("\nvalue\n") == "\nvalue\n"
-    assert native.decode_raw_payload("\nvalue\n") == "value"
-    assert native.decode_raw_payload('"value"') == "value"
-    assert native.decode_raw_payload('"a\\nb"') == "a\nb"
-    assert native.decode_raw_payload("true") == "true"
-    assert native.decode_raw_payload("line1\nline2") == "line1\nline2"
-    assert exact.is_losslessly_representable_raw_value(" leading ")
-    assert not native.is_losslessly_representable_raw_value(" leading ")
-    assert encode_lossless_raw_string(" leading ", framing) == '" leading "'
-    safe_close = encode_lossless_raw_string("x</parameter>y", framing)
-    assert safe_close == '"x\\u003c/parameter>y"'
-    assert native.decode_raw_payload(safe_close) == "x</parameter>y"
+    assert codec.decode_raw_payload("\nvalue\n") == "\nvalue\n"
+    assert codec.decode_raw_payload('"value"') == '"value"'
+    assert codec.is_losslessly_representable_raw_value(" leading ")
+    assert encode_lossless_raw_string(" leading ", framing) == " leading "
+    assert encode_lossless_raw_string("x</parameter>y", framing) is None
 
 
 def test_raw_until_requires_forbidden_close_language_to_exactly_cover_accepted_closes() -> None:
@@ -127,7 +118,7 @@ def test_compiler_requires_explicit_presentation_order_not_canonical_schema_orde
         "file_path",
         "content",
     )
-    assert plan.presentation_orders == (("write", ("file_path", "content")),)
+    assert plan.tool("write").order_plan.orders[0] == ("file_path", "content")
 
     with pytest.raises(ToolWireCompileError, match="presentation order evidence"):
         schema_plan(raw_spec(), policy(write), {})
@@ -143,10 +134,9 @@ def test_raw_enum_intersects_every_close_alias_and_keeps_schema_guarantee() -> N
 
     branch = schema_plan(raw_spec(), policy(choose), {"choose": ("value",)}).tool("choose")
     argument = branch.arguments[0]
-    assert argument.representability is RepresentabilityStatus.REPRESENTABLE
     assert argument.generated is True
-    assert argument.admitted_values_json == ('"safe"',)
-    assert argument.proof.guarantee is GenerationGuarantee.SCHEMA
+    assert argument.admitted_wire_payloads == ("safe",)
+    assert argument.guarantee is GenerationGuarantee.SCHEMA
     assert branch.guarantee is GenerationGuarantee.SCHEMA
 
 
@@ -160,8 +150,8 @@ def test_raw_const_collision_makes_required_strict_branch_unrepresentable() -> N
     )
 
     branch = schema_plan(raw_spec(), policy(write), {"write": ("content",)}).tool("write")
-    assert branch.arguments[0].representability is RepresentabilityStatus.EMPTY
     assert branch.arguments[0].generated is False
+    assert branch.arguments[0].guarantee is GenerationGuarantee.NONE
     assert branch.representable is False
     assert branch.guarantee is GenerationGuarantee.NONE
 
@@ -221,7 +211,7 @@ def test_wire_required_optional_cannot_be_silently_narrowed_away() -> None:
     assert branch.guarantee is GenerationGuarantee.NONE
 
 
-def test_object_schema_capability_caps_tool_guarantee_and_plan_identity() -> None:
+def test_object_schema_capability_caps_tool_guarantee() -> None:
     fn = tool(
         "write",
         '{"type":"object","properties":{"content":{"type":"string"}},'
@@ -244,9 +234,7 @@ def test_object_schema_capability_caps_tool_guarantee_and_plan_identity() -> Non
     )
     weak_branch = weak_plan.tool("write")
 
-    assert full_plan.fingerprint != weak_plan.fingerprint
-    assert weak_branch.object_schema_safe is False
-    assert "additionalProperties" in weak_branch.object_schema_detail
+    assert full_plan.tool("write").guarantee is GenerationGuarantee.SCHEMA
     assert weak_branch.guarantee is GenerationGuarantee.FORMAT
     assert weak_branch.representable is False
 
@@ -261,8 +249,6 @@ def test_unsupported_object_semantics_cannot_be_misreported_as_schema() -> None:
 
     branch = schema_plan(raw_spec(), policy(fn), {"write": ("content",)}).tool("write")
 
-    assert branch.object_schema_safe is False
-    assert "minProperties" in branch.object_schema_detail
     assert branch.guarantee is GenerationGuarantee.FORMAT
     assert branch.representable is False
 
@@ -279,9 +265,9 @@ def test_raw_const_and_enum_are_intersected_before_schema_guarantee() -> None:
     branch = schema_plan(raw_spec(), policy(fn), {"choose": ("value",)}).tool("choose")
     argument = branch.arguments[0]
 
-    assert argument.representability is RepresentabilityStatus.EMPTY
-    assert argument.admitted_values_json == ()
     assert argument.generated is False
+    assert argument.admitted_wire_payloads is None
+    assert argument.guarantee is GenerationGuarantee.NONE
     assert branch.guarantee is GenerationGuarantee.NONE
     assert branch.representable is False
 
@@ -302,9 +288,8 @@ def test_structured_schema_capability_is_recursive_not_top_level_only() -> None:
     ).tool("store")
     argument = branch.arguments[0]
 
-    assert argument.proof.schema_safe is False
-    assert "pattern" in argument.proof.detail
     assert argument.generated is False
+    assert argument.guarantee is GenerationGuarantee.NONE
     assert branch.guarantee is GenerationGuarantee.NONE
     assert branch.representable is False
 
@@ -314,7 +299,7 @@ def test_structured_schema_capability_is_recursive_not_top_level_only() -> None:
     (
         (0, 1000, 1, False),
         (1, 1000, 1, False),
-        (6, 1000, 720, False),
+        (6, 1000, None, True),
         (7, 1000, None, True),
         (20, 1000, None, True),
     ),
@@ -352,7 +337,7 @@ def test_permutation_budget_is_bounded_and_truthful(
         assert order_plan.orders == (order,)
 
 
-def test_many_optional_parameters_narrow_to_stable_required_subset_without_enumeration() -> None:
+def test_many_optional_parameters_remain_available_without_enumeration() -> None:
     optional_count = 30
     property_parts = ['"required":{"type":"string"}']
     property_parts.extend(f'"o{i}":{{"type":"string"}}' for i in range(optional_count))
@@ -372,7 +357,10 @@ def test_many_optional_parameters_narrow_to_stable_required_subset_without_enume
 
     assert branch.order_plan.narrowed is True
     assert branch.order_plan.full_order_count is None
-    assert branch.order_plan.orders == (("required",),)
+    assert branch.order_plan.orders == (order,)
+    assert branch.order_plan.accepts(("required",))
+    assert branch.order_plan.accepts(("required", "o29"))
+    assert len(branch.order_plan.optional_names) == optional_count
     assert branch.guarantee is GenerationGuarantee.SCHEMA
 
 
@@ -395,7 +383,7 @@ def test_same_contract_compiler_handles_structured_json_value_framing() -> None:
     assert all(argument.generated for argument in branch.arguments)
 
 
-def test_same_inputs_have_stable_plan_fingerprint_and_off_mode_cannot_claim_activation() -> None:
+def test_same_inputs_are_stable_and_off_mode_cannot_claim_activation() -> None:
     fn = tool(
         "read",
         '{"type":"object","properties":{"path":{"type":"string"}},'
@@ -405,7 +393,6 @@ def test_same_inputs_have_stable_plan_fingerprint_and_off_mode_cannot_claim_acti
     first = schema_plan(spec, policy(fn), {"read": ("path",)})
     second = schema_plan(spec, policy(fn), {"read": ("path",)})
     assert first == second
-    assert first.fingerprint == second.fingerprint
 
     with pytest.raises(ToolWireCompileError, match="OFF Tool-wire plans"):
         compile_tool_wire_plan(
@@ -415,6 +402,5 @@ def test_same_inputs_have_stable_plan_fingerprint_and_off_mode_cannot_claim_acti
             compiler_capabilities=raw_compiler_capabilities(),
             presentation_orders={"read": ("path",)},
             budget=budget(),
-            parser_branch_id="off",
             constraint_fingerprint="must-not-be-here",
         )

@@ -34,6 +34,7 @@ from exqserve.core.usage import TokenUsage
 from exqserve.model.contracts import (
     CompiledPrompt,
     NativeTokenProvenanceError,
+    ParserCreationContext,
     ParserTerminalIssue,
     TemplateRequest,
     ToolConstraintGuarantee,
@@ -55,6 +56,7 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
     RuntimeTiming,
 )
+from exqserve.server.qwen_parser_binding import resolve_qwen_parser_context
 from exqserve.serving.contracts import ServingRequest
 from exqserve.serving.engine import ServingEngine, ServingSession
 from exqserve.serving.terminal import (
@@ -185,6 +187,36 @@ def _request(
         policy,
         max_output_tokens=32,
         structured_output=structured,
+    )
+
+
+def _qwen_parser_factory(
+    request_id: str,
+    reasoning: ReasoningPolicy,
+    tool_policy: ToolPolicy,
+    context: ParserCreationContext | None,
+) -> QwenIncrementalParser:
+    del reasoning
+    return QwenIncrementalParser(
+        request_id,
+        start_in_reasoning=False,
+        tool_policy=tool_policy,
+        parser_context=context,
+    )
+
+
+def _qwen_reasoning_parser_factory(
+    request_id: str,
+    reasoning: ReasoningPolicy,
+    tool_policy: ToolPolicy,
+    context: ParserCreationContext | None,
+) -> QwenIncrementalParser:
+    del reasoning
+    return QwenIncrementalParser(
+        request_id,
+        start_in_reasoning=True,
+        tool_policy=tool_policy,
+        parser_context=context,
     )
 
 
@@ -441,7 +473,7 @@ def test_completed_model_tool_validation_allowlist_gets_recovery_cause_without_c
 
 
 @pytest.mark.parametrize("arguments_json", ('{"id":', '{"id":1,"id":2}', '[]'))
-def test_format_constraint_classifies_structure_level_violation_as_constraint_integrity(
+def test_pre_activation_format_constraint_does_not_claim_constraint_integrity(
     arguments_json: str,
 ) -> None:
     async def scenario() -> None:
@@ -450,7 +482,7 @@ def test_format_constraint_classifies_structure_level_violation_as_constraint_in
             constraint=_constraint(("lookup", ToolConstraintGuarantee.FORMAT)),
         )
         assert error.code == "tool_call_invalid"
-        assert error.cause is FailureCause.CONSTRAINT_FAILURE
+        assert error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
 
     asyncio.run(scenario())
 
@@ -466,13 +498,13 @@ def test_format_constraint_allows_schema_failure_model_output_recovery() -> None
     asyncio.run(scenario())
 
 
-def test_schema_constraint_classifies_schema_failure_as_constraint_integrity() -> None:
+def test_pre_activation_schema_constraint_does_not_claim_constraint_integrity() -> None:
     async def scenario() -> None:
         error = await _completed_call_failure(
             '{"id":"bad"}',
             constraint=_constraint(("lookup", ToolConstraintGuarantee.SCHEMA)),
         )
-        assert error.cause is FailureCause.CONSTRAINT_FAILURE
+        assert error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
 
     asyncio.run(scenario())
 
@@ -483,7 +515,7 @@ def test_unknown_legacy_constraint_metadata_fails_closed_for_model_output_recove
             '{"id":"bad"}',
             constraint=ToolGenerationConstraint("<tool>", 'start: "ok"', True),
         )
-        assert error.cause is None
+        assert error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
 
     asyncio.run(scenario())
 
@@ -514,7 +546,7 @@ def test_actual_completed_branch_controls_mixed_constraint_recovery() -> None:
             policy=policy,
         )
         assert loose_error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
-        assert strict_error.cause is FailureCause.CONSTRAINT_FAILURE
+        assert strict_error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
 
     asyncio.run(scenario())
 
@@ -1100,6 +1132,113 @@ def test_atomic_constrained_parallel_incomplete_call_discards_entire_batch() -> 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("policy", "wire"),
+    (
+        (
+            ToolPolicy((_tool("foo"),), ToolChoice(ToolChoiceMode.NONE), allow_parallel=True),
+            "<tool_call><function=foo><parameter=id>1</parameter></function></tool_call>",
+        ),
+        (
+            ToolPolicy((_tool("foo"),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True),
+            "<tool_call><function=bogus><parameter=id>1</parameter></function></tool_call>",
+        ),
+        (
+            ToolPolicy(
+                (_tool("foo"), _tool("bar")),
+                ToolChoice(ToolChoiceMode.NAMED, "foo"),
+                allow_parallel=True,
+            ),
+            "<tool_call><function=bar><parameter=id>1</parameter></function></tool_call>",
+        ),
+    ),
+)
+def test_qwen_validation_only_complete_policy_invalid_tool_reaches_policy_validator(
+    policy: ToolPolicy,
+    wire: str,
+) -> None:
+    async def scenario() -> None:
+        controlled = _Controlled(
+            [RuntimeStarted("req"), RuntimeTextDelta("req", wire), _finished()]
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_parser_factory,
+            _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_policy_violation"
+
+    asyncio.run(scenario())
+
+
+def test_qwen_validation_only_complete_missing_required_tool_reaches_schema_validation() -> None:
+    async def scenario() -> None:
+        tool = FunctionTool(
+            "write",
+            None,
+            JsonSchema(
+                '{"type":"object","properties":{'
+                '"content":{"type":"string"},"file_path":{"type":"string"}},'
+                '"required":["content","file_path"],"additionalProperties":false}'
+            ),
+            strict=False,
+        )
+        policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+        wire = "<tool_call><function=write><parameter=content>a</parameter></function></tool_call>"
+        controlled = _Controlled(
+            [RuntimeStarted("req"), RuntimeTextDelta("req", wire), _finished()]
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_parser_factory,
+            _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert not any(isinstance(event, ToolCallCompleted) for event in events)
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.code == "tool_call_invalid"
+
+    asyncio.run(scenario())
+
+
+def test_qwen_validation_only_over_hint_cap_string_tool_stays_valid_at_serving_boundary() -> None:
+    async def scenario() -> None:
+        schema = JsonSchema(
+            '{"type":"object","properties":{"x":{"type":"string"}},'
+            '"required":["x"],"additionalProperties":false}'
+        )
+        tools = tuple(FunctionTool(f"f{index}", None, schema, strict=False) for index in range(256))
+        policy = ToolPolicy(tools, ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        wire = "<tool_call><function=f128><parameter=x>true</parameter></function></tool_call>"
+        controlled = _Controlled(
+            [RuntimeStarted("req"), RuntimeTextDelta("req", wire), _finished()]
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            _qwen_parser_factory,
+            _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+        completed = [event.call for event in events if isinstance(event, ToolCallCompleted)]
+
+        assert [(call.name, call.arguments_json) for call in completed] == [("f128", '{"x":"true"}')]
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+
+    asyncio.run(scenario())
+
+
 def test_qwen_dsh_raw_parameter_collision_completes_at_serving_boundary() -> None:
     async def scenario() -> None:
         bash_tool = FunctionTool(
@@ -1131,12 +1270,9 @@ def test_qwen_dsh_raw_parameter_collision_completes_at_serving_boundary() -> Non
         )
         session = await ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
-                request_id,
-                start_in_reasoning=False,
-                tool_policy=tool_policy,
-            ),
+            _qwen_parser_factory,
             _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
         ).submit(_request(policy))
 
         events = [event async for event in session]
@@ -1172,12 +1308,9 @@ def test_qwen_ambiguous_full_close_never_publishes_shortened_executable_call() -
         )
         session = await ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
-                request_id,
-                start_in_reasoning=False,
-                tool_policy=tool_policy,
-            ),
+            _qwen_parser_factory,
             _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
         ).submit(_request(policy))
 
         events = [event async for event in session]
@@ -1218,12 +1351,9 @@ def test_qwen_semantic_hold_limit_is_early_terminal_and_preserves_safe_prefix() 
         policy = ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         session = await ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
-                request_id,
-                start_in_reasoning=True,
-                tool_policy=tool_policy,
-            ),
+            _qwen_reasoning_parser_factory,
             _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
         ).submit(_request(policy))
 
         events = [event async for event in session]
@@ -1265,12 +1395,9 @@ def test_qwen_unresolved_boundary_maps_runtime_finish_reason_without_silent_succ
         policy = ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         session = await ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
-                request_id,
-                start_in_reasoning=True,
-                tool_policy=tool_policy,
-            ),
+            _qwen_reasoning_parser_factory,
             _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
         ).submit(_request(policy))
         events = [event async for event in session]
         assert not any(isinstance(event, ToolCallCompleted) for event in events)
@@ -1311,12 +1438,9 @@ def test_qwen_cleanup_ambiguity_does_not_override_runtime_failure() -> None:
         policy = ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         session = await ServingEngine(
             _Compiler(),
-            lambda request_id, reasoning, tool_policy: QwenIncrementalParser(
-                request_id,
-                start_in_reasoning=True,
-                tool_policy=tool_policy,
-            ),
+            _qwen_reasoning_parser_factory,
             _Controller(controlled),
+            parser_context_factory=resolve_qwen_parser_context,
         ).submit(_request(policy))
 
         events = [event async for event in session]
@@ -1828,6 +1952,53 @@ def test_installed_but_unactivated_tool_constraint_does_not_claim_constraint_fai
     asyncio.run(scenario())
 
 
+def test_validation_only_completed_tool_survives_later_length_stop() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(strict=False),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        call = ToolCallItem("call-1", "lookup", '{"id":7}', 0)
+        parser = _ScriptedParser(
+            (
+                ToolCallStarted("req", "call-1", "lookup", 0),
+                ToolCallArgumentsDelta("req", "call-1", '{"id":7}', 0),
+                ToolCallCompleted("req", call),
+                TextDelta("req", " trailing text"),
+            )
+        )
+        length_finished = RuntimeFinished(
+            "req",
+            RuntimeStopReason.LENGTH,
+            TokenUsage(input_tokens=2, output_tokens=32),
+            RuntimeTiming(),
+            hard_constraint_installed=False,
+            hard_constraint_activated=False,
+        )
+        controlled = _Controlled([RuntimeTextDelta("req", "raw"), length_finished])
+        constraint = ToolGenerationConstraint(
+            "<tool>",
+            'start: "ok"',
+            True,
+            decode_authority=object(),
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            lambda tool_policy: constraint,
+        ).submit(_request(policy))
+
+        events = [event async for event in session]
+
+        assert ToolCallCompleted("req", call) in events
+        assert isinstance(events[-1], GenerationCompleted)
+        assert events[-1].reason is CompletionReason.TOOL_CALLS
+        assert not any(
+            isinstance(event, GenerationFailed) and event.error.code == "tool_call_incomplete"
+            for event in events
+        )
+
+    asyncio.run(scenario())
+
+
 def test_constrained_length_limited_incomplete_tool_reports_output_limit_cause() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
@@ -2128,7 +2299,7 @@ def test_b1_length_semantic_failure_preserves_underlying_runtime_reason() -> Non
     asyncio.run(scenario())
 
 
-def test_b1_tool_schema_constraint_contradiction_has_constraint_integrity_owner() -> None:
+def test_b1_pre_activation_tool_schema_failure_has_semantic_owner() -> None:
     async def scenario() -> None:
         policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
         constraint = _constraint(("lookup", ToolConstraintGuarantee.SCHEMA))
@@ -2149,6 +2320,47 @@ def test_b1_tool_schema_constraint_contradiction_has_constraint_integrity_owner(
         ).submit(_request(policy))
 
         await session._process_runtime(RuntimeTextDelta("req", "raw"))
+        events = [event async for event in session]
+
+        assert isinstance(events[-1], GenerationFailed)
+        assert events[-1].error.cause is FailureCause.MODEL_TOOL_OUTPUT_INVALID
+        assert session.terminal_decision is not None
+        assert session.terminal_decision.primary_owner is TerminalPrimaryOwner.SEMANTIC_CONTRACT
+
+    asyncio.run(scenario())
+
+
+def test_b1_activated_tool_schema_failure_has_constraint_integrity_owner() -> None:
+    async def scenario() -> None:
+        policy = ToolPolicy((_tool(),), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
+        constraint = _constraint(("lookup", ToolConstraintGuarantee.SCHEMA))
+        call = ToolCallItem("call-1", "lookup", '{"id":"bad"}', 0)
+        parser = _ScriptedParser(
+            (),
+            _Finish(
+                (
+                    ToolCallStarted("req", "call-1", "lookup", 0),
+                    ToolCallArgumentsDelta("req", "call-1", '{"id":"bad"}', 0),
+                    ToolCallCompleted("req", call),
+                )
+            ),
+        )
+        controlled = _Controlled(
+            [
+                _finished(
+                    hard_constraint_installed=True,
+                    hard_constraint_activated=True,
+                    effective_generation_guarantee=GenerationGuarantee.SCHEMA,
+                )
+            ]
+        )
+        session = await ServingEngine(
+            _Compiler(),
+            lambda request_id, reasoning, tool_policy: parser,
+            _Controller(controlled),
+            lambda tool_policy: constraint,
+        ).submit(_request(policy))
+
         events = [event async for event in session]
 
         assert isinstance(events[-1], GenerationFailed)

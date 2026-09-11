@@ -3,7 +3,7 @@ from __future__ import annotations
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
 from exqserve.model.contracts import ToolConstraintMode
-from exqserve.tool_wire import (
+from tests.tool_wire._legacy_api import (
     ActivationTriggerSpec,
     ArgumentFramingSelector,
     ArgumentFramingSelectorRule,
@@ -173,7 +173,6 @@ def schema_plan(
         compiler_capabilities=compiler_capabilities,
         presentation_orders=presentation_orders,
         budget=budget() if compile_budget is None else compile_budget,
-        parser_branch_id="synthetic-constrained-branch",
         constraint_fingerprint="constraint-v1",
         activation_trigger_ids=("tool-open",),
     )

@@ -245,18 +245,28 @@ def test_tool_calling_true_without_provider_still_fails_closed(tmp_path: Path) -
     assert snapshot.strict_tool_generation_available is False
 
 
-def test_builtin_qwen_tool_capability_remains_available(tmp_path: Path) -> None:
+def test_builtin_qwen_tool_capability_requires_composition_provider_fact(tmp_path: Path) -> None:
     runtime = SimpleNamespace(
         capabilities=ExLlamaV3Runtime.capabilities,
         model_metadata=RuntimeModelMetadata(65536, "Qwen3_5ForConditionalGeneration"),
         vision_loaded=False,
     )
+    dialect = QwenDialect()
 
-    snapshot = resolve_effective_model_snapshot(ServerConfig(tmp_path), QwenDialect(), runtime)
+    unbound = resolve_effective_model_snapshot(ServerConfig(tmp_path), dialect, runtime)
+    bound = resolve_effective_model_snapshot(
+        ServerConfig(tmp_path),
+        dialect,
+        runtime,
+        tool_constraint_provider_available=True,
+        strict_tool_constraint_provider_available=True,
+    )
 
-    assert snapshot.dialect_capabilities.tool_calling is True
-    assert snapshot.tool_generation_available is True
-    assert snapshot.strict_tool_generation_available is True
+    assert unbound.dialect_capabilities.tool_calling is True
+    assert unbound.tool_generation_available is False
+    assert unbound.strict_tool_generation_available is False
+    assert bound.tool_generation_available is True
+    assert bound.strict_tool_generation_available is True
 
 
 def test_unsupported_image_is_rejected_before_backend_compiler(tmp_path: Path) -> None:

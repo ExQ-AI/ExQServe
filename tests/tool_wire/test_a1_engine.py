@@ -6,7 +6,8 @@ from dataclasses import replace
 
 import pytest
 
-from exqserve.tool_wire import (
+from tests.tool_wire._deepseek_fixture import deepseek_v4_structured_dsml_spec
+from tests.tool_wire._legacy_api import (
     ArgumentOrderingMode,
     CloseLanguage,
     DeterministicToolWireEngine,
@@ -15,7 +16,6 @@ from exqserve.tool_wire import (
     WireToolSequence,
     admit_tool_sequence,
 )
-from exqserve.tool_wire.controls.deepseek_v4 import deepseek_v4_structured_dsml_spec
 from tests.tool_wire._support import policy, schema_plan, tool
 
 
@@ -276,7 +276,7 @@ def test_a1_deepseek_static_function_name_language_rejects_invalid_names(
     bad_tool = tool(bad_name, json.dumps(schema, separators=(",", ":")), strict=True)
     bad_plan = schema_plan(spec, policy(bad_tool), {bad_name: ("value",)})
     assert not bad_plan.constrained_executable
-    assert not bad_plan.tool(bad_name).name_representable
+    assert not bad_plan.tool(bad_name).representable
 
     _, plan = _plan({"value": {"type": "integer"}})
     wire = _wire(spec, plan, ((bad_name, (("value", "1"),)),))

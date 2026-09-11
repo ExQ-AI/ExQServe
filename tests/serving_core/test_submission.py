@@ -759,7 +759,7 @@ def test_tool_constraint_descriptor_is_forwarded_to_runtime_request() -> None:
 
 
 
-def test_mixed_tool_constraint_reports_runtime_unknown_and_preserves_strict_fail_closed() -> None:
+def test_mixed_tool_constraint_reports_runtime_format_and_preserves_strict_fail_closed() -> None:
     async def scenario() -> None:
         controller = _Controller()
         policy = ToolPolicy(
@@ -797,7 +797,7 @@ def test_mixed_tool_constraint_reports_runtime_unknown_and_preserves_strict_fail
         await engine.submit(request)
 
         runtime_request = controller.requests[0]
-        assert runtime_request.generation_guarantee is GenerationGuarantee.UNKNOWN
+        assert runtime_request.generation_guarantee is GenerationGuarantee.FORMAT
         assert runtime_request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
 
     asyncio.run(scenario())

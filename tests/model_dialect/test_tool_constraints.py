@@ -4,6 +4,7 @@ import pytest
 
 from exqserve.agent.schema import JsonSchema
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.model import tool_constraints
 from exqserve.model.contracts import (
     ToolConstraintGuarantee,
     ToolConstraintMode,
@@ -11,8 +12,14 @@ from exqserve.model.contracts import (
     ToolGenerationConstraint,
 )
 from exqserve.model.gemma4 import gemma4_tool_constraint
-from exqserve.model.qwen import qwen_tool_constraint
-from exqserve.model.tool_constraints import qwen_parameter_schema
+from exqserve.model.tool_constraints import (
+    qwen_parameter_schema,
+    qwen_property_schema,
+    qwen_property_schema_type,
+)
+from exqserve.tool_wire.controls.qwen import (
+    qwen_production_tool_constraint as qwen_tool_constraint,
+)
 
 
 def _tool(name: str, schema: str, *, strict: bool = False) -> FunctionTool:
@@ -81,18 +88,19 @@ def test_qwen_schema_constraint_uses_native_parameter_envelope_when_sound() -> N
     assert constraint.trigger == "<tool_call>"
     assert constraint.eos_after_completed is True
     assert '"<function=save>"' in constraint.lark_grammar
-    assert '"<parameter=command>"' in constraint.lark_grammar
-    assert '"<parameter=count>"' in constraint.lark_grammar
-    assert '"<parameter=mode>"' in constraint.lark_grammar
+    assert '"<parameter=command>\\n"' in constraint.lark_grammar
+    assert '"<parameter=count>\\n"' in constraint.lark_grammar
+    assert '"<parameter=mode>\\n"' in constraint.lark_grammar
     assert '"minimum":1' in constraint.lark_grammar
     assert 'qwen_raw_string[suffix="</parameter>"]' not in constraint.lark_grammar
-    assert '("check" | "run")' in constraint.lark_grammar
-    assert '("fast" | "safe")' in constraint.lark_grammar
-    assert '"stable"' in constraint.lark_grammar
+    assert '"check\\n</parameter>\\n"' in constraint.lark_grammar
+    assert '"run\\n</parameter>\\n"' in constraint.lark_grammar
+    assert '"fast\\n</parameter>\\n"' in constraint.lark_grammar
+    assert '"safe\\n</parameter>\\n"' in constraint.lark_grammar
+    assert '"stable\\n</parameter>\\n"' in constraint.lark_grammar
     assert "%json" in constraint.lark_grammar
-    assert "function_0_parameter_3" in constraint.lark_grammar
-    assert "start: WS? function WS? </tool_call>" in constraint.lark_grammar
-    assert '"</tool_call>"' not in constraint.lark_grammar
+    assert "function_0_argument_" in constraint.lark_grammar
+    assert 'start: WS? function WS? "</tool_call>"' in constraint.lark_grammar
     assert "<tool_call> WS? function" not in constraint.lark_grammar
     assert constraint.guarantee_for_tool("save") is ToolConstraintGuarantee.SCHEMA
 
@@ -108,57 +116,65 @@ def test_qwen_constraint_bounds_structural_whitespace() -> None:
     assert "WS: /[ \\t\\r\\n]+/" not in constraint.lark_grammar
 
 
-def test_qwen_schema_constraint_falls_back_request_wide_for_unrestricted_raw_strings() -> None:
+def test_qwen_schema_constraint_supports_prevention_first_raw_strings() -> None:
     write_schema = (
         '{"type":"object","properties":{'
         '"content":{"type":"string"},"file_path":{"type":"string"}'
         '},"required":["content","file_path"],"additionalProperties":false}'
     )
 
-    assert (
-        qwen_tool_constraint(
-            _policy(_tool("write", write_schema), parallel=False),
-            ToolConstraintMode.SCHEMA,
-        )
-        is None
+    constraint = qwen_tool_constraint(
+        _policy(_tool("write", write_schema), parallel=False),
+        ToolConstraintMode.SCHEMA,
     )
+    assert constraint is not None
+    assert constraint.guarantee_for_tool("write") is ToolConstraintGuarantee.SCHEMA
+    assert '"<parameter=content>\\n"' in constraint.lark_grammar
+    assert '"<parameter=file_path>\\n"' in constraint.lark_grammar
 
 
-def test_qwen_strict_raw_string_schema_is_unsupported() -> None:
-    with pytest.raises(ToolConstraintUnsupported, match="unrestricted raw string"):
-        qwen_tool_constraint(
-            _policy(_tool("write", _qwen_schema(), strict=True), parallel=False),
-            ToolConstraintMode.SCHEMA,
-        )
+def test_qwen_strict_raw_string_schema_uses_tool_wire_schema_guarantee() -> None:
+    constraint = qwen_tool_constraint(
+        _policy(_tool("write", _qwen_schema(), strict=True), parallel=False),
+        ToolConstraintMode.SCHEMA,
+    )
+    assert constraint is not None
+    assert constraint.guarantee_for_tool("write") is ToolConstraintGuarantee.SCHEMA
 
 
-def test_qwen_mixed_sound_and_raw_string_tools_fall_back_request_wide() -> None:
+def test_qwen_mixed_sound_and_raw_string_tools_share_tool_wire_schema_authority() -> None:
     safe_schema = (
         '{"type":"object","properties":{"count":{"type":"integer"}},'
         '"required":["count"],"additionalProperties":false}'
     )
-    assert (
-        qwen_tool_constraint(
-            _policy(
-                _tool("safe", safe_schema),
-                _tool("write", _qwen_schema()),
-                parallel=True,
-            ),
-            ToolConstraintMode.SCHEMA,
-        )
-        is None
+    constraint = qwen_tool_constraint(
+        _policy(
+            _tool("safe", safe_schema),
+            _tool("write", _qwen_schema()),
+            parallel=True,
+        ),
+        ToolConstraintMode.SCHEMA,
     )
+    assert constraint is not None
+    assert constraint.guarantee_for_tool("safe") is ToolConstraintGuarantee.SCHEMA
+    assert constraint.guarantee_for_tool("write") is ToolConstraintGuarantee.SCHEMA
 
 
-def test_qwen_schema_mode_rejects_unrepresentable_native_string_keywords() -> None:
+def test_qwen_schema_mode_validation_only_fallback_for_unsupported_non_strict_branch() -> None:
     schema = (
         '{"type":"object","properties":{'
         '"command":{"type":"string","pattern":"^git .+$"}'
         '},"required":["command"]}'
     )
 
-    with pytest.raises(ToolConstraintUnsupported, match="pattern"):
-        qwen_tool_constraint(_policy(_tool("run", schema)), ToolConstraintMode.SCHEMA)
+    constraint = qwen_tool_constraint(_policy(_tool("run", schema)), ToolConstraintMode.SCHEMA)
+    assert constraint is not None
+    assert constraint.guarantee_for_tool("run") is ToolConstraintGuarantee.FORMAT
+    with pytest.raises(ToolConstraintUnsupported):
+        qwen_tool_constraint(
+            _policy(_tool("run", schema, strict=True)),
+            ToolConstraintMode.SCHEMA,
+        )
 
 
 def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> None:
@@ -170,11 +186,10 @@ def test_qwen_format_constraint_limits_tool_name_but_not_parameter_schema() -> N
     assert constraint is not None
     assert constraint.eos_after_completed is True
     assert '"<function=lookup>"' in constraint.lark_grammar
-    assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' in constraint.lark_grammar
-    assert "start: WS? function WS? </tool_call>" in constraint.lark_grammar
-    assert '"<tool_call>"' not in constraint.lark_grammar
-    assert '"</tool_call>"' not in constraint.lark_grammar
-    assert "%json" not in constraint.lark_grammar
+    assert '"<parameter=count>\\n"' in constraint.lark_grammar
+    assert '"<parameter=mode>\\n"' in constraint.lark_grammar
+    assert '"<parameter=tags>\\n"' in constraint.lark_grammar
+    assert 'start: WS? function WS? "</tool_call>"' in constraint.lark_grammar
     assert constraint.guarantee_for_tool("lookup") is ToolConstraintGuarantee.FORMAT
 
 
@@ -189,8 +204,8 @@ def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
 
     assert constraint is not None
     assert (
-        "start: WS? function WS? </tool_call> "
-        "(WS? <tool_call> WS? function WS? </tool_call>)*"
+        'start: WS? function WS? "</tool_call>" '
+        '(WS? "<tool_call>" WS? function WS? "</tool_call>"){0,7}'
     ) in constraint.lark_grammar
 
     strict_constraint = qwen_tool_constraint(
@@ -198,7 +213,7 @@ def test_qwen_constrained_parallel_restores_native_one_to_many_grammar(
         ToolConstraintMode.OFF,
     )
     assert strict_constraint is not None
-    assert '"<parameter=count>"' in strict_constraint.lark_grammar
+    assert '"<parameter=count>\\n"' in strict_constraint.lark_grammar
 
     assert (
         qwen_tool_constraint(
@@ -216,7 +231,7 @@ def test_qwen_strict_tool_escalates_off_baseline_to_schema() -> None:
     )
 
     assert constraint is not None
-    assert '"<parameter=count>"' in constraint.lark_grammar
+    assert '"<parameter=count>\\n"' in constraint.lark_grammar
     assert '"minimum":1' in constraint.lark_grammar
     assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' not in constraint.lark_grammar
 
@@ -241,10 +256,9 @@ def test_qwen_mixed_strict_and_non_strict_tools_keep_distinct_branches() -> None
 
     assert constraint is not None
     assert '"<function=strict_tool>"' in constraint.lark_grammar
-    assert '"<parameter=strict_value>"' in constraint.lark_grammar
+    assert '"<parameter=strict_value>\\n"' in constraint.lark_grammar
     assert '"<function=loose_tool>"' in constraint.lark_grammar
-    assert 'parameter: "<parameter=" NAME ">" value "</parameter>" WS?' in constraint.lark_grammar
-    assert '"<parameter=loose_value>"' not in constraint.lark_grammar
+    assert '"<parameter=loose_value>\\n"' in constraint.lark_grammar
     assert constraint.guarantee_for_tool("strict_tool") is ToolConstraintGuarantee.SCHEMA
     assert constraint.guarantee_for_tool("loose_tool") is ToolConstraintGuarantee.FORMAT
 
@@ -354,9 +368,9 @@ def test_none_choice_and_off_mode_do_not_create_filter() -> None:
     assert gemma4_tool_constraint(auto_policy, ToolConstraintMode.OFF) is None
 
 
-def test_qwen_schema_mode_supports_root_defs_for_property_refs() -> None:
+def test_qwen_schema_mode_supports_simple_root_defs_for_property_refs() -> None:
     schema = (
-        '{"$defs":{"item":{"type":"string","pattern":"^[A-Z]+$"}},'
+        '{"$defs":{"item":{"type":"string"}},'
         '"type":"object","properties":{"value":{"$ref":"#/$defs/item"}},'
         '"required":["value"]}'
     )
@@ -366,8 +380,100 @@ def test_qwen_schema_mode_supports_root_defs_for_property_refs() -> None:
     )
 
     assert constraint is not None
-    assert '"$ref":"#/$defs/item"' in constraint.lark_grammar
-    assert '"$defs":{"item":{"pattern":"^[A-Z]+$","type":"string"}}' in constraint.lark_grammar
+    assert '"<parameter=value>\\n"' in constraint.lark_grammar
+    assert constraint.guarantee_for_tool("save") is ToolConstraintGuarantee.SCHEMA
+
+
+def test_qwen_property_schema_does_not_copy_unrelated_root_defs() -> None:
+    property_schema = {"type": "integer"}
+    root_schema = {
+        "$defs": {f"d{index}": {"type": "integer"} for index in range(256)},
+        "type": "object",
+        "properties": {"value": property_schema},
+    }
+
+    resolved = qwen_property_schema(root_schema, property_schema)
+
+    assert resolved is property_schema
+    assert resolved == {"type": "integer"}
+    assert "$defs" not in resolved
+
+
+def test_qwen_property_schema_resolves_chained_root_defs_without_copying_scope() -> None:
+    root_schema = {
+        "$defs": {
+            "base": {"type": "integer", "minimum": 5},
+            "alias": {"$ref": "#/$defs/base"},
+        }
+    }
+
+    resolved = qwen_property_schema(root_schema, {"$ref": "#/$defs/alias"})
+
+    assert resolved == {"type": "integer", "minimum": 5}
+    assert "$defs" not in resolved
+    assert "$ref" not in resolved
+
+
+@pytest.mark.parametrize("definitions_key", ("$defs", "definitions"))
+@pytest.mark.parametrize(
+    ("terminal_index", "expected_type"),
+    ((63, "string"), (64, "string"), (65, None)),
+)
+def test_qwen_property_schema_type_matches_generation_ref_boundary(
+    definitions_key: str,
+    terminal_index: int,
+    expected_type: str | None,
+) -> None:
+    definitions: dict[str, object] = {
+        f"d{index}": {"$ref": f"#/{definitions_key}/d{index + 1}"}
+        for index in range(terminal_index)
+    }
+    definitions[f"d{terminal_index}"] = {"type": "string"}
+    root_schema = {definitions_key: definitions}
+    property_schema = {"$ref": f"#/{definitions_key}/d0"}
+
+    assert qwen_property_schema_type(root_schema, property_schema) == expected_type
+
+
+def test_qwen_property_schema_stops_detached_expansion_at_remaining_node_limit() -> None:
+    class TrackingList(list[None]):
+        reads = 0
+
+        def __iter__(self):
+            for item in super().__iter__():
+                self.reads += 1
+                yield item
+
+    examples = TrackingList([None] * 100)
+    root_schema = {
+        "$defs": {
+            "large": {
+                "type": "integer",
+                "examples": examples,
+            }
+        }
+    }
+    context_handle = tool_constraints._QWEN_PROPERTY_RESOLUTION_NODE_LIMIT.set(12)
+    try:
+        with pytest.raises(tool_constraints._QwenPropertyResolutionNodeLimit):
+            qwen_property_schema(root_schema, {"$ref": "#/$defs/large"})
+    finally:
+        tool_constraints._QWEN_PROPERTY_RESOLUTION_NODE_LIMIT.reset(context_handle)
+
+    assert examples.reads < len(examples)
+    assert examples.reads <= 12
+
+
+def test_qwen_schema_mode_falls_back_for_unsupported_root_defs_target() -> None:
+    schema = (
+        '{"$defs":{"item":{"type":"string","pattern":"^[A-Z]+$"}},'
+        '"type":"object","properties":{"value":{"$ref":"#/$defs/item"}},'
+        '"required":["value"]}'
+    )
+
+    constraint = qwen_tool_constraint(_policy(_tool("save", schema)), ToolConstraintMode.SCHEMA)
+    assert constraint is not None
+    assert constraint.guarantee_for_tool("save") is ToolConstraintGuarantee.FORMAT
 
 
 def test_qwen_schema_mode_rejects_cross_property_top_level_assertions() -> None:
@@ -379,14 +485,28 @@ def test_qwen_schema_mode_rejects_cross_property_top_level_assertions() -> None:
         qwen_parameter_schema(schema)
 
 
-def test_qwen_schema_mode_rejects_root_ref_that_changes_meaning_when_detached() -> None:
+def test_qwen_schema_mode_can_omit_unframed_optional_nonlocal_property_ref() -> None:
     schema = (
         '{"type":"object","properties":{"value":{"anyOf":['
         '{"type":"string"},{"$ref":"#"}]}}}'
     )
 
-    with pytest.raises(ToolConstraintUnsupported, match="target \\$defs or definitions"):
-        qwen_tool_constraint(_policy(_tool("save", schema)), ToolConstraintMode.SCHEMA)
+    constraint = qwen_tool_constraint(_policy(_tool("save", schema)), ToolConstraintMode.SCHEMA)
+    assert constraint is not None
+    assert constraint.guarantee_for_tool("save") is ToolConstraintGuarantee.SCHEMA
+
+
+def test_qwen_schema_mode_formats_loose_dynamic_ref_but_strict_fails_closed() -> None:
+    schema = (
+        '{"type":"object","properties":{"value":'
+        '{"type":"string","$dynamicRef":"#node"}},"required":["value"]}'
+    )
+
+    loose = qwen_tool_constraint(_policy(_tool("save", schema)), ToolConstraintMode.SCHEMA)
+    assert loose is not None
+    assert loose.guarantee_for_tool("save") is ToolConstraintGuarantee.FORMAT
+    with pytest.raises(ToolConstraintUnsupported):
+        qwen_tool_constraint(_policy(_tool("save", schema, strict=True)), ToolConstraintMode.SCHEMA)
 
 
 def test_qwen_schema_mode_rejects_required_property_without_declared_schema() -> None:
@@ -398,17 +518,41 @@ def test_qwen_schema_mode_rejects_required_property_without_declared_schema() ->
         qwen_parameter_schema(schema)
 
 
-def test_qwen_constraint_rejects_names_that_native_tag_parser_cannot_accept() -> None:
+def test_qwen_constraint_falls_back_or_narrows_for_unrepresentable_names() -> None:
     invalid_tool = _tool("bad name", _schema())
-    invalid_parameter = _tool(
+    optional_invalid_parameter = _tool(
         "save",
         '{"type":"object","properties":{"bad name":{"type":"string"}}}',
     )
+    required_invalid_parameter = _tool(
+        "save",
+        '{"type":"object","properties":{"bad name":{"type":"string"}},'
+        '"required":["bad name"]}',
+    )
 
-    with pytest.raises(ToolConstraintUnsupported, match="tool name"):
-        qwen_tool_constraint(_policy(invalid_tool), ToolConstraintMode.FORMAT)
-    with pytest.raises(ToolConstraintUnsupported, match="parameter name"):
-        qwen_tool_constraint(_policy(invalid_parameter), ToolConstraintMode.SCHEMA)
+    assert qwen_tool_constraint(_policy(invalid_tool), ToolConstraintMode.FORMAT) is None
+    narrowed = qwen_tool_constraint(_policy(optional_invalid_parameter), ToolConstraintMode.SCHEMA)
+    assert narrowed is not None
+    assert narrowed.guarantee_for_tool("save") is ToolConstraintGuarantee.SCHEMA
+    assert "<parameter=bad name>" not in narrowed.lark_grammar
+    assert qwen_tool_constraint(_policy(required_invalid_parameter), ToolConstraintMode.SCHEMA) is None
+    with pytest.raises(ToolConstraintUnsupported):
+        qwen_tool_constraint(
+            _policy(_tool("bad name", _schema(), strict=True)),
+            ToolConstraintMode.OFF,
+        )
+    with pytest.raises(ToolConstraintUnsupported):
+        qwen_tool_constraint(
+            _policy(
+                _tool(
+                    "save",
+                    '{"type":"object","properties":{"bad name":{"type":"string"}},'
+                    '"required":["bad name"]}',
+                    strict=True,
+                )
+            ),
+            ToolConstraintMode.OFF,
+        )
 
 
 @pytest.mark.parametrize("name", ("bad name", "bad{name", "bad}name", "bad<name", "bad>name"))

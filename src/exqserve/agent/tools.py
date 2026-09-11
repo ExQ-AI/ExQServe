@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from exqserve.agent.schema import JsonSchema
@@ -55,6 +55,8 @@ class ToolPolicy:
     tools: tuple[FunctionTool, ...]
     choice: ToolChoice
     allow_parallel: bool
+    has_strict: bool = field(init=False, repr=False, compare=False)
+    _tool_index: dict[str, FunctionTool] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.tools, tuple):
@@ -66,12 +68,18 @@ class ToolPolicy:
         if not isinstance(self.allow_parallel, bool):
             raise TypeError("allow_parallel must be a bool")
 
-        names = tuple(tool.name for tool in self.tools)
-        if len(names) != len(set(names)):
+        tool_index = {tool.name: tool for tool in self.tools}
+        names = tuple(tool_index)
+        object.__setattr__(self, "has_strict", any(tool.strict for tool in self.tools))
+        if len(names) != len(self.tools):
             raise ValueError("tool names must be unique")
+        object.__setattr__(self, "_tool_index", tool_index)
 
         if self.choice.mode is ToolChoiceMode.REQUIRED and not self.tools:
             raise ValueError("REQUIRED tool choice requires at least one declared tool")
 
         if self.choice.mode is ToolChoiceMode.NAMED and self.choice.name not in names:
             raise ValueError("named tool choice must reference a declared tool")
+
+    def get_tool(self, name: str) -> FunctionTool | None:
+        return self._tool_index.get(name)

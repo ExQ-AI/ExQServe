@@ -5,8 +5,12 @@ import json
 import pytest
 
 from exqserve.model.contracts import ToolConstraintMode
-from exqserve.tool_wire import CompileBudget, PlanCompileDisposition, compile_tool_wire_plan
-from exqserve.tool_wire.controls.qwen import compile_qwen_a2a_shadow
+from tests.tool_wire._legacy_api import (
+    CompileBudget,
+    PlanCompileDisposition,
+    compile_tool_wire_plan,
+)
+from tests.tool_wire._legacy_qwen_a2a import compile_qwen_a2a_shadow
 from tests.tool_wire._support import policy, raw_compiler_capabilities, raw_spec, tool
 
 _ROOMY = CompileBudget(1000, 1_000_000, 100_000_000, 10_000_000)
@@ -28,7 +32,6 @@ def _compile_generic(fn, orders: dict[str, tuple[str, ...]]):
         compiler_capabilities=raw_compiler_capabilities(),
         presentation_orders=orders,
         budget=_ROOMY,
-        parser_branch_id="utf8-failclosed",
         constraint_fingerprint="static",
         activation_trigger_ids=("tool-open",),
     )

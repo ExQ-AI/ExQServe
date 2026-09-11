@@ -9,6 +9,7 @@ from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, Genera
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
+    ConstraintInstallation,
     ExLlamaV3LoadConfig,
     LoRAAdapterConfig,
     RuntimeCancelled,
@@ -24,6 +25,39 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
     RuntimeTiming,
 )
+
+
+def test_constraint_installation_is_immutable_submit_truth() -> None:
+    installed = ConstraintInstallation(
+        True,
+        "grammar-fingerprint",
+        (248058,),
+        GenerationGuarantee.SCHEMA,
+    )
+    uninstalled = ConstraintInstallation(False, None, (), GenerationGuarantee.NONE)
+
+    assert installed.installed is True
+    assert installed.trigger_token_ids == (248058,)
+    assert uninstalled.installed is False
+    with pytest.raises(FrozenInstanceError):
+        installed.installed = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        (True, None, (1,), GenerationGuarantee.SCHEMA),
+        (True, "fp", (1,), GenerationGuarantee.NONE),
+        (False, "fp", (), GenerationGuarantee.NONE),
+        (False, None, (1,), GenerationGuarantee.NONE),
+        (False, None, (), GenerationGuarantee.FORMAT),
+    ),
+)
+def test_constraint_installation_rejects_invented_or_contradictory_truth(
+    args: tuple[bool, str | None, tuple[int, ...], GenerationGuarantee],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ConstraintInstallation(*args)
 
 
 def test_runtime_capabilities_are_immutable_booleans() -> None:

@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import get_type_hints
 
 from exqserve.agent.reasoning import ReasoningMode, ReasoningPolicy
-from exqserve.agent.tools import ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.agent.schema import JsonSchema
+from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.core.events import ToolCallCompleted
 from exqserve.model.contracts import (
     IncrementalParserLike,
     PromptCompilerLike,
@@ -59,6 +61,26 @@ def test_default_registry_selects_specialized_qwen_architectures() -> None:
         assert dialect.dialect_id == "qwen"
         assert isinstance(dialect.create_compiler(_Adapter()), QwenPromptCompiler)
         assert isinstance(dialect.create_parser("req-1", ReasoningPolicy(), _TOOL_POLICY), QwenIncrementalParser)
+
+
+def test_direct_qwen_dialect_parser_keeps_shared_compatibility_tool_decode() -> None:
+    tool = FunctionTool(
+        "lookup",
+        None,
+        JsonSchema(
+            '{"type":"object","properties":{"id":{"type":"integer"}},'
+            '"required":["id"],"additionalProperties":false}'
+        ),
+        strict=False,
+    )
+    policy = ToolPolicy((tool,), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=False)
+    parser = QwenDialect().create_parser("req-direct", ReasoningPolicy(), policy)
+    source = "<tool_call><function=lookup><parameter=id>7</parameter></function></tool_call>"
+
+    events = [*parser.feed(source), *parser.finish().events]
+    calls = [event.call for event in events if isinstance(event, ToolCallCompleted)]
+
+    assert [(call.name, call.arguments_json) for call in calls] == [("lookup", '{"id":7}')]
 
 
 def test_default_registry_selects_specialized_gemma4_architectures() -> None:

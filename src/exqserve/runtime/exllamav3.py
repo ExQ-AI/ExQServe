@@ -32,6 +32,7 @@ from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, Genera
 from exqserve.core.tokens import NativeTokenSpan
 from exqserve.core.usage import TokenUsage
 from exqserve.runtime.contracts import (
+    ConstraintInstallation,
     ExLlamaV3LoadConfig,
     RuntimeCancelled,
     RuntimeCapabilities,
@@ -783,16 +784,38 @@ class _ConstraintEnforcementState:
     trigger_token: int | None = None
     activated: bool = False
     guarantee: GenerationGuarantee = GenerationGuarantee.NONE
+    constraint_fingerprint: str | None = None
 
     @classmethod
     def installed_with_trigger(
         cls,
         trigger_token: int | None,
         guarantee: GenerationGuarantee,
+        constraint_fingerprint: str,
     ) -> _ConstraintEnforcementState:
         if not isinstance(guarantee, GenerationGuarantee):
             raise TypeError("guarantee must be a GenerationGuarantee")
-        return cls(True, trigger_token, trigger_token is None, guarantee)
+        if not isinstance(constraint_fingerprint, str) or not constraint_fingerprint.strip():
+            raise ValueError("constraint_fingerprint must be a non-empty string")
+        return cls(
+            True,
+            trigger_token,
+            trigger_token is None,
+            guarantee,
+            constraint_fingerprint,
+        )
+
+    @property
+    def installation(self) -> ConstraintInstallation:
+        if not self.installed:
+            return ConstraintInstallation(False, None, (), GenerationGuarantee.NONE)
+        assert self.constraint_fingerprint is not None
+        return ConstraintInstallation(
+            True,
+            self.constraint_fingerprint,
+            () if self.trigger_token is None else (self.trigger_token,),
+            self.guarantee,
+        )
 
     @property
     def effective_guarantee(self) -> GenerationGuarantee:
@@ -846,6 +869,12 @@ class RuntimeSession:
 
     def __aiter__(self) -> RuntimeSession:
         return self
+
+    @property
+    def constraint_installation(self) -> ConstraintInstallation | None:
+        if self._request.generation_constraint is None:
+            return None
+        return self._constraint_state.installation
 
     def inject_text(self, text: str) -> None:
         if not isinstance(text, str):
@@ -1287,22 +1316,28 @@ def _build_output_filters(
                     encode_special_tokens=True,
                 )
             )
-        except (AttributeError, TypeError, ValueError) as exc:
+        except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
             if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
                 raise RuntimeConstraintUnsupported(
                     "Requested Tool generation guarantee cannot install its trigger."
                 ) from exc
-            raise RuntimeError(
-                "Constrained tool generation trigger could not be tokenized by the loaded model."
-            ) from exc
+            logger.warning(
+                "Tool-generation trigger unavailable for request %s; using validation-only fallback: %s",
+                request.request_id,
+                exc,
+            )
+            return None, _ConstraintEnforcementState()
         if len(trigger_ids) != 1:
             if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
                 raise RuntimeConstraintUnsupported(
                     "Requested Tool generation guarantee requires a single-token model-native trigger."
                 )
-            raise RuntimeError(
-                "Constrained tool generation requires a single-token model-native tool trigger."
+            logger.warning(
+                "Tool-generation trigger for request %s resolved to %d tokens; using validation-only fallback.",
+                request.request_id,
+                len(trigger_ids),
             )
+            return None, _ConstraintEnforcementState()
         try:
             output_filter = backend.LLGuidanceFilter(
                 tokenizer,
@@ -1312,23 +1347,35 @@ def _build_output_filters(
             )
         except (TypeError, ValueError, RuntimeError) as exc:
             if _llguidance_reports_unsupported_schema(exc):
-                raise RuntimeConstraintUnsupported(
-                    "Tool JSON Schema uses semantics that the active LLGuidance runtime cannot enforce."
-                ) from exc
+                if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
+                    raise RuntimeConstraintUnsupported(
+                        "Tool JSON Schema uses semantics that the active LLGuidance runtime cannot enforce."
+                    ) from exc
+                logger.warning(
+                    "Tool-generation schema unsupported for request %s; using validation-only fallback: %s",
+                    request.request_id,
+                    exc,
+                )
+                return None, _ConstraintEnforcementState()
             if request.constraint_fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED:
                 raise RuntimeConstraintUnsupported(
                     "Requested Tool generation guarantee cannot be enforced by the active runtime."
                 ) from exc
-            raise RuntimeError(
-                "Constrained tool generation grammar could not be initialized by the runtime."
-            ) from exc
+            logger.warning(
+                "Tool-generation grammar unavailable for request %s; using validation-only fallback: %s",
+                request.request_id,
+                exc,
+            )
+            return None, _ConstraintEnforcementState()
         runtime_guarantee = (
             GenerationGuarantee.UNKNOWN
             if request.generation_guarantee is GenerationGuarantee.NONE
             else request.generation_guarantee
         )
         return [output_filter], _ConstraintEnforcementState.installed_with_trigger(
-            trigger_ids[0], runtime_guarantee
+            trigger_ids[0],
+            runtime_guarantee,
+            constraint.constraint_fingerprint or hashlib.sha256(constraint.lark_grammar.encode("utf-8")).hexdigest(),
         )
 
     if request.output_json_schema is None:
@@ -1400,7 +1447,9 @@ def _build_output_filters(
         else request.generation_guarantee
     )
     return [output_filter], _ConstraintEnforcementState.installed_with_trigger(
-        trigger_token, runtime_guarantee
+        trigger_token,
+        runtime_guarantee,
+        hashlib.sha256(request.output_json_schema.encode("utf-8")).hexdigest(),
     )
 
 

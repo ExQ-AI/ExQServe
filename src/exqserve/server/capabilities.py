@@ -157,11 +157,22 @@ def resolve_effective_model_snapshot(
     config: ServerConfig,
     dialect: ModelDialect,
     runtime: CapabilityRuntimeLike,
+    *,
+    tool_constraint_provider_available: bool | None = None,
+    strict_tool_constraint_provider_available: bool | None = None,
 ) -> EffectiveModelSnapshot:
     if not isinstance(config, ServerConfig):
         raise TypeError("config must be a ServerConfig")
     if not isinstance(dialect, ModelDialect):
         raise TypeError("dialect must implement ModelDialect")
+    if tool_constraint_provider_available is not None and not isinstance(
+        tool_constraint_provider_available, bool
+    ):
+        raise TypeError("tool_constraint_provider_available must be a bool or None")
+    if strict_tool_constraint_provider_available is not None and not isinstance(
+        strict_tool_constraint_provider_available, bool
+    ):
+        raise TypeError("strict_tool_constraint_provider_available must be a bool or None")
     metadata = runtime.model_metadata
     if not isinstance(metadata, RuntimeModelMetadata):
         raise TypeError("runtime model_metadata must be RuntimeModelMetadata")
@@ -171,9 +182,15 @@ def resolve_effective_model_snapshot(
     structural = _structural_requirements(dialect)
     context_window = config.effective_context_length(metadata.max_context_tokens)
 
-    provider = isinstance(dialect, ToolConstraintProvider)
-    strict_provider = isinstance(dialect, StrictToolConstraintProvider) and bool(
-        dialect.supports_strict_tools
+    provider = (
+        isinstance(dialect, ToolConstraintProvider)
+        if tool_constraint_provider_available is None
+        else tool_constraint_provider_available
+    )
+    strict_provider = (
+        isinstance(dialect, StrictToolConstraintProvider) and bool(dialect.supports_strict_tools)
+        if strict_tool_constraint_provider_available is None
+        else strict_tool_constraint_provider_available
     )
     tool_generation = (
         dialect.capabilities.tool_calling

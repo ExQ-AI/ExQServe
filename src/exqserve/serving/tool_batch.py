@@ -249,6 +249,17 @@ class ToolCallBatchGate:
         self._buffered_events.append(event)
         return BatchDecision()
 
+    def on_passthrough(self, event: GenerationEvent) -> BatchDecision:
+        """Preserve semantic ordering after an atomic Tool batch has started."""
+
+        lifecycle_failure = self._ensure_open()
+        if lifecycle_failure is not None:
+            return BatchDecision(failure=lifecycle_failure)
+        if self._atomic_parallel_tools and self._buffered_events:
+            self._buffered_events.append(event)
+            return BatchDecision()
+        return BatchDecision((event,))
+
     def commit_events(self) -> tuple[GenerationEvent, ...]:
         if self._lifecycle is not _BatchLifecycle.OPEN:
             return ()

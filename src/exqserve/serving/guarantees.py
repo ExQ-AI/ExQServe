@@ -82,10 +82,16 @@ def _runtime_tool_guarantee(constraint: ToolGenerationConstraint | None) -> Gene
         return GenerationGuarantee.NONE
     if constraint.branch_guarantees is None:
         return GenerationGuarantee.UNKNOWN
-    guarantees = {guarantee for _, guarantee in constraint.branch_guarantees}
-    if len(guarantees) != 1:
+    generated = tuple(
+        guarantee
+        for _, guarantee in constraint.branch_guarantees
+        if guarantee is not GenerationGuarantee.NONE
+    )
+    if not generated:
+        return GenerationGuarantee.NONE
+    if any(guarantee is GenerationGuarantee.UNKNOWN for guarantee in generated):
         return GenerationGuarantee.UNKNOWN
-    return next(iter(guarantees))
+    return min(generated, key=lambda guarantee: _GUARANTEE_STRENGTH[guarantee])
 
 
 def _exposed_strict_tool_names(policy: ToolPolicy) -> tuple[str, ...]:

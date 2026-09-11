@@ -1,4 +1,4 @@
-"""DeepSeek-V4 structured DSML control data for Tool-Wire A1 shadow certification.
+"""Test-only DeepSeek-V4 structured DSML control data for Tool-Wire A1 shadow certification.
 
 This module is intentionally isolated from the production DeepSeek parser.  It contributes
 static DSML framing data only; the shared engine contains no DeepSeek/model-name dispatch.

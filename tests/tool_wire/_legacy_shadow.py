@@ -1,16 +1,11 @@
 """A1 shadow/certification harness for the deterministic Tool-wire engine."""
+# Historical test helper; not production authority.
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from exqserve.tool_wire.admission import (
-    PlanAdmissionIssue,
-    PlanAdmissionResult,
-    admit_tool_sequence,
-    admit_validation_only_tool_sequence,
-)
 from exqserve.tool_wire.contracts import (
     CompiledToolWirePlan,
     PlanCompileDisposition,
@@ -21,6 +16,12 @@ from exqserve.tool_wire.engine import (
     DeterministicToolWireEngine,
     ToolWireEngineResult,
     ToolWireEngineStatus,
+)
+from tests.tool_wire._legacy_admission import (
+    PlanAdmissionIssue,
+    PlanAdmissionResult,
+    admit_tool_sequence,
+    admit_validation_only_tool_sequence,
 )
 
 
