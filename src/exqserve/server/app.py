@@ -34,8 +34,12 @@ from exqserve.model.registry import (
     Gemma4Dialect,
     GenericHFDialect,
     Glm5Dialect,
+    Glm5NextDialect,
     MuseGlimmerDialect,
+    Qwen4ExpDialect,
     QwenDialect,
+    Step3p5Dialect,
+    Step3p7Dialect,
     default_model_dialect_registry,
 )
 from exqserve.observability.capture import CaptureManager, CaptureMode, JsonlCaptureSink
@@ -195,8 +199,12 @@ def _dialect_parser(
 def _is_builtin_dialect(dialect: ModelDialect) -> bool:
     return type(dialect) in {
         QwenDialect,
+        Qwen4ExpDialect,
         Gemma4Dialect,
         Glm5Dialect,
+        Glm5NextDialect,
+        Step3p5Dialect,
+        Step3p7Dialect,
         DeepSeekV4Dialect,
         MuseGlimmerDialect,
         GenericHFDialect,

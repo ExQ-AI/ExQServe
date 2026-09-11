@@ -24,7 +24,15 @@ from exqserve.model.muse_glimmer import (
     MUSE_GLIMMER_PROMPT_STRUCTURAL_MARKERS,
     MuseGlimmerPromptCompiler,
 )
-from exqserve.model.registry import GenericHFDialect, MuseGlimmerDialect, QwenDialect
+from exqserve.model.registry import (
+    GenericHFDialect,
+    Glm5NextDialect,
+    MuseGlimmerDialect,
+    Qwen4ExpDialect,
+    QwenDialect,
+    Step3p5Dialect,
+    Step3p7Dialect,
+)
 from exqserve.observability.capture import CaptureMode
 from exqserve.runtime.contracts import (
     ConstraintInstallation,
@@ -405,6 +413,32 @@ def test_best_effort_mid_system_lowering_is_bound_to_exact_qwen_origin() -> None
         app_module._builtin_best_effort_mid_system_lowering(GenericHFDialect())
         is BestEffortMidSystemLowering.MERGED_LEADING
     )
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [Qwen4ExpDialect(), Glm5NextDialect(), Step3p5Dialect(), Step3p7Dialect()],
+)
+def test_renderer_workers_gt_one_accepts_new_builtin_dialects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dialect: GenericHFDialect
+) -> None:
+    class BuiltinRegistry:
+        def resolve(
+            self, architecture: str | None, selector: str = "auto"
+        ) -> GenericHFDialect:
+            del architecture, selector
+            return dialect
+
+    monkeypatch.setattr(app_module, "default_model_dialect_registry", lambda: BuiltinRegistry())
+    runtime = _RendererRuntime()
+
+    composed = compose_server(
+        ServerConfig(model_directory=tmp_path, renderer_workers=2),
+        runtime=runtime,
+    )
+
+    assert runtime.renderer_calls == 2
+    assert composed.runtime is runtime
 
 
 def test_renderer_workers_gt_one_rejects_external_plugin_v1_subclass(

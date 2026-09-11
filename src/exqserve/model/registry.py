@@ -36,11 +36,13 @@ from exqserve.model.gemma4 import (
 )
 from exqserve.model.generic_hf import (
     GENERIC_HF_CAPABILITIES,
+    AlwaysReasoningHFPromptCompiler,
     GenericHFIncrementalParser,
     GenericHFPromptCompiler,
 )
 from exqserve.model.glm5 import (
     GLM5_CAPABILITIES,
+    GLM5_NEXT_CAPABILITIES,
     Glm5IncrementalParser,
     Glm5PromptCompiler,
     glm5_parser_context,
@@ -254,6 +256,32 @@ class Glm5Dialect:
 
 
 @dataclass(frozen=True, slots=True)
+class Glm5NextDialect:
+    dialect_id: str = "glm5-next"
+    capabilities: ModelCapabilities = GLM5_NEXT_CAPABILITIES
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        normalized = architecture.replace(".", "_").lower()
+        return normalized == "glm5nextforconditionalgeneration"
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> GenericHFPromptCompiler:
+        return GenericHFPromptCompiler(template_adapter)
+
+    def create_parser(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> GenericHFIncrementalParser:
+        del tool_policy
+        if not isinstance(reasoning, ReasoningPolicy):
+            raise TypeError("reasoning must be a ReasoningPolicy")
+        return GenericHFIncrementalParser(request_id)
+
+
+@dataclass(frozen=True, slots=True)
 class DeepSeekV4Dialect:
     dialect_id: str = "deepseek-v4"
     capabilities: ModelCapabilities = DEEPSEEK_V4_CAPABILITIES
@@ -345,6 +373,92 @@ class GenericHFDialect:
         if not isinstance(reasoning, ReasoningPolicy):
             raise TypeError("reasoning must be a ReasoningPolicy")
         return GenericHFIncrementalParser(request_id)
+
+
+_QWEN4_EXP_CAPABILITIES = ModelCapabilities(
+    reasoning=False,
+    tool_calling=False,
+    parallel_tool_calls=False,
+    system_role=True,
+    developer_role=False,
+    reasoning_history=False,
+    vision=False,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Qwen4ExpDialect(GenericHFDialect):
+    """Conservative Qwen 3.8 architecture binding until its wire contract is directly proven."""
+
+    dialect_id: str = "qwen4-exp"
+    capabilities: ModelCapabilities = _QWEN4_EXP_CAPABILITIES
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        normalized = architecture.replace(".", "_").lower()
+        return normalized == "qwen4expforconditionalgeneration"
+
+
+_STEP35_CAPABILITIES = ModelCapabilities(
+    reasoning=True,
+    tool_calling=False,
+    parallel_tool_calls=False,
+    system_role=True,
+    developer_role=False,
+    reasoning_history=False,
+    vision=False,
+)
+
+_STEP37_CAPABILITIES = ModelCapabilities(
+    reasoning=False,
+    tool_calling=False,
+    parallel_tool_calls=False,
+    system_role=True,
+    developer_role=False,
+    reasoning_history=False,
+    vision=False,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Step3p5Dialect:
+    """Step 3.5 binding for the directly proven always-on think envelope."""
+
+    dialect_id: str = "step3p5"
+    capabilities: ModelCapabilities = _STEP35_CAPABILITIES
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        return architecture.replace(".", "_").lower() == "step3p5forcausallm"
+
+    def create_compiler(self, template_adapter: ChatTemplateAdapter) -> AlwaysReasoningHFPromptCompiler:
+        return AlwaysReasoningHFPromptCompiler(template_adapter)
+
+    def create_parser(
+        self,
+        request_id: str,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> Glm5IncrementalParser:
+        del tool_policy
+        if reasoning.mode is ReasoningMode.DISABLED:
+            raise ValueError("Step 3.5 does not support disabling reasoning")
+        return Glm5IncrementalParser(request_id, start_in_reasoning=True)
+
+
+@dataclass(frozen=True, slots=True)
+class Step3p7Dialect(GenericHFDialect):
+    """Conservative Step 3.7 binding until its prompt/output contract is directly proven."""
+
+    dialect_id: str = "step3p7"
+    capabilities: ModelCapabilities = _STEP37_CAPABILITIES
+
+    def matches(self, architecture: str | None) -> bool:
+        if architecture is None:
+            return False
+        return architecture.replace(".", "_").lower() == "step3p7forconditionalgeneration"
 
 
 def discover_model_dialect_plugins(
@@ -454,9 +568,13 @@ def default_model_dialect_registry(
 ) -> ModelDialectRegistry:
     plugins = discover_model_dialect_plugins(entry_points)
     builtins: tuple[ModelDialect, ...] = (
+        Qwen4ExpDialect(),
         QwenDialect(),
         Gemma4Dialect(),
+        Glm5NextDialect(),
         Glm5Dialect(),
+        Step3p5Dialect(),
+        Step3p7Dialect(),
         DeepSeekV4Dialect(),
         MuseGlimmerDialect(),
     )

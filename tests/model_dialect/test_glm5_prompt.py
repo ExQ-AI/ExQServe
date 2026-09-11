@@ -18,7 +18,7 @@ from exqserve.core.items import (
 )
 from exqserve.core.request import CanonicalRequest
 from exqserve.model.contracts import RenderedPrompt, TemplateRequest
-from exqserve.model.glm5 import GLM5_CAPABILITIES, Glm5PromptCompiler
+from exqserve.model.glm5 import GLM5_CAPABILITIES, GLM5_NEXT_CAPABILITIES, Glm5PromptCompiler
 from exqserve.model.registry import Glm5Dialect
 
 
@@ -58,6 +58,14 @@ def test_glm5_capabilities_are_conservative_and_explicit() -> None:
     assert GLM5_CAPABILITIES.developer_role is False
     assert GLM5_CAPABILITIES.reasoning_history is True
     assert GLM5_CAPABILITIES.vision is False
+
+
+def test_glm5_next_capabilities_remain_conservative_until_wire_is_proven() -> None:
+    assert GLM5_NEXT_CAPABILITIES.reasoning is False
+    assert GLM5_NEXT_CAPABILITIES.tool_calling is False
+    assert GLM5_NEXT_CAPABILITIES.parallel_tool_calls is False
+    assert GLM5_NEXT_CAPABILITIES.reasoning_history is False
+    assert GLM5_NEXT_CAPABILITIES.vision is False
 
 
 def test_glm5_history_uses_reasoning_tool_calls_and_named_tool_results() -> None:
@@ -144,6 +152,7 @@ def test_glm5_rejects_multimodal_input_instead_of_template_silently_dropping_it(
 
     with pytest.raises(TypeError, match="does not support multimodal"):
         compiler.prepare(request, ReasoningPolicy(), _policy())
+
 
 
 def test_glm5_compile_is_parser_context_stateless() -> None:

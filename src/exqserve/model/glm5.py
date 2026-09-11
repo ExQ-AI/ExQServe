@@ -56,6 +56,18 @@ GLM5_CAPABILITIES = ModelCapabilities(
     vision=False,
 )
 
+# M0 intentionally keeps GLM 5.3 conservative until the target tokenizer/chat template
+# proves its reasoning/tool/vision wire contract directly.
+GLM5_NEXT_CAPABILITIES = ModelCapabilities(
+    reasoning=False,
+    tool_calling=False,
+    parallel_tool_calls=False,
+    system_role=True,
+    developer_role=False,
+    reasoning_history=False,
+    vision=False,
+)
+
 _GLM5_STOP_CONDITIONS = ("<|endoftext|>", "<|user|>", "<|observation|>")
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
@@ -228,6 +240,8 @@ class Glm5PromptCompiler(HFTemplatePromptCompiler):
             return _THINK_CLOSE
         return None
 
+
+# GLM 5.3 intentionally reuses the generic HF compiler until its target wire is proven.
 
 @dataclass(frozen=True, slots=True)
 class Glm5ParserFinish:

@@ -124,6 +124,20 @@ class GenericHFPromptCompiler(HFTemplatePromptCompiler):
         return True
 
 
+class AlwaysReasoningHFPromptCompiler(GenericHFPromptCompiler):
+    """Generic HF template path for a model whose saved contract always reasons."""
+
+    def prepare(
+        self,
+        request: CanonicalRequest,
+        reasoning: ReasoningPolicy,
+        tool_policy: ToolPolicy,
+    ) -> TemplateRequest:
+        if reasoning.mode is ReasoningMode.DISABLED:
+            raise ValueError("this model does not support disabling reasoning")
+        return super().prepare(request, ReasoningPolicy(), tool_policy)
+
+
 @dataclass(frozen=True, slots=True)
 class GenericHFParserFinish:
     events: tuple[GenerationEvent, ...]

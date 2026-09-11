@@ -13,7 +13,11 @@ from exqserve.model.contracts import (
 )
 from exqserve.model.deepseek_v4 import DeepSeekV4IncrementalParser, DeepSeekV4PromptCompiler
 from exqserve.model.gemma4 import Gemma4IncrementalParser, Gemma4PromptCompiler
-from exqserve.model.generic_hf import GenericHFIncrementalParser, GenericHFPromptCompiler
+from exqserve.model.generic_hf import (
+    AlwaysReasoningHFPromptCompiler,
+    GenericHFIncrementalParser,
+    GenericHFPromptCompiler,
+)
 from exqserve.model.glm5 import Glm5IncrementalParser, Glm5PromptCompiler
 from exqserve.model.muse_glimmer import MuseGlimmerIncrementalParser, MuseGlimmerPromptCompiler
 from exqserve.model.qwen import QwenIncrementalParser, QwenPromptCompiler
@@ -22,8 +26,12 @@ from exqserve.model.registry import (
     Gemma4Dialect,
     GenericHFDialect,
     Glm5Dialect,
+    Glm5NextDialect,
     MuseGlimmerDialect,
+    Qwen4ExpDialect,
     QwenDialect,
+    Step3p5Dialect,
+    Step3p7Dialect,
     default_model_dialect_registry,
 )
 from exqserve.plugin_api import ModelDialect
@@ -61,6 +69,73 @@ def test_default_registry_selects_specialized_qwen_architectures() -> None:
         assert dialect.dialect_id == "qwen"
         assert isinstance(dialect.create_compiler(_Adapter()), QwenPromptCompiler)
         assert isinstance(dialect.create_parser("req-1", ReasoningPolicy(), _TOOL_POLICY), QwenIncrementalParser)
+
+
+def test_default_registry_selects_conservative_qwen4_exp_architecture() -> None:
+    registry = default_model_dialect_registry(entry_points=())
+
+    dialect = registry.resolve("Qwen4ExpForConditionalGeneration")
+
+    assert isinstance(dialect, Qwen4ExpDialect)
+    assert dialect.dialect_id == "qwen4-exp"
+    assert dialect.capabilities.reasoning is False
+    assert dialect.capabilities.tool_calling is False
+    assert dialect.capabilities.parallel_tool_calls is False
+    assert dialect.capabilities.vision is False
+    assert isinstance(dialect.create_compiler(_Adapter()), GenericHFPromptCompiler)
+    assert isinstance(
+        dialect.create_parser("req-qwen4-exp", ReasoningPolicy(), _TOOL_POLICY),
+        GenericHFIncrementalParser,
+    )
+
+
+def test_default_registry_selects_step35_reasoning_only_architecture() -> None:
+    registry = default_model_dialect_registry(entry_points=())
+    dialect = registry.resolve("Step3p5ForCausalLM")
+
+    assert isinstance(dialect, Step3p5Dialect)
+    assert dialect.capabilities.reasoning is True
+    assert dialect.capabilities.tool_calling is False
+    assert dialect.capabilities.vision is False
+    assert isinstance(dialect.create_compiler(_Adapter()), AlwaysReasoningHFPromptCompiler)
+    parser = dialect.create_parser("req-step35", ReasoningPolicy(), _TOOL_POLICY)
+    events = [*parser.feed("<think>plan</think>answer"), *parser.finish().events]
+    assert not any(isinstance(event, ToolCallCompleted) for event in events)
+
+
+def test_default_registry_selects_conservative_step37_architecture() -> None:
+    registry = default_model_dialect_registry(entry_points=())
+    dialect = registry.resolve("Step3p7ForConditionalGeneration")
+
+    assert isinstance(dialect, Step3p7Dialect)
+    assert dialect.capabilities.reasoning is False
+    assert dialect.capabilities.tool_calling is False
+    assert dialect.capabilities.vision is False
+    assert isinstance(dialect.create_compiler(_Adapter()), GenericHFPromptCompiler)
+    assert isinstance(
+        dialect.create_parser("req-step37", ReasoningPolicy(), _TOOL_POLICY),
+        GenericHFIncrementalParser,
+    )
+
+
+def test_new_model_family_registry_closure_is_unambiguous_and_conservative() -> None:
+    registry = default_model_dialect_registry(entry_points=())
+    expected = {
+        "Qwen4ExpForConditionalGeneration": Qwen4ExpDialect,
+        "Glm5NextForConditionalGeneration": Glm5NextDialect,
+        "Step3p5ForCausalLM": Step3p5Dialect,
+        "Step3p7ForConditionalGeneration": Step3p7Dialect,
+    }
+
+    for architecture, expected_type in expected.items():
+        matches = [dialect for dialect in registry.specialized if dialect.matches(architecture)]
+        assert len(matches) == 1, architecture
+        resolved = registry.resolve(architecture)
+        assert type(resolved) is expected_type
+
+    unknown = registry.resolve("FutureUnknownForConditionalGeneration")
+    assert type(unknown) is GenericHFDialect
+    assert len({dialect.dialect_id for dialect in registry.dialects}) == len(registry.dialects)
 
 
 def test_direct_qwen_dialect_parser_keeps_shared_compatibility_tool_decode() -> None:
@@ -112,6 +187,24 @@ def test_default_registry_selects_exact_glm5_architecture() -> None:
         assert isinstance(dialect.create_parser("req-1", ReasoningPolicy(), _TOOL_POLICY), Glm5IncrementalParser)
 
 
+def test_default_registry_selects_exact_glm5_next_architecture() -> None:
+    registry = default_model_dialect_registry(entry_points=())
+
+    dialect = registry.resolve("Glm5NextForConditionalGeneration")
+
+    assert isinstance(dialect, Glm5NextDialect)
+    assert dialect.dialect_id == "glm5-next"
+    assert dialect.capabilities.reasoning is False
+    assert dialect.capabilities.tool_calling is False
+    assert dialect.capabilities.parallel_tool_calls is False
+    assert dialect.capabilities.vision is False
+    assert isinstance(dialect.create_compiler(_Adapter()), GenericHFPromptCompiler)
+    assert isinstance(
+        dialect.create_parser("req-next", ReasoningPolicy(), _TOOL_POLICY),
+        GenericHFIncrementalParser,
+    )
+
+
 def test_default_registry_selects_exact_deepseek_v4_architecture() -> None:
     registry = default_model_dialect_registry(entry_points=())
 
@@ -158,6 +251,10 @@ def test_default_registry_uses_generic_fallback_for_unknown_or_missing_architect
         "MuseGlimmerAssistantModel",
         "GlmMoeDsaMTPModel",
         "GlmMoeDsaForConditionalGeneration",
+        "Glm5NextForCausalLM",
+        "Glm5NextMTPModel",
+        "Qwen4ExpMTPModel",
+        "Qwen4ExpForCausalLM",
         "DeepseekV4MTPModel",
         "DeepseekV4ForConditionalGeneration",
     ):
