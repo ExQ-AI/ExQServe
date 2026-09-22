@@ -947,6 +947,7 @@ def test_load_configures_moe_pinned_arena_before_model_construction(
     assert runtime.moe_pinned_arena_active is False
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_helper_uses_capability_not_release_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -977,6 +978,7 @@ def test_sysmem_shutdown_support_uses_close_contract_not_release_version() -> No
     assert module._supports_sysmem_kv_shutdown(backend) is False
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_helper_requires_upstream_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1008,6 +1010,7 @@ def test_moe_pinned_arena_helper_rejects_non_linux_without_mutation(
     assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_capability_failure_does_not_mutate_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1021,6 +1024,7 @@ def test_moe_pinned_arena_capability_failure_does_not_mutate_env(
     assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_failed_load_and_close_reset_global_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1049,6 +1053,7 @@ def test_moe_pinned_arena_failed_load_and_close_reset_global_switch(
     assert tuning.pinned_arena is False
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_auto_retry_keeps_global_switch_until_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1111,6 +1116,7 @@ def test_moe_pinned_arena_auto_retry_keeps_global_switch_until_close(
     assert tuning.pinned_arena is False
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_pretry_device_failure_rolls_back_global_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1165,6 +1171,7 @@ def test_moe_pinned_arena_activation_requires_real_pinned_host() -> None:
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MoE pinned arena is Linux-only")
 def test_moe_pinned_arena_helper_sets_and_resets_upstream_tuning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

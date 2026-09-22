@@ -9,6 +9,13 @@ from exqserve.runtime.contracts import ExLlamaV3LoadConfig
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime
 
 
+@pytest.fixture(autouse=True)
+def _stub_backend_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend_config = SimpleNamespace()
+    backend = SimpleNamespace(Config=SimpleNamespace(from_directory=lambda _: backend_config))
+    monkeypatch.setattr(exl3, "_load_backend_module", lambda: backend)
+
+
 @pytest.mark.parametrize(
     ("model_limit", "expected_first"),
     ((32768, 32768), (131072, 131072), (262144, 262144), (131199, 131072)),
