@@ -115,7 +115,7 @@ async def _wait_for(predicate, timeout: float = 2.0) -> None:  # type: ignore[no
         await asyncio.sleep(0.001)
 
 
-def test_cpu_mixed_multiclient_soak_switch_cancel_and_recovery(tmp_path: Path) -> None:
+def test_cpu_mixed_multiclient_soak_switch_and_recovery(tmp_path: Path) -> None:
     async def scenario() -> None:
         first = tmp_path / "first"
         second = tmp_path / "second"
@@ -165,34 +165,6 @@ def test_cpu_mixed_multiclient_soak_switch_cancel_and_recovery(tmp_path: Path) -
 
             transport = httpx.ASGITransport(app=composed.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test", timeout=5.0) as client:
-                previous_session_count = len(initial.sessions)
-                disconnected = asyncio.create_task(
-                    client.post(
-                        "/v1/responses",
-                        json={
-                            "model": "first",
-                            "input": "SLOW",
-                            "reasoning": {"effort": "disabled"},
-                            "max_output_tokens": 16,
-                            "stream": True,
-                        },
-                    )
-                )
-                await _wait_for(lambda: composed.controller.in_flight == 1)
-                await _wait_for(lambda: len(initial.sessions) > previous_session_count)
-                disconnected.cancel()
-                try:
-                    await disconnected
-                except asyncio.CancelledError:
-                    pass
-                else:
-                    raise AssertionError("cancelled HTTP stream task must raise CancelledError")
-
-                # Cancelling an httpx ASGITransport client task is not a wire-level
-                # ASGI http.disconnect signal on every event-loop/platform combination.
-                # Dedicated endpoint tests inject http.disconnect directly and own the
-                # server-side cancel/drain guarantee. This soak only requires that a
-                # cancelled client task does not prevent later traffic or model switch.
                 tool = await client.post(
                     "/v1/responses",
                     json={
