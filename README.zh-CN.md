@@ -62,7 +62,7 @@ Release 验证覆盖：
 
 ## 安装
 
-ExQServe 需要 Python 3.12+、NVIDIA GPU、支持 CUDA 的 PyTorch，以及 ExLlamaV3 `>=1.4.4,<1.5`。
+ExQServe 需要 Python 3.12+、NVIDIA GPU、支持 CUDA 的 PyTorch，以及 ExLlamaV3 `>=1.4.9,<1.6`。当前推荐使用 ExLlamaV3 1.5.x。
 
 ### Linux
 
@@ -78,14 +78,14 @@ pip install -U pip
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-从 [ExLlamaV3 v1.4.4 Release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.4.4) 下载与当前 Python、PyTorch、CUDA 对应的 `linux_x86_64` wheel，然后安装 ExLlamaV3 和 ExQServe：
+从 [ExLlamaV3 v1.5.0 Release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.0) 下载与当前 Python、PyTorch、CUDA 对应的 `linux_x86_64` wheel，然后安装 ExLlamaV3 和 ExQServe：
 
 ```bash
 pip install ./path/to/exllamav3.whl
 pip install .
 ```
 
-如果使用其他 Python / PyTorch / CUDA 组合，请到上游 [ExLlamaV3 Releases](https://github.com/turboderp-org/exllamav3/releases) 选择匹配的 wheel。
+如果使用其他 Python / PyTorch / CUDA 组合，请到上游 [ExLlamaV3 Releases](https://github.com/turboderp-org/exllamav3/releases) 选择匹配的 wheel。可选 backend 能力按实际 capability 启用；显式请求不支持的能力会在加载阶段明确失败，不会静默降级。
 
 ### Docker
 
@@ -123,7 +123,7 @@ pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -U "triton-windows<3.7"
 ```
 
-从 [ExLlamaV3 v1.4.4 Release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.4.4) 下载与当前 Python、PyTorch、CUDA 对应的 `win_amd64` wheel。Python 版本对应 wheel 文件名里的 `cp312`、`cp313`、`cp314` 等标签。下载后安装 ExLlamaV3 和 ExQServe：
+从 [ExLlamaV3 v1.5.0 Release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.0) 下载与当前 Python、PyTorch、CUDA 对应的 `win_amd64` wheel。Python 版本对应 wheel 文件名里的 `cp312`、`cp313`、`cp314` 等标签。下载后安装 ExLlamaV3 和 ExQServe：
 
 ```powershell
 pip install .\path\to\exllamav3.whl
@@ -181,6 +181,10 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 
 生成中注入接口接收 `{"text":"..."}` 这样的 JSON body，用于仍在进行的流式请求。它修改的是当前这次模型输出，不会新增用户消息；结构化输出请求不支持这一能力。
 
+### OpenAI Sampler 扩展
+
+OpenAI 请求体还可以使用 ExLlamaV3 的 DRY、`blocked_tokens`、`banned_strings` 和 `token_healing` 等采样扩展。这些能力均为可选的 ExQServe 扩展，并非 OpenAI 标准字段。
+
 ## 常用参数
 
 | 参数 | 说明 |
@@ -196,9 +200,9 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--vision` | 加载模型的视觉组件并接受图片输入；模型或后端不支持时会直接报错 |
 | `--vision-offload` | 将 ExLlamaV3 Vision 组件保留在 pinned host memory，以降低显存占用 |
 | `--allow-remote-images` | 允许 HTTP(S) 图片地址；data URL 只需要开启 `--vision` |
-| `--vision-cache-mb` | 图片 embedding 的 CPU 缓存上限，默认 256 MiB；设为 `0` 可关闭缓存 |
+| `--vision-cache-mb` | 图片 embedding 的 CPU 缓存上限，默认 1024 MiB；设为 `0` 可关闭缓存 |
 | `--max-injection-body-bytes` | 生成中注入接口的 JSON body 上限，默认 64 KiB |
-| `--cache-tokens` | KV Cache 容量 |
+| `--cache-tokens` | KV Cache 容量；默认 `auto` 会根据已加载模型/runtime 自动解析 |
 | `--kv-cache-bits` | KV Cache 精度 |
 | `--sysmem-kv-cache-mb` | ExLlamaV3 二级 K/V page cache 使用的 pinned 系统内存预算 |
 | `--sysmem-recurrent-cache-mb` | ExLlamaV3 recurrent-state checkpoint 的系统内存预算 |
@@ -211,7 +215,7 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--reasoning-budget-tokens` | 默认 Soft Reasoning Token Budget；`-1` 关闭服务端默认值 |
 | `--reasoning-budget-message` | Reasoning Budget 强制收束前，可选插入到 reasoning 内的提示文本 |
 | `--max-batch-size` | 最大 batch size |
-| `--max-chunk-size` | Prefill chunk size |
+| `--max-chunk-size` | Prefill chunk size，默认 `1024` |
 | `--mtp` | 开启 MTP 投机解码 |
 | `--mtp-draft-tokens` | MTP draft token 数量 |
 | `--mtp-cache-bits` | MTP draft cache 精度 |
@@ -223,6 +227,7 @@ PowerShell 下可将 `curl` 换成 `curl.exe`。
 | `--moe-cpu-offload-layers` | 将前 N 个符合条件的 block-sparse MoE 层交给 CPU 执行 |
 | `--moe-cpu-split-experts` | 通过 ExLlamaV3 split mode 将每个符合条件的 MoE 层中的 N 个 routed experts 保留在 CPU |
 | `--draft-moe-cpu-offload-layers` | 将前 N 个符合条件的 draft/MTP MoE 层交给 CPU 执行 |
+| `--moe-pinned-arena` | 在 Linux 上为符合条件的 MoE CPU offload 启用 ExLlamaV3 1.5 pinned arena |
 | `--moe-cpu-threads` | ExLlamaV3 MoE CPU offload 的工作线程数 |
 | `--device-ids` | 当前进程可见的 CUDA 设备，例如 `0,1` |
 | `--tensor-parallel` | 开启 ExLlamaV3 Tensor Parallel |
@@ -257,9 +262,9 @@ model-directory: ./models/Qwen3.8-27B-exl3-SC_4.00bpw_H5
 served-model-id: Qwen3.8-27B-exl3-SC_4.00bpw_H5
 host: 127.0.0.1
 port: 8000
-cache-tokens: 32768
+cache-tokens: auto
 kv-cache-bits: 8
-max-chunk-size: 2048
+max-chunk-size: 1024
 mtp: true
 mtp-draft-tokens: 4
 mtp-cache-bits: 4

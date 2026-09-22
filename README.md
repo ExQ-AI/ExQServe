@@ -62,7 +62,7 @@ Release-specific workload results are published with the corresponding release i
 
 ## Installation
 
-ExQServe requires Python 3.12+, an NVIDIA GPU, a CUDA-enabled PyTorch build, and ExLlamaV3 `>=1.4.4,<1.5`.
+ExQServe requires Python 3.12+, an NVIDIA GPU, a CUDA-enabled PyTorch build, and ExLlamaV3 `>=1.4.9,<1.6`. ExLlamaV3 1.5.x is the recommended backend.
 
 ### Linux
 
@@ -78,14 +78,14 @@ pip install -U pip
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Download the `linux_x86_64` ExLlamaV3 wheel that matches your Python version, PyTorch version, and CUDA build from the [ExLlamaV3 v1.4.4 release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.4.4), then install the downloaded wheel and ExQServe:
+Download the `linux_x86_64` ExLlamaV3 wheel that matches your Python version, PyTorch version, and CUDA build from the [ExLlamaV3 v1.5.0 release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.0), then install the downloaded wheel and ExQServe:
 
 ```bash
 pip install ./path/to/exllamav3.whl
 pip install .
 ```
 
-If you use a different Python / PyTorch / CUDA combination, choose the matching wheel from the upstream [ExLlamaV3 releases](https://github.com/turboderp-org/exllamav3/releases).
+If you use a different Python / PyTorch / CUDA combination, choose the matching wheel from the upstream [ExLlamaV3 releases](https://github.com/turboderp-org/exllamav3/releases). Optional backend features are capability-gated; explicitly requesting an unsupported feature fails during load instead of silently degrading.
 
 ### Docker
 
@@ -123,7 +123,7 @@ pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -U "triton-windows<3.7"
 ```
 
-Download the `win_amd64` ExLlamaV3 wheel that matches your Python version (`cp312`, `cp313`, `cp314`, etc.), PyTorch version, and CUDA build from the [ExLlamaV3 v1.4.4 release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.4.4), then install the downloaded wheel and ExQServe:
+Download the `win_amd64` ExLlamaV3 wheel that matches your Python version (`cp312`, `cp313`, `cp314`, etc.), PyTorch version, and CUDA build from the [ExLlamaV3 v1.5.0 release](https://github.com/turboderp-org/exllamav3/releases/tag/v1.5.0), then install the downloaded wheel and ExQServe:
 
 ```powershell
 pip install .\path\to\exllamav3.whl
@@ -181,6 +181,10 @@ To listen on another interface, configure an API key and add `--host 0.0.0.0 --p
 
 Output injection accepts a JSON body such as `{"text":"..."}` for an active streaming request. It modifies the current assistant output rather than creating a new user turn; structured-output requests do not support injection.
 
+### OpenAI sampling extensions
+
+OpenAI request bodies can also use ExLlamaV3 sampler extensions including DRY controls, `blocked_tokens`, `banned_strings`, and `token_healing`. These are opt-in ExQServe extensions rather than OpenAI-standard fields.
+
 ## Common runtime options
 
 | Option | Description |
@@ -196,9 +200,9 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--vision` | Load the model's vision component and accept image input; fails clearly if the selected model/backend cannot provide it |
 | `--vision-offload` | Keep the ExLlamaV3 vision component in pinned host memory to reduce VRAM use |
 | `--allow-remote-images` | Allow HTTP(S) image URLs; data-image URLs only require `--vision` |
-| `--vision-cache-mb` | CPU budget for cached vision embeddings (default 256 MiB; `0` disables retention) |
+| `--vision-cache-mb` | CPU budget for cached vision embeddings (default 1024 MiB; `0` disables retention) |
 | `--max-injection-body-bytes` | Maximum JSON body size for output injection (default 64 KiB) |
-| `--cache-tokens` | KV-cache capacity |
+| `--cache-tokens` | KV-cache capacity; default `auto` resolves capacity from the loaded model/runtime |
 | `--kv-cache-bits` | KV-cache precision |
 | `--sysmem-kv-cache-mb` | Pinned system-memory budget for ExLlamaV3's second-tier K/V page cache |
 | `--sysmem-recurrent-cache-mb` | System-memory budget for ExLlamaV3 recurrent-state checkpoints |
@@ -211,7 +215,7 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--reasoning-budget-tokens` | Default soft reasoning-token budget; `-1` disables the server default |
 | `--reasoning-budget-message` | Optional text inserted inside reasoning immediately before a budget-forced close |
 | `--max-batch-size` | Maximum batch size |
-| `--max-chunk-size` | Prefill chunk size |
+| `--max-chunk-size` | Prefill chunk size (default `1024`) |
 | `--mtp` | Enable MTP speculative decoding |
 | `--mtp-draft-tokens` | MTP draft-token count |
 | `--mtp-cache-bits` | MTP draft-cache precision |
@@ -223,6 +227,7 @@ Output injection accepts a JSON body such as `{"text":"..."}` for an active stre
 | `--moe-cpu-offload-layers` | Run the first N eligible block-sparse MoE layers on CPU |
 | `--moe-cpu-split-experts` | Keep N routed experts per eligible MoE layer on CPU through ExLlamaV3 split mode |
 | `--draft-moe-cpu-offload-layers` | Run the first N eligible draft/MTP MoE layers on CPU |
+| `--moe-pinned-arena` | Opt in to ExLlamaV3 1.5 pinned-arena support for eligible MoE CPU offload on Linux |
 | `--moe-cpu-threads` | Worker-thread count for ExLlamaV3 MoE CPU offload |
 | `--device-ids` | Process-visible CUDA device allowlist, e.g. `0,1` |
 | `--tensor-parallel` | Enable ExLlamaV3 tensor parallelism |
@@ -257,9 +262,9 @@ model-directory: ./models/Qwen3.8-27B-exl3-SC_4.00bpw_H5
 served-model-id: Qwen3.8-27B-exl3-SC_4.00bpw_H5
 host: 127.0.0.1
 port: 8000
-cache-tokens: 32768
+cache-tokens: auto
 kv-cache-bits: 8
-max-chunk-size: 2048
+max-chunk-size: 1024
 mtp: true
 mtp-draft-tokens: 4
 mtp-cache-bits: 4
