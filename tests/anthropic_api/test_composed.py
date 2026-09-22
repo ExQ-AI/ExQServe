@@ -114,6 +114,48 @@ class _Runtime:
         self.is_ready = False
 
 
+class _LongContextRuntime(_Runtime):
+    def __init__(self, context_length: int = 262144) -> None:
+        super().__init__()
+        self.model_metadata = RuntimeModelMetadata(
+            context_length,
+            "Qwen3_5ForConditionalGeneration",
+        )
+
+    @staticmethod
+    def _content_tokens(value: object) -> int:
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, list):
+            return sum(_LongContextRuntime._content_tokens(item) for item in value)
+        if isinstance(value, dict):
+            block_type = value.get("type")
+            if block_type == "text":
+                return _LongContextRuntime._content_tokens(value.get("text"))
+            if block_type == "tool_result":
+                return _LongContextRuntime._content_tokens(value.get("content"))
+            return sum(
+                _LongContextRuntime._content_tokens(item)
+                for key, item in value.items()
+                if key not in {"type", "tool_use_id", "is_error"}
+            )
+        return 0
+
+    def render_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]] | None,
+        template_kwargs: dict[str, object],
+        *,
+        add_generation_prompt: bool = True,
+        protect_literal_tokens: bool = False,
+    ) -> RuntimeRenderedPrompt:
+        del tools, template_kwargs, add_generation_prompt, protect_literal_tokens
+        self.render_calls.append(messages)
+        token_count = sum(self._content_tokens(message.get("content")) for message in messages)
+        return RuntimeRenderedPrompt("long-context", (1,) * token_count)
+
+
 async def _request(app: object, method: str, path: str, **kwargs: object) -> httpx.Response:
     transport = httpx.ASGITransport(app=app)  # type: ignore[arg-type]
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -333,5 +375,103 @@ def test_composed_mid_system_strict_rejects_and_claude_code_best_effort_compiles
                 }
             ]
             assert compatible_runtime.render_calls == [expected_messages, expected_messages]
+
+    asyncio.run(scenario())
+
+
+def test_claude_code_long_context_count_admission_and_compaction_share_one_limit(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        runtime = _LongContextRuntime(262144)
+        composed = compose_server(
+            ServerConfig(
+                model_directory=model_dir,
+                anthropic_compatibility_profile="claude-code",
+                max_inference_recovery_attempts=1,
+            ),
+            runtime=runtime,
+        )
+
+        giant_tool_result = "R" * 220000
+        compacted_tool_result = "R" * 120000
+
+        def messages(tool_result: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": tool_result,
+                        }
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ]
+
+        async with composed.app.router.lifespan_context(composed.app):
+            model = await _request(composed.app, "GET", "/v1/models/model")
+            assert model.status_code == 200, model.text
+            assert model.json()["context_length"] == 262144
+
+            counted = await _request(
+                composed.app,
+                "POST",
+                "/v1/messages/count_tokens",
+                headers=_headers(),
+                json={"model": "model", "messages": messages(giant_tool_result)},
+            )
+            assert counted.status_code == 200, counted.text
+            assert counted.json() == {"input_tokens": 220008}
+
+            oversized = await _request(
+                composed.app,
+                "POST",
+                "/v1/messages",
+                headers=_headers(),
+                json={
+                    "model": "model",
+                    "max_tokens": 42137,
+                    "messages": messages(giant_tool_result),
+                },
+            )
+            assert oversized.status_code == 400, oversized.text
+            assert oversized.json()["error"]["exqserve_code"] == "context_length_exceeded"
+            assert runtime.submit_calls == 0
+
+            compacted_count = await _request(
+                composed.app,
+                "POST",
+                "/v1/messages/count_tokens",
+                headers=_headers(),
+                json={"model": "model", "messages": messages(compacted_tool_result)},
+            )
+            assert compacted_count.status_code == 200, compacted_count.text
+            assert compacted_count.json() == {"input_tokens": 120008}
+
+            admitted = await _request(
+                composed.app,
+                "POST",
+                "/v1/messages",
+                headers=_headers(),
+                json={
+                    "model": "model",
+                    "max_tokens": 32768,
+                    "messages": messages(compacted_tool_result),
+                },
+            )
+            assert admitted.status_code == 200, admitted.text
+            assert runtime.submit_calls == 1
 
     asyncio.run(scenario())

@@ -31,6 +31,16 @@ class RuntimeEngineStats:
     kv_cached_pages_reused_since_generator_start: int | None = None
     kv_pages_restored_from_cpu_tier_since_generator_start: int | None = None
     kv_cached_kv_only_pages_since_generator_start: int | None = None
+    cpu_kv_cached_pages: int | None = None
+    cpu_kv_cache_max_pages: int | None = None
+    cpu_kv_cache_pushes_since_generator_start: int | None = None
+    cpu_kv_cache_restores_since_generator_start: int | None = None
+    cpu_kv_cache_evictions_since_generator_start: int | None = None
+    cpu_kv_cache_dedup_hits_since_generator_start: int | None = None
+    recurrent_cache_entries: int | None = None
+    recurrent_cache_bytes: int | None = None
+    recurrent_cache_evictions_since_generator_start: int | None = None
+    recurrent_cache_pruned_since_generator_start: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, RuntimeEngineState):
@@ -49,6 +59,16 @@ class RuntimeEngineStats:
             "kv_cached_pages_reused_since_generator_start",
             "kv_pages_restored_from_cpu_tier_since_generator_start",
             "kv_cached_kv_only_pages_since_generator_start",
+            "cpu_kv_cached_pages",
+            "cpu_kv_cache_max_pages",
+            "cpu_kv_cache_pushes_since_generator_start",
+            "cpu_kv_cache_restores_since_generator_start",
+            "cpu_kv_cache_evictions_since_generator_start",
+            "cpu_kv_cache_dedup_hits_since_generator_start",
+            "recurrent_cache_entries",
+            "recurrent_cache_bytes",
+            "recurrent_cache_evictions_since_generator_start",
+            "recurrent_cache_pruned_since_generator_start",
         ):
             value = getattr(self, name)
             if value is None:

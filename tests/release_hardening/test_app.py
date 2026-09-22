@@ -229,7 +229,7 @@ def test_composition_loads_runtime_and_serves_health_metrics_and_chat(tmp_path: 
             models = await _request(composed.app, "GET", "/v1/models")
             assert models.status_code == 200
             assert models.json()["data"][0]["id"] == "local"
-            assert models.json()["data"][0]["context_length"] == 32768
+            assert models.json()["data"][0]["context_length"] == 131072
 
             inactive_injection = await _request(
                 composed.app,
@@ -1315,10 +1315,12 @@ def test_model_management_switch_unload_load_keeps_http_app_alive(tmp_path: Path
 
         runtimes: list[_FakeRuntime] = []
         initial = _FakeRuntime()
+        initial.model_metadata = RuntimeModelMetadata(32768)
         runtimes.append(initial)
 
         def runtime_factory() -> _FakeRuntime:
             created = _FakeRuntime()
+            created.model_metadata = RuntimeModelMetadata(131072)
             runtimes.append(created)
             return created
 
@@ -1337,6 +1339,9 @@ def test_model_management_switch_unload_load_keeps_http_app_alive(tmp_path: Path
                 "models": ["first", "second"],
             }
             assert str(tmp_path) not in admin.text
+            current = composed.model_manager.current_model()
+            assert current is not None
+            assert current.context_length == 32768
 
             switched = await _request(
                 composed.app,
@@ -1346,6 +1351,9 @@ def test_model_management_switch_unload_load_keeps_http_app_alive(tmp_path: Path
             )
             assert switched.status_code == 200
             assert switched.json()["current_model"] == "second"
+            current = composed.model_manager.current_model()
+            assert current is not None
+            assert current.context_length == 131072
             assert initial.close_calls == 1
             models = await _request(composed.app, "GET", "/v1/models")
             assert models.json()["data"][0]["id"] == "second"

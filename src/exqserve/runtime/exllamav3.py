@@ -1068,6 +1068,10 @@ def _load_backend_module() -> Any:
     return importlib.import_module("exllamav3")
 
 
+def _supports_sysmem_kv_shutdown(backend: Any) -> bool:
+    return getattr(backend, "cpu_page_cache_lifecycle_safe", False) is True
+
+
 def _load_torch_module() -> Any:
     return importlib.import_module("torch")
 
@@ -1258,6 +1262,46 @@ def _runtime_model_metadata(
         architecture=_backend_architecture(backend_config),
         backend_context_tokens=backend_limit,
         generation_headroom_tokens=headroom,
+        cache_capacity_tokens=cache_limit,
+    )
+
+
+def _aligned_cache_tokens(value: int) -> int:
+    return (value // _EXLLAMAV3_PAGE_SIZE) * _EXLLAMAV3_PAGE_SIZE
+
+
+def _auto_cache_candidates(config: ExLlamaV3LoadConfig) -> tuple[int, ...]:
+    backend = _load_backend_module()
+    backend_config = backend.Config.from_directory(config.model_directory)
+    model_limit = _backend_context_limit(backend_config)
+    ceiling = 32768 if model_limit is None else model_limit
+    ceiling = max(_EXLLAMAV3_PAGE_SIZE, _aligned_cache_tokens(ceiling))
+    minimum = min(
+        ceiling,
+        ((config.max_chunk_size + _EXLLAMAV3_PAGE_SIZE - 1) // _EXLLAMAV3_PAGE_SIZE)
+        * _EXLLAMAV3_PAGE_SIZE,
+    )
+    raw = (
+        ceiling,
+        _aligned_cache_tokens(ceiling * 3 // 4),
+        _aligned_cache_tokens(ceiling // 2),
+        _aligned_cache_tokens(ceiling // 4),
+        32768, 16384, 8192, 4096, 2048, 1024, 256,
+        minimum,
+    )
+    return tuple(dict.fromkeys(value for value in raw if minimum <= value <= ceiling))
+
+
+def _is_memory_capacity_error(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    return (
+        "outofmemory" in name
+        or "out of memory" in text
+        or "insufficient memory" in text
+        or "insufficient vram in split for model and cache" in text
+        or "not enough memory" in text
+        or "memory fraction" in text
     )
 
 
@@ -1277,8 +1321,11 @@ def _tensor_to_token_ids(value: object) -> tuple[int, ...]:
 
 
 def _build_sampler(backend: Any, sampling: RuntimeSamplingConfig | None) -> object:
-    if sampling is None:
+    if sampling is None or not sampling.sampler_requested:
         return backend.DefaultSampler()
+    logit_bias = dict(sampling.logit_bias)
+    for blocked_id in sampling.blocked_ids:
+        logit_bias[blocked_id] = -float("inf")
     return backend.ComboSampler(
         temperature=sampling.temperature,
         min_p=sampling.min_p,
@@ -1292,7 +1339,12 @@ def _build_sampler(backend: Any, sampling: RuntimeSamplingConfig | None) -> obje
         temp_last=sampling.temperature_last,
         adaptive_target=sampling.adaptive_target,
         adaptive_decay=sampling.adaptive_decay,
-        logit_bias=dict(sampling.logit_bias),
+        logit_bias=logit_bias,
+        dry_multiplier=sampling.dry_multiplier,
+        dry_base=sampling.dry_base,
+        dry_allowed_length=sampling.dry_allowed_length,
+        dry_range=sampling.dry_range,
+        dry_sequence_breakers=sampling.dry_sequence_breaker_ids,
     )
 
 
@@ -1476,6 +1528,12 @@ def _create_backend_job(
         "stop_conditions": stop_conditions,
         "decode_special_tokens": False,
     }
+    sampling = request.sampling
+    if sampling is not None:
+        if sampling.banned_strings:
+            kwargs["banned_strings"] = list(sampling.banned_strings)
+        if sampling.token_healing:
+            kwargs["token_healing"] = True
     if max_requeue_tokens is not None:
         kwargs["max_rq_tokens"] = max_requeue_tokens
     if embeddings:
@@ -1838,6 +1896,12 @@ class ExLlamaV3Runtime:
         )
         page_metrics = getattr(pagetable, "metrics", None)
         metrics = page_metrics if isinstance(page_metrics, Mapping) else {}
+        cpu_page_cache = getattr(backend_generator, "cpu_page_cache", None)
+        cpu_page_metrics_value = getattr(cpu_page_cache, "metrics", None)
+        cpu_page_metrics = cpu_page_metrics_value if isinstance(cpu_page_metrics_value, Mapping) else {}
+        recurrent_cache = getattr(backend_generator, "recurrent_cache", None)
+        recurrent_metrics_value = getattr(recurrent_cache, "metrics", None)
+        recurrent_metrics = recurrent_metrics_value if isinstance(recurrent_metrics_value, Mapping) else {}
         return RuntimeEngineStats(
             RuntimeEngineState.READY,
             active_jobs=active_jobs,
@@ -1853,6 +1917,20 @@ class ExLlamaV3Runtime:
             kv_cached_pages_reused_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_cached_pages")),
             kv_pages_restored_from_cpu_tier_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_tier_pages")),
             kv_cached_kv_only_pages_since_generator_start=_optional_nonnegative_int(metrics.get("alloc_kv_only_pages")),
+            cpu_kv_cached_pages=_optional_nonnegative_int(len(cpu_page_cache)) if cpu_page_cache is not None else None,
+            cpu_kv_cache_max_pages=_optional_nonnegative_int(getattr(cpu_page_cache, "max_slots", None)),
+            cpu_kv_cache_pushes_since_generator_start=_optional_nonnegative_int(cpu_page_metrics.get("pushes")),
+            cpu_kv_cache_restores_since_generator_start=_optional_nonnegative_int(cpu_page_metrics.get("restores")),
+            cpu_kv_cache_evictions_since_generator_start=_optional_nonnegative_int(cpu_page_metrics.get("evictions")),
+            cpu_kv_cache_dedup_hits_since_generator_start=_optional_nonnegative_int(cpu_page_metrics.get("dedup_hits")),
+            recurrent_cache_entries=_optional_nonnegative_int(len(recurrent_cache)) if recurrent_cache is not None else None,
+            recurrent_cache_bytes=_optional_nonnegative_int(getattr(recurrent_cache, "current_size", None)),
+            recurrent_cache_evictions_since_generator_start=_optional_nonnegative_int(
+                recurrent_metrics.get("stash_evictions")
+            ),
+            recurrent_cache_pruned_since_generator_start=_optional_nonnegative_int(
+                recurrent_metrics.get("stash_pruned")
+            ),
         )
 
     def create_prompt_renderer(self) -> _ExLlamaV3PromptRenderer:
@@ -2208,9 +2286,38 @@ class ExLlamaV3Runtime:
         if self._resources is not None:
             raise RuntimeError("ExLlamaV3 runtime is already loaded")
 
+        if config.sysmem_kv_cache_mb > 0:
+            backend = _load_backend_module()
+            if not _supports_sysmem_kv_shutdown(backend):
+                raise RuntimeError(
+                    "sysmem_kv_cache_mb requires ExLlamaV3 CPU page-cache shutdown support; "
+                    "the active runtime must be upgraded or the system-memory K/V tier disabled"
+                )
+
         _configure_cuda_malloc_async(config.cuda_malloc_async)
         _configure_qc_staging(config.qc_staging)
-        resources = self._build_resources(config)
+        if config.cache_tokens is not None:
+            resources = self._build_resources(config)
+        else:
+            resources = None
+            last_memory_error: BaseException | None = None
+            for cache_tokens in _auto_cache_candidates(config):
+                resolved_config = replace(config, cache_tokens=cache_tokens)
+                try:
+                    resources = self._build_resources(resolved_config)
+                    break
+                except Exception as exc:
+                    if not _is_memory_capacity_error(exc):
+                        raise
+                    last_memory_error = exc
+                    logger.warning(
+                        "AUTO cache capacity %d tokens did not fit; retrying conservatively",
+                        cache_tokens,
+                    )
+            if resources is None:
+                raise RuntimeError(
+                    "ExLlamaV3 AUTO cache resolution could not fit even one backend page"
+                ) from last_memory_error
         self._resources = resources
         self._generator = None
         self._generator_episode = None
@@ -2224,6 +2331,9 @@ class ExLlamaV3Runtime:
 
     @staticmethod
     def _build_resources(config: ExLlamaV3LoadConfig) -> _ExLlamaV3Resources:
+        cache_tokens = config.cache_tokens
+        if cache_tokens is None:
+            raise ValueError("runtime cache capacity must be resolved before resource construction")
         backend = _load_backend_module()
         reserve_per_device = _effective_reserve_per_device(config)
         model: Any | None = None
@@ -2303,7 +2413,7 @@ class ExLlamaV3Runtime:
                         "v_bits": config.cache_value_bits,
                     }
                 )
-            cache_object = backend.Cache(model, config.cache_tokens, **cache_kwargs)
+            cache_object = backend.Cache(model, cache_tokens, **cache_kwargs)
             model_metadata = _runtime_model_metadata(config, backend_config, cache_object)
 
             if draft_model is not None:
@@ -2315,10 +2425,10 @@ class ExLlamaV3Runtime:
                         draft_model,
                         config.mtp_draft_tokens,
                     )
-                    draft_cache_tokens = config.cache_tokens
+                    draft_cache_tokens = cache_tokens
                     draft_cache_bits = config.mtp_cache_bits
                 else:
-                    draft_cache_tokens = _draft_cache_size(draft_model, config.cache_tokens)
+                    draft_cache_tokens = _draft_cache_size(draft_model, cache_tokens)
                     draft_cache_bits = config.draft_cache_bits
                 if draft_cache_bits is not None:
                     draft_cache_kwargs.update(

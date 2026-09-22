@@ -29,13 +29,20 @@ _CLAUDE_CODE_CMD_ENV = "EXQSERVE_CLAUDE_CODE_CMD"
 
 
 class _Session:
-    def __init__(self, request_id: str) -> None:
+    def __init__(self, request: ServingRequest) -> None:
+        request_id = request.input.request_id
+        rendered = repr(request.input.items)
+        text = (
+            '{"title":"Claude Code OK"}'
+            if "naming a coding session" in rendered
+            else "CLAUDE_CODE_OK"
+        )
         usage = TokenUsage(input_tokens=32, output_tokens=4)
         self._events: list[GenerationEvent] = [
             GenerationStarted(request_id),
             TextStarted(request_id),
-            TextDelta(request_id, "CLAUDE_CODE_OK"),
-            TextCompleted(request_id, "CLAUDE_CODE_OK"),
+            TextDelta(request_id, text),
+            TextCompleted(request_id, text),
             GenerationCompleted(request_id, CompletionReason.STOP, usage),
         ]
 
@@ -62,7 +69,9 @@ class _Engine:
 
     async def submit(self, request: ServingRequest) -> _Session:
         self.requests.append(request)
-        return _Session(request.input.request_id)
+        session = _Session(request)
+        session.input_token_count = 32
+        return session
 
 
 @contextmanager
@@ -104,7 +113,7 @@ def test_claude_code_print_mode_uses_exqserve_messages_api_directly() -> None:
         env = os.environ.copy()
         env["ANTHROPIC_BASE_URL"] = base_url
         env["ANTHROPIC_API_KEY"] = "test"
-        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "32768"
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "262144"
         env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
         command = [

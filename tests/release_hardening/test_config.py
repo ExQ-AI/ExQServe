@@ -12,7 +12,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
 
     assert config.host == "127.0.0.1"
     assert config.port == 8000
-    assert config.cache_tokens == 32768
+    assert config.cache_tokens is None
     assert config.cache_key_bits == 8
     assert config.cache_value_bits == 8
     assert config.max_batch_size == 8
@@ -41,11 +41,11 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.capture_mode is CaptureMode.OFF
     assert config.capture_path is None
     assert config.effective_served_model_id() == tmp_path.name
-    assert config.effective_context_length(131072) == 32768
+    assert config.effective_context_length(131072) == 131072
 
     runtime = config.runtime_load_config()
     assert runtime.model_directory == str(tmp_path)
-    assert runtime.cache_tokens == 32768
+    assert runtime.cache_tokens is None
     assert runtime.cache_key_bits == 8
     assert runtime.cache_value_bits == 8
     assert runtime.mtp_enabled is False

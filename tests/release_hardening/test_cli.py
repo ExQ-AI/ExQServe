@@ -13,10 +13,14 @@ from exqserve.server.app import RuntimeUnavailableError
 
 def test_cli_defaults_to_auto_output_tokens_and_accepts_explicit_auto(tmp_path: Path) -> None:
     defaulted = cli.parse_config([str(tmp_path)])
-    explicit = cli.parse_config([str(tmp_path), "--default-output-tokens", "auto"])
+    explicit = cli.parse_config(
+        [str(tmp_path), "--default-output-tokens", "auto", "--cache-tokens", "auto"]
+    )
 
     assert defaulted.default_api_output_tokens is None
     assert explicit.default_api_output_tokens is None
+    assert defaulted.cache_tokens is None
+    assert explicit.cache_tokens is None
 
 
 def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:

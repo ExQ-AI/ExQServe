@@ -295,6 +295,14 @@ def test_sampling_config_validates_common_combo_subset() -> None:
         adaptive_target=0.5,
         adaptive_decay=0.8,
         logit_bias=((10, 2.5), (20, -3.0)),
+        dry_multiplier=0.7,
+        dry_base=1.8,
+        dry_allowed_length=3,
+        dry_range=1024,
+        dry_sequence_breaker_ids=(30, 31),
+        blocked_ids=(40, 41),
+        banned_strings=("alpha", "beta"),
+        token_healing=True,
     )
     assert sampling.top_k == 40
     assert sampling.repetition_penalty_range == 512
@@ -302,6 +310,11 @@ def test_sampling_config_validates_common_combo_subset() -> None:
     assert sampling.adaptive_target == 0.5
     assert sampling.adaptive_decay == 0.8
     assert sampling.logit_bias == ((10, 2.5), (20, -3.0))
+    assert sampling.dry_multiplier == 0.7
+    assert sampling.dry_sequence_breaker_ids == (30, 31)
+    assert sampling.blocked_ids == (40, 41)
+    assert sampling.banned_strings == ("alpha", "beta")
+    assert sampling.token_healing is True
     assert sampling.temperature_last is True
 
     with pytest.raises(ValueError, match="temperature"):
@@ -326,6 +339,20 @@ def test_sampling_config_validates_common_combo_subset() -> None:
         RuntimeSamplingConfig(logit_bias=((-1, 0.0),))
     with pytest.raises(ValueError, match="finite"):
         RuntimeSamplingConfig(logit_bias=((1, float("nan")),))
+    with pytest.raises(ValueError, match="dry_multiplier"):
+        RuntimeSamplingConfig(dry_multiplier=-0.1)
+    with pytest.raises(ValueError, match="dry_allowed_length"):
+        RuntimeSamplingConfig(dry_allowed_length=-1)
+    with pytest.raises(ValueError, match="dry_range"):
+        RuntimeSamplingConfig(dry_range=-1)
+    with pytest.raises(ValueError, match="dry_sequence_breaker_ids"):
+        RuntimeSamplingConfig(dry_sequence_breaker_ids=(1, 1))
+    with pytest.raises(ValueError, match="blocked_ids"):
+        RuntimeSamplingConfig(blocked_ids=(-1,))
+    with pytest.raises(ValueError, match="banned_strings"):
+        RuntimeSamplingConfig(banned_strings=("",))
+    with pytest.raises(TypeError, match="token_healing"):
+        RuntimeSamplingConfig(token_healing=1)  # type: ignore[arg-type]
 
 
 def test_generation_request_is_immutable_and_protocol_neutral() -> None:

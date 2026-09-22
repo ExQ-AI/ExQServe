@@ -33,7 +33,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "chat_template": None,
     "host": "127.0.0.1",
     "port": 8000,
-    "cache_tokens": 32768,
+    "cache_tokens": "auto",
     "kv_cache_bits": "8",
     "max_batch_size": 8,
     "max_chunk_size": 2048,
@@ -182,7 +182,10 @@ def _build_parser(
     )
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
-    parser.add_argument("--cache-tokens", type=int)
+    parser.add_argument(
+        "--cache-tokens",
+        help="KV cache token capacity; use 'auto' (default) to resolve from the loaded model/runtime.",
+    )
     parser.add_argument(
         "--kv-cache-bits",
         choices=("fp16", "2", "3", "4", "5", "6", "7", "8"),
@@ -589,6 +592,25 @@ def _default_output_tokens(value: object) -> int | None:
     return parsed
 
 
+def _cache_tokens(value: object) -> int | None:
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    if isinstance(value, bool):
+        raise TypeError("cache tokens must be a positive multiple of 256 or 'auto'")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError("cache tokens must be a positive multiple of 256 or 'auto'") from exc
+    else:
+        raise TypeError("cache tokens must be a positive multiple of 256 or 'auto'")
+    if parsed <= 0 or parsed % 256 != 0:
+        raise ValueError("cache tokens must be a positive multiple of 256 or 'auto'")
+    return parsed
+
+
 def _read_api_key_file(path: Path) -> list[str]:
     values = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not values:
@@ -634,6 +656,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         parser.error("model_directory is required (or set model-directory in --config)")
     args = argparse.Namespace(**resolved)
     args.default_output_tokens = _default_output_tokens(args.default_output_tokens)
+    args.cache_tokens = _cache_tokens(args.cache_tokens)
 
     key_bits, value_bits = _cache_bits(args.kv_cache_bits)
     mtp_bits, _ = _cache_bits(args.mtp_cache_bits)

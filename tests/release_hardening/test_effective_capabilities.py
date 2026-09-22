@@ -38,6 +38,36 @@ def test_effective_snapshot_is_frozen_and_context_authoritative(tmp_path: Path) 
         snapshot.context_window = 1  # type: ignore[misc]
 
 
+def test_auto_context_uses_loaded_runtime_capacity_and_operator_cap(tmp_path: Path) -> None:
+    runtime = SimpleNamespace(
+        capabilities=ExLlamaV3Runtime.capabilities,
+        model_metadata=RuntimeModelMetadata(
+            131072,
+            "Qwen3_5ForConditionalGeneration",
+            backend_context_tokens=131076,
+            generation_headroom_tokens=4,
+            cache_capacity_tokens=131328,
+        ),
+        vision_loaded=False,
+    )
+
+    auto = resolve_effective_model_snapshot(ServerConfig(tmp_path), QwenDialect(), runtime)
+    capped = resolve_effective_model_snapshot(
+        ServerConfig(tmp_path, max_total_tokens=65536), QwenDialect(), runtime
+    )
+    explicit = resolve_effective_model_snapshot(
+        ServerConfig(tmp_path, cache_tokens=32768), QwenDialect(), runtime
+    )
+    sysmem = resolve_effective_model_snapshot(
+        ServerConfig(tmp_path, sysmem_kv_cache_mb=65536), QwenDialect(), runtime
+    )
+
+    assert auto.context_window == 131072
+    assert capped.context_window == 65536
+    assert explicit.context_window == 32768
+    assert sysmem.context_window == 131072
+
+
 @pytest.mark.parametrize("dialect_vision", (False, True))
 @pytest.mark.parametrize("runtime_vision", (False, True))
 @pytest.mark.parametrize("vision_loaded", (False, True))

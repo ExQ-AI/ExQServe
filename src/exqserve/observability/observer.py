@@ -153,7 +153,11 @@ def _execution_metadata(
         "runtime_state": getattr(diagnostics, "runtime_state", "unknown"),
         "final_attempt": final_attempt if isinstance(final_attempt, int) else 1,
         "seed": request.seed,
-        "temperature": None if sampling is None else sampling.temperature,
+        "temperature": (
+            None
+            if sampling is None or sampling.sampler_requested is False
+            else sampling.temperature
+        ),
         "recovery_attempts": recovery_attempts if isinstance(recovery_attempts, int) else 0,
         "recovered": recovered if isinstance(recovered, bool) else False,
         "attempts": _attempt_record_payloads(diagnostics),

@@ -356,6 +356,7 @@ def _backend(
             state["generator"] = self
 
     backend = SimpleNamespace(
+        cpu_page_cache_lifecycle_safe=True,
         Config=Config,
         Tokenizer=Tokenizer,
         Model=Model,
@@ -380,6 +381,23 @@ def _reset_factories() -> None:
     _FakeLoRA.calls.clear()
     _FakeLoRA.instances.clear()
     _FakeLoRA.fail_directory = None
+
+
+def test_sysmem_kv_requires_lifecycle_safe_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    backend.cpu_page_cache_lifecycle_safe = False
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+
+    with pytest.raises(RuntimeError, match="page-cache shutdown support"):
+        runtime.load(
+            ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024, sysmem_kv_cache_mb=64)
+        )
+
+    assert backend._state["config_directories"] == []
 
 
 def test_load_uses_official_q8_cache_and_normal_autosplit_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2149,6 +2167,14 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
             adaptive_target=0.5,
             adaptive_decay=0.75,
             logit_bias=((10, 2.0), (20, -1.5)),
+            dry_multiplier=0.7,
+            dry_base=1.8,
+            dry_allowed_length=3,
+            dry_range=64,
+            dry_sequence_breaker_ids=(30, 31),
+            blocked_ids=(40, 41),
+            banned_strings=("alpha", "beta"),
+            token_healing=True,
         ),
     )
     native_eos = RuntimeGenerationRequest(
@@ -2181,7 +2207,12 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
             "temp_last": True,
             "adaptive_target": 0.5,
             "adaptive_decay": 0.75,
-            "logit_bias": {10: 2.0, 20: -1.5},
+            "logit_bias": {10: 2.0, 20: -1.5, 40: -float("inf"), 41: -float("inf")},
+            "dry_multiplier": 0.7,
+            "dry_base": 1.8,
+            "dry_allowed_length": 3,
+            "dry_range": 64,
+            "dry_sequence_breakers": (30, 31),
         }
     ]
     assert _FakeTorch.calls == [
@@ -2200,10 +2231,49 @@ def test_submit_builds_default_or_combo_sampler_and_cpu_input_tensor(
     assert isinstance(second_args[3], _FakeComboSampler)
     assert second_args[4] == 123
     assert second_kwargs["stop_conditions"] == (7,)
+    assert second_kwargs["banned_strings"] == ["alpha", "beta"]
+    assert second_kwargs["token_healing"] is True
     assert "max_rq_tokens" not in second_kwargs
     _, _, third_args, third_kwargs = _FakeAsyncJob.calls[2]
     assert third_args[:3] == (5, 0, 4)
     assert third_kwargs["stop_conditions"] == (248044, 248046, "literal-stop")
+
+
+def test_job_only_generation_controls_keep_backend_default_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_torch_module", lambda: _FakeTorch)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024))
+
+    request = RuntimeGenerationRequest(
+        "req-job-only",
+        (1, 2, 3),
+        8,
+        sampling=RuntimeSamplingConfig(
+            banned_strings=("BANME",),
+            token_healing=True,
+            sampler_requested=False,
+        ),
+    )
+
+    async def scenario() -> None:
+        runtime.submit(request)
+
+    asyncio.run(scenario())
+
+    assert _FakeDefaultSampler.calls == 1
+    assert _FakeComboSampler.calls == []
+    assert len(_FakeAsyncJob.calls) == 1
+    _, _, args, kwargs = _FakeAsyncJob.calls[0]
+    assert isinstance(args[3], _FakeDefaultSampler)
+    assert kwargs["banned_strings"] == ["BANME"]
+    assert kwargs["token_healing"] is True
 
 
 def test_submit_maps_explicit_generation_constraint_to_strict_llguidance_filter(

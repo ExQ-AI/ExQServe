@@ -6,6 +6,16 @@ from exqserve.core.engine_stats import RuntimeEngineState
 from exqserve.runtime.exllamav3 import ExLlamaV3Runtime, _GeneratorLifecycleState
 
 
+class _SizedCache:
+    def __init__(self, size: int, **attributes: object) -> None:
+        self._size = size
+        for name, value in attributes.items():
+            setattr(self, name, value)
+
+    def __len__(self) -> int:
+        return self._size
+
+
 def test_engine_stats_before_lazy_generator_uses_loaded_cache_without_creating_generator() -> None:
     runtime = ExLlamaV3Runtime()
     runtime._resources = SimpleNamespace(  # type: ignore[assignment]
@@ -45,6 +55,16 @@ def test_engine_stats_maps_current_generator_page_table_semantics() -> None:
         num_active_jobs=lambda: 2,
         num_pending_jobs=lambda: 5,
         pagetable=page_table,
+        cpu_page_cache=_SizedCache(
+            5,
+            max_slots=12,
+            metrics={"pushes": 11, "restores": 4, "evictions": 3, "dedup_hits": 2},
+        ),
+        recurrent_cache=_SizedCache(
+            2,
+            current_size=65536,
+            metrics={"stash_evictions": 6, "stash_pruned": 1},
+        ),
     )
     runtime = ExLlamaV3Runtime()
     runtime._resources = SimpleNamespace(  # type: ignore[assignment]
@@ -65,6 +85,16 @@ def test_engine_stats_maps_current_generator_page_table_semantics() -> None:
     assert stats.kv_cached_pages_reused_since_generator_start == 9
     assert stats.kv_pages_restored_from_cpu_tier_since_generator_start == 4
     assert stats.kv_cached_kv_only_pages_since_generator_start == 1
+    assert stats.cpu_kv_cached_pages == 5
+    assert stats.cpu_kv_cache_max_pages == 12
+    assert stats.cpu_kv_cache_pushes_since_generator_start == 11
+    assert stats.cpu_kv_cache_restores_since_generator_start == 4
+    assert stats.cpu_kv_cache_evictions_since_generator_start == 3
+    assert stats.cpu_kv_cache_dedup_hits_since_generator_start == 2
+    assert stats.recurrent_cache_entries == 2
+    assert stats.recurrent_cache_bytes == 65536
+    assert stats.recurrent_cache_evictions_since_generator_start == 6
+    assert stats.recurrent_cache_pruned_since_generator_start == 1
 
 
 def test_recovering_engine_stats_never_inspects_quarantined_generator() -> None:

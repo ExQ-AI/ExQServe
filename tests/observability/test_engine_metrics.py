@@ -23,6 +23,9 @@ def test_engine_metrics_replace_ready_values_with_nan_when_unavailable() -> None
             kv_pages_referenced=3,
             kv_pages_unreferenced=5,
             kv_pages_allocated_since_generator_start=9,
+            cpu_kv_cached_pages=4,
+            cpu_kv_cache_evictions_since_generator_start=2,
+            recurrent_cache_bytes=65536,
         )
     ]
     metrics = MetricsRegistry()
@@ -30,6 +33,9 @@ def test_engine_metrics_replace_ready_values_with_nan_when_unavailable() -> None
 
     ready = metrics.render_text()
     assert _sample(ready, "exqserve_engine_active_jobs") == 2.0
+    assert _sample(ready, "exqserve_engine_cpu_kv_cached_pages") == 4.0
+    assert _sample(ready, "exqserve_engine_cpu_kv_cache_evictions_since_generator_start") == 2.0
+    assert _sample(ready, "exqserve_engine_recurrent_cache_bytes") == 65536.0
     assert 'exqserve_engine_state{state="ready"} 1.0' in ready
 
     current[0] = RuntimeEngineStats(RuntimeEngineState.UNAVAILABLE)

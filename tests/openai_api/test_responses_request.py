@@ -135,6 +135,22 @@ def test_responses_string_input_and_default_output_limit() -> None:
     assert automatic.serving.max_output_tokens is None
 
 
+def test_responses_job_only_sampler_extensions_preserve_default_sampler_truth() -> None:
+    parsed = ResponsesRequestAdapter().parse(
+        {
+            "model": "m",
+            "input": "hi",
+            "banned_strings": ["BANME"],
+            "token_healing": True,
+        },
+        request_id="r-job",
+    )
+    assert parsed.serving.sampling is not None
+    assert parsed.serving.sampling.banned_strings == ("BANME",)
+    assert parsed.serving.sampling.token_healing is True
+    assert parsed.serving.sampling.sampler_requested is False
+
+
 def test_responses_retry_reasoning_marks_a_new_assistant_segment() -> None:
     parsed = ResponsesRequestAdapter().parse(
         {

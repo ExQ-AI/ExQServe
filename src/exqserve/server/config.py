@@ -19,7 +19,7 @@ class ServerConfig:
     model_directory: Path
     host: str = "127.0.0.1"
     port: int = 8000
-    cache_tokens: int = 32768
+    cache_tokens: int | None = None
     cache_key_bits: int | None = 8
     cache_value_bits: int | None = 8
     max_batch_size: int = 8
@@ -246,7 +246,8 @@ class ServerConfig:
         if self.response_store_ttl_seconds <= 0:
             raise ValueError("response_store_ttl_seconds must be positive")
         self.runtime_load_config()
-        self.request_control_config()
+        # Validate request-control fields before the runtime resolves AUTO cache capacity.
+        self.request_control_config_for_context(self.max_total_tokens or self.cache_tokens or 32768)
 
     def effective_model_root(self) -> Path:
         return self.model_directory.parent if self.model_root is None else self.model_root
@@ -265,11 +266,15 @@ class ServerConfig:
                 raise TypeError("model_limit must be an integer or None")
             if model_limit <= 0:
                 raise ValueError("model_limit must be positive")
-        limits = [self.cache_tokens]
+        limits: list[int] = []
+        if self.cache_tokens is not None:
+            limits.append(self.cache_tokens)
         if model_limit is not None:
             limits.append(model_limit)
         if self.max_total_tokens is not None:
             limits.append(self.max_total_tokens)
+        if not limits:
+            raise ValueError("effective context length is unavailable before AUTO cache resolution")
         return min(limits)
 
     def runtime_load_config(self, model_directory: Path | None = None) -> ExLlamaV3LoadConfig:
@@ -341,6 +346,10 @@ class ServerConfig:
         )
 
     def request_control_config(self, model_limit: int | None = None) -> RequestControlConfig:
+        if model_limit is None and self.cache_tokens is None and self.max_total_tokens is None:
+            # Pre-load validation fallback only. Loaded serving bundles always pass the resolved
+            # EffectiveModelSnapshot.context_window explicitly.
+            return self.request_control_config_for_context(32768)
         return self.request_control_config_for_context(self.effective_context_length(model_limit))
 
     def request_control_config_for_context(self, context_window: int) -> RequestControlConfig:

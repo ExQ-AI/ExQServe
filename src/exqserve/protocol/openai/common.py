@@ -277,6 +277,40 @@ def _parse_logit_bias(value: object) -> tuple[tuple[int, float], ...]:
     return tuple(parsed)
 
 
+def _parse_token_id_extension(
+    value: object,
+    name: str,
+    *,
+    allow_none: bool = False,
+) -> tuple[int, ...] | None:
+    if value is None:
+        return None if allow_none else ()
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a list of token ids")
+    parsed: list[int] = []
+    seen: set[int] = set()
+    for token_id in value:
+        if not isinstance(token_id, int) or isinstance(token_id, bool):
+            raise TypeError(f"{name} entries must be integers")
+        if token_id < 0 or token_id in seen:
+            raise ValueError(f"{name} entries must be unique and non-negative")
+        seen.add(token_id)
+        parsed.append(token_id)
+    return tuple(parsed)
+
+
+def _parse_string_list_extension(value: object, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a list of strings")
+    if not all(isinstance(item, str) and item for item in value):
+        raise ValueError(f"{name} entries must be non-empty strings")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{name} entries must be unique")
+    return tuple(value)
+
+
 def _parse_penalty_range(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError("penalty_range must be an integer")
@@ -347,7 +381,7 @@ def parse_sampling(
     policy: SamplingOverridePolicy | None = None,
 ) -> RuntimeSamplingConfig | None:
     body = _apply_sampling_overrides(body, policy)
-    names = (
+    sampler_names = (
         "temperature",
         "top_p",
         "top_k",
@@ -361,8 +395,16 @@ def parse_sampling(
         "adaptive_target",
         "adaptive_decay",
         "logit_bias",
+        "dry_multiplier",
+        "dry_base",
+        "dry_allowed_length",
+        "dry_range",
+        "dry_sequence_breaker_ids",
+        "blocked_tokens",
     )
-    if not any(name in body for name in names):
+    job_option_names = ("banned_strings", "token_healing")
+    sampler_requested = any(name in body for name in sampler_names)
+    if not sampler_requested and not any(name in body for name in job_option_names):
         return None
     try:
         return RuntimeSamplingConfig(
@@ -379,6 +421,23 @@ def parse_sampling(
             adaptive_target=body.get("adaptive_target", 1.0),  # type: ignore[arg-type]
             adaptive_decay=body.get("adaptive_decay", 0.9),  # type: ignore[arg-type]
             logit_bias=_parse_logit_bias(body.get("logit_bias")),
+            dry_multiplier=body.get("dry_multiplier", 0.0),  # type: ignore[arg-type]
+            dry_base=body.get("dry_base", 1.75),  # type: ignore[arg-type]
+            dry_allowed_length=body.get("dry_allowed_length", 2),  # type: ignore[arg-type]
+            dry_range=body.get("dry_range", 0),  # type: ignore[arg-type]
+            dry_sequence_breaker_ids=_parse_token_id_extension(
+                body.get("dry_sequence_breaker_ids"),
+                "dry_sequence_breaker_ids",
+                allow_none=True,
+            ),
+            blocked_ids=_parse_token_id_extension(
+                body.get("blocked_tokens"),
+                "blocked_tokens",
+            )
+            or (),
+            banned_strings=_parse_string_list_extension(body.get("banned_strings"), "banned_strings"),
+            token_healing=body.get("token_healing", False),  # type: ignore[arg-type]
+            sampler_requested=sampler_requested,
         )
     except (TypeError, ValueError) as exc:
         raise invalid_request("invalid_sampling", "Sampling parameters are invalid.") from exc

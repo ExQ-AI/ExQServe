@@ -93,12 +93,14 @@ class RuntimeModelMetadata:
     architecture: str | None = None
     backend_context_tokens: int | None = None
     generation_headroom_tokens: int | None = None
+    cache_capacity_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "max_context_tokens",
             "backend_context_tokens",
             "generation_headroom_tokens",
+            "cache_capacity_tokens",
         ):
             value = getattr(self, name)
             if value is None:
@@ -137,7 +139,7 @@ class LoRAAdapterConfig:
 @dataclass(frozen=True, slots=True)
 class ExLlamaV3LoadConfig:
     model_directory: str
-    cache_tokens: int
+    cache_tokens: int | None
     cache_key_bits: int | None = 8
     cache_value_bits: int | None = 8
     max_batch_size: int = 16
@@ -180,10 +182,11 @@ class ExLlamaV3LoadConfig:
             raise TypeError("model_directory must be a string")
         if not self.model_directory.strip():
             raise ValueError("model_directory must not be empty")
-        if not isinstance(self.cache_tokens, int) or isinstance(self.cache_tokens, bool):
-            raise TypeError("cache_tokens must be an integer")
-        if self.cache_tokens <= 0 or self.cache_tokens % _PAGE_SIZE != 0:
-            raise ValueError("cache_tokens must be positive and a multiple of 256")
+        if self.cache_tokens is not None:
+            if not isinstance(self.cache_tokens, int) or isinstance(self.cache_tokens, bool):
+                raise TypeError("cache_tokens must be an integer or None")
+            if self.cache_tokens <= 0 or self.cache_tokens % _PAGE_SIZE != 0:
+                raise ValueError("cache_tokens must be positive and a multiple of 256")
 
         key_bits = self.cache_key_bits
         value_bits = self.cache_value_bits
@@ -393,6 +396,15 @@ class RuntimeSamplingConfig:
     adaptive_target: float = 1.0
     adaptive_decay: float = 0.9
     logit_bias: tuple[tuple[int, float], ...] = ()
+    dry_multiplier: float = 0.0
+    dry_base: float = 1.75
+    dry_allowed_length: int = 2
+    dry_range: int = 0
+    dry_sequence_breaker_ids: tuple[int, ...] | None = None
+    blocked_ids: tuple[int, ...] = ()
+    banned_strings: tuple[str, ...] = ()
+    token_healing: bool = False
+    sampler_requested: bool = True
 
     def __post_init__(self) -> None:
         for name in (
@@ -404,6 +416,8 @@ class RuntimeSamplingConfig:
             "presence_penalty",
             "adaptive_target",
             "adaptive_decay",
+            "dry_multiplier",
+            "dry_base",
         ):
             _validate_finite(name, getattr(self, name))
 
@@ -430,6 +444,16 @@ class RuntimeSamplingConfig:
             raise ValueError("adaptive_target must be between 0 and 1")
         if not 0 <= self.adaptive_decay < 1:
             raise ValueError("adaptive_decay must be between 0 (inclusive) and 1 (exclusive)")
+        if self.dry_multiplier < 0:
+            raise ValueError("dry_multiplier must be non-negative")
+        if self.dry_base < 0:
+            raise ValueError("dry_base must be non-negative")
+        for name in ("dry_allowed_length", "dry_range"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
         if not isinstance(self.logit_bias, tuple):
             raise TypeError("logit_bias must be a tuple")
         normalized_bias: list[tuple[int, float]] = []
@@ -446,6 +470,40 @@ class RuntimeSamplingConfig:
             seen_token_ids.add(token_id)
             normalized_bias.append((token_id, float(bias)))
         object.__setattr__(self, "logit_bias", tuple(normalized_bias))
+
+        for name in ("dry_sequence_breaker_ids", "blocked_ids"):
+            value = getattr(self, name)
+            if value is None and name == "dry_sequence_breaker_ids":
+                continue
+            if not isinstance(value, tuple):
+                raise TypeError(f"{name} must be a tuple")
+            normalized_ids: list[int] = []
+            seen_ids: set[int] = set()
+            for token_id in value:
+                if not isinstance(token_id, int) or isinstance(token_id, bool):
+                    raise TypeError(f"{name} entries must be integers")
+                if token_id < 0 or token_id in seen_ids:
+                    raise ValueError(f"{name} entries must be unique and non-negative")
+                seen_ids.add(token_id)
+                normalized_ids.append(token_id)
+            object.__setattr__(self, name, tuple(normalized_ids))
+
+        if not isinstance(self.banned_strings, tuple):
+            raise TypeError("banned_strings must be a tuple")
+        normalized_strings: list[str] = []
+        seen_strings: set[str] = set()
+        for value in self.banned_strings:
+            if not isinstance(value, str):
+                raise TypeError("banned_strings entries must be strings")
+            if not value:
+                raise ValueError("banned_strings entries must not be empty")
+            if value in seen_strings:
+                raise ValueError("banned_strings entries must be unique")
+            seen_strings.add(value)
+            normalized_strings.append(value)
+        object.__setattr__(self, "banned_strings", tuple(normalized_strings))
+        _validate_bool("token_healing", self.token_healing)
+        _validate_bool("sampler_requested", self.sampler_requested)
 
 
 @dataclass(frozen=True, slots=True)

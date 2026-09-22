@@ -57,6 +57,40 @@ _ENGINE_NUMERIC_FIELDS = (
         "exqserve_engine_kv_cached_kv_only_pages_since_generator_start",
         "Cached KV-only pages without a resumable recurrent checkpoint since the current Generator started.",
     ),
+    ("cpu_kv_cached_pages", "exqserve_engine_cpu_kv_cached_pages", "Current pages retained in the CPU KV tier."),
+    ("cpu_kv_cache_max_pages", "exqserve_engine_cpu_kv_cache_max_pages", "Maximum page slots in the CPU KV tier."),
+    (
+        "cpu_kv_cache_pushes_since_generator_start",
+        "exqserve_engine_cpu_kv_cache_pushes_since_generator_start",
+        "KV pages copied into the CPU tier since the current Generator started.",
+    ),
+    (
+        "cpu_kv_cache_restores_since_generator_start",
+        "exqserve_engine_cpu_kv_cache_restores_since_generator_start",
+        "KV pages restored from the CPU tier since the current Generator started.",
+    ),
+    (
+        "cpu_kv_cache_evictions_since_generator_start",
+        "exqserve_engine_cpu_kv_cache_evictions_since_generator_start",
+        "CPU-tier KV entries evicted since the current Generator started.",
+    ),
+    (
+        "cpu_kv_cache_dedup_hits_since_generator_start",
+        "exqserve_engine_cpu_kv_cache_dedup_hits_since_generator_start",
+        "Duplicate CPU-tier pushes avoided since the current Generator started.",
+    ),
+    ("recurrent_cache_entries", "exqserve_engine_recurrent_cache_entries", "Current recurrent checkpoint entries."),
+    ("recurrent_cache_bytes", "exqserve_engine_recurrent_cache_bytes", "Current recurrent checkpoint bytes in host memory."),
+    (
+        "recurrent_cache_evictions_since_generator_start",
+        "exqserve_engine_recurrent_cache_evictions_since_generator_start",
+        "Recurrent checkpoints evicted since the current Generator started.",
+    ),
+    (
+        "recurrent_cache_pruned_since_generator_start",
+        "exqserve_engine_recurrent_cache_pruned_since_generator_start",
+        "Stranded recurrent checkpoints pruned since the current Generator started.",
+    ),
 )
 
 

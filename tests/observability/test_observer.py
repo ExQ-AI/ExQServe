@@ -286,6 +286,45 @@ def test_capture_records_recovery_census_inputs_without_full_payload() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("sampling", "expected_temperature"),
+    [
+        (None, None),
+        (RuntimeSamplingConfig(token_healing=True, sampler_requested=False), None),
+        (RuntimeSamplingConfig(banned_strings=("BANME",), sampler_requested=False), None),
+        (RuntimeSamplingConfig(temperature=0.7, token_healing=True), 0.7),
+    ],
+    ids=("no-sampling", "healing-only", "banned-only", "explicit-temperature"),
+)
+def test_capture_temperature_reflects_explicit_sampler_truth(
+    sampling: RuntimeSamplingConfig | None,
+    expected_temperature: float | None,
+) -> None:
+    async def scenario() -> None:
+        base = _request()
+        request = ServingRequest(
+            base.input,
+            base.reasoning,
+            base.tools,
+            base.max_output_tokens,
+            sampling=sampling,
+        )
+        sink = MemoryCaptureSink()
+        observer = ObservedServingEngine(
+            _Engine(_Session([GenerationStarted("r"), GenerationCompleted("r", CompletionReason.STOP)])),
+            MetricsRegistry(),
+            clock=_Clock([0.0, 0.5]),
+            capture=CaptureManager(CaptureMode.METADATA, sink),
+        )
+
+        observed = await observer.submit(request)
+        _ = [event async for event in observed]
+
+        assert sink.records[0]["execution"]["temperature"] == expected_temperature
+
+    asyncio.run(scenario())
+
+
 def test_capture_records_per_attempt_recovery_cost_without_discarded_payload() -> None:
     async def scenario() -> None:
         diagnostics = RecoveryDiagnostics(

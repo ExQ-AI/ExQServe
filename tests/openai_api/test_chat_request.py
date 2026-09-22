@@ -147,6 +147,22 @@ def test_chat_max_tokens_alias_and_default_output_limit() -> None:
     assert automatic.serving.max_output_tokens is None
 
 
+def test_chat_job_only_sampler_extensions_preserve_default_sampler_truth() -> None:
+    parsed = ChatRequestAdapter().parse(
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "banned_strings": ["BANME"],
+            "token_healing": True,
+        },
+        request_id="r-job",
+    )
+    assert parsed.serving.sampling is not None
+    assert parsed.serving.sampling.banned_strings == ("BANME",)
+    assert parsed.serving.sampling.token_healing is True
+    assert parsed.serving.sampling.sampler_requested is False
+
+
 def test_chat_reasoning_compatibility_values_map_explicitly() -> None:
     base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}
     disabled = ChatRequestAdapter().parse({**base, "reasoning_effort": "none"}, request_id="r")

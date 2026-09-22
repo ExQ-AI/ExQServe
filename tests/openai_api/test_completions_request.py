@@ -53,6 +53,22 @@ def test_completions_logit_bias_reaches_shared_sampler() -> None:
     assert parsed.raw.sampling.logit_bias == ((7, -10.0),)
 
 
+def test_completions_job_only_sampler_extensions_preserve_default_sampler_truth() -> None:
+    parsed = CompletionsRequestAdapter().parse(
+        {
+            "model": "m",
+            "prompt": "raw",
+            "banned_strings": ["BANME"],
+            "token_healing": True,
+        },
+        request_id="req-job",
+    )
+    assert parsed.raw.sampling is not None
+    assert parsed.raw.sampling.banned_strings == ("BANME",)
+    assert parsed.raw.sampling.token_healing is True
+    assert parsed.raw.sampling.sampler_requested is False
+
+
 def test_completions_flat_token_prompt_bypasses_text_tokenization_contract() -> None:
     parsed = CompletionsRequestAdapter().parse(
         {"model": "m", "prompt": [11, 22, 33], "max_tokens": 4},
