@@ -112,6 +112,24 @@ class _Tokenizer:
         raise AssertionError("tokenizer must not run while admission is full")
 
 
+class _BlockingAsyncPool:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, kind: str, operation: object) -> CompiledPrompt:
+        del kind, operation
+        self.started.set()
+        await self.release.wait()
+        return CompiledPrompt(
+            text="prompt",
+            input_ids=(1, 2, 3),
+            prompt_hash="a" * 64,
+            stop_conditions=(),
+            template_request=TemplateRequest(messages=(), tools=(), template_kwargs=()),
+        )
+
+
 def _tools() -> ToolPolicy:
     return ToolPolicy((), ToolChoice(ToolChoiceMode.AUTO), allow_parallel=True)
 
@@ -254,6 +272,93 @@ def test_cancelled_preprocessing_keeps_capacity_until_worker_thread_exits() -> N
 
         session = await engine.submit(_request("generation-second"))
         await session.cancel()
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_async_preprocessing_deadline_rejects_without_runtime_submit() -> None:
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(
+            runtime, RequestControlConfig(max_in_flight=1, timeout_seconds=0.01)
+        )
+        pool = _BlockingAsyncPool()
+        engine = ServingEngine(None, _parser_factory, controller, preprocessing_pool=pool)
+
+        task = asyncio.create_task(engine.submit(_request("deadline-async")))
+        await asyncio.wait_for(pool.started.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+
+        assert task.done()
+        with pytest.raises(ServingRejected) as rejected:
+            await task
+        assert rejected.value.error.code == "request_timeout"
+        assert controller.in_flight == 0
+        assert runtime.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_count_tokens_deadline_holds_capacity_until_worker_thread_exits() -> None:
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(
+            runtime, RequestControlConfig(max_in_flight=1, timeout_seconds=0.01)
+        )
+        compiler = _BlockingCompiler()
+        engine = ServingEngine(compiler, _parser_factory, controller)
+
+        task = asyncio.create_task(engine.count_input_tokens(_request("deadline-count")))
+        assert await asyncio.to_thread(compiler.started.wait, 0.5)
+        await asyncio.sleep(0.03)
+
+        assert not task.done()
+        assert controller.in_flight == 1
+        assert runtime.requests == []
+
+        compiler.release.set()
+        with pytest.raises(ServingRejected) as rejected:
+            await task
+        assert rejected.value.error.code == "request_timeout"
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_raw_deadline_holds_capacity_until_tokenizer_worker_exits() -> None:
+    class BlockingTokenizer:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
+            self.started.set()
+            self.release.wait(timeout=2)
+            return RuntimeRenderedPrompt(text, (7, 8))
+
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(
+            runtime, RequestControlConfig(max_in_flight=1, timeout_seconds=0.01)
+        )
+        tokenizer = BlockingTokenizer()
+        engine = RawServingEngine(tokenizer, controller)
+
+        task = asyncio.create_task(
+            engine.submit(_raw("deadline-raw", RawPromptItem(text="RAW")))
+        )
+        assert await asyncio.to_thread(tokenizer.started.wait, 0.5)
+        await asyncio.sleep(0.03)
+
+        assert not task.done()
+        assert controller.in_flight == 1
+        assert runtime.requests == []
+
+        tokenizer.release.set()
+        with pytest.raises(ServingRejected) as rejected:
+            await task
+        assert rejected.value.error.code == "request_timeout"
         assert controller.in_flight == 0
 
     asyncio.run(scenario())

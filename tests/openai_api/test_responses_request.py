@@ -331,6 +331,28 @@ def test_responses_tool_call_indices_reset_after_new_user_turn() -> None:
     [
         ({"conversation": "conv_1"}, "unsupported_conversation"),
         ({"background": True}, "unsupported_background"),
+        (
+            {"input": [{"type": "message", "role": {}, "content": "hello"}]},
+            "unsupported_message_role",
+        ),
+        (
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,AA==",
+                                "detail": {},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "invalid_image_detail",
+        ),
         ({"tools": [{"type": "web_search_preview"}]}, "unsupported_tool_type"),
         (
             {"input": [{"type": "function_call_output", "call_id": "x", "output": ["bad"]}]},

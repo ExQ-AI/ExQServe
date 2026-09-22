@@ -43,3 +43,32 @@ jobs:
         run: |
           python -m pip install --force-reinstall --no-deps dist/*.whl
           python -c "import exqserve; import exqserve.server.cli"
+
+  protocol-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install protocol contract dependencies
+        run: python -m pip install ".[dev,protocol-contract]"
+
+      - name: Verify mandatory protocol dependencies
+        run: |
+          python -c "import anthropic, llguidance; print('anthropic', anthropic.__version__); print('llguidance', llguidance.__version__)"
+          python -m pip check
+
+      - name: Run mandatory protocol contract tests
+        run: |
+          python -m pytest -q \
+            tests/anthropic_api/test_sdk_blackbox.py \
+            tests/model_dialect/test_tool_constraints.py \
+            tests/tool_wire/test_a2a_qwen_llguidance.py \
+            tests/tool_wire/test_a2b_qwen_production.py

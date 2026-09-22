@@ -12,6 +12,14 @@ def _sample(text: str, name: str) -> float | None:
     return None
 
 
+def _bucket_sample(text: str, name: str, le: str) -> float | None:
+    prefix = f'{name}_bucket{{le="{le}"}} '
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
 def test_metrics_registry_uses_private_registry_and_stable_names() -> None:
     first = MetricsRegistry()
     second = MetricsRegistry()
@@ -53,3 +61,17 @@ def test_unknown_measurements_do_not_turn_into_zero_or_derived_observations() ->
     assert _sample(text, "exqserve_prefill_tokens_per_second_count") == 0.0
     assert _sample(text, "exqserve_decode_tokens_per_second_count") == 0.0
     assert _sample(text, "exqserve_backend_prefill_seconds_count") == 0.0
+
+
+def test_metric_buckets_cover_realistic_agent_latency_and_throughput() -> None:
+    metrics = MetricsRegistry()
+    metrics.observe_backend(
+        GenerationTiming(queue_seconds=0.2, prefill_seconds=1.0, generation_seconds=2.0),
+        TokenUsage(input_tokens=1000, cached_input_tokens=0, output_tokens=100),
+    )
+    text = metrics.render_text()
+
+    assert _bucket_sample(text, "exqserve_backend_queue_seconds", "0.25") == 1.0
+    assert _bucket_sample(text, "exqserve_backend_generation_seconds", "2.5") == 1.0
+    assert _bucket_sample(text, "exqserve_prefill_tokens_per_second", "1000.0") == 1.0
+    assert _bucket_sample(text, "exqserve_decode_tokens_per_second", "50.0") == 1.0

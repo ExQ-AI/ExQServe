@@ -58,7 +58,7 @@ def _message_text(value: object, *, param: str) -> str:
     for index, raw_part in enumerate(value):
         part = _as_dict(raw_part, code="invalid_input_message", param=f"{param}[{index}]")
         part_type = part.get("type")
-        if part_type not in allowed_types:
+        if not isinstance(part_type, str) or part_type not in allowed_types:
             raise invalid_request(
                 "unsupported_content_part",
                 "Only text content is supported for this message role.",
@@ -96,7 +96,7 @@ def _user_message_content(
         part_param = f"{param}[{index}]"
         part = _as_dict(raw_part, code="invalid_input_message", param=part_param)
         part_type = part.get("type")
-        if part_type in allowed_text_types:
+        if isinstance(part_type, str) and part_type in allowed_text_types:
             text = part.get("text")
             if not isinstance(text, str):
                 raise invalid_request(
@@ -121,7 +121,7 @@ def _user_message_content(
                     "input_image.image_url must be a non-empty string.",
                     f"{part_param}.image_url",
                 )
-            if detail is not None and detail not in {"auto", "low", "high"}:
+            if detail is not None and (not isinstance(detail, str) or detail not in {"auto", "low", "high"}):
                 raise invalid_request(
                     "invalid_image_detail",
                     "input_image.detail must be auto, low, or high.",
@@ -162,7 +162,7 @@ def _function_output_content(
         part_param = f"{param}[{index}]"
         part = _as_dict(raw_part, code="unsupported_function_output", param=part_param)
         part_type = part.get("type")
-        if part_type in allowed_text_types:
+        if isinstance(part_type, str) and part_type in allowed_text_types:
             text = part.get("text")
             if not isinstance(text, str):
                 raise invalid_request(
@@ -187,7 +187,7 @@ def _function_output_content(
                     "input_image.image_url must be a non-empty string.",
                     f"{part_param}.image_url",
                 )
-            if detail is not None and detail not in {"auto", "low", "high"}:
+            if detail is not None and (not isinstance(detail, str) or detail not in {"auto", "low", "high"}):
                 raise invalid_request(
                     "invalid_image_detail",
                     "input_image.detail must be auto, low, or high.",
@@ -258,9 +258,9 @@ def _parse_input(value: object) -> tuple[CanonicalItem, ...]:
     for index, raw_item in enumerate(value):
         item = _as_dict(raw_item, code="invalid_input", param=f"input[{index}]")
         item_type = item.get("type")
-        if item_type in {None, "message"}:
+        if item_type is None or item_type == "message":
             role = item.get("role")
-            if role not in role_map:
+            if not isinstance(role, str) or role not in role_map:
                 raise invalid_request(
                     "unsupported_message_role",
                     "Unsupported Responses message role.",
@@ -441,7 +441,7 @@ def _parse_structured_output(value: object) -> StructuredOutputSpec | None:
         return None
     format_object = _as_dict(format_value, code="invalid_text_format", param="text.format")
     format_type = format_object.get("type")
-    if format_type in {None, "text"}:
+    if format_type is None or format_type == "text":
         return None
     if format_type == "json_object":
         return StructuredOutputSpec(

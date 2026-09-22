@@ -23,11 +23,17 @@ def test_auto_cache_candidates_start_at_page_aligned_model_limit(
     monkeypatch.setattr(exl3, "_load_backend_module", lambda: backend)
     monkeypatch.setattr(exl3, "_backend_context_limit", lambda _: model_limit)
 
-    candidates = exl3._auto_cache_candidates(ExLlamaV3LoadConfig("/models/qwen", None))
+    config = ExLlamaV3LoadConfig("/models/qwen", None)
+    candidates = exl3._auto_cache_candidates(config)
+    page_size = exl3._EXLLAMAV3_PAGE_SIZE
+    expected_minimum = min(
+        expected_first,
+        ((config.max_chunk_size + page_size - 1) // page_size) * page_size,
+    )
 
     assert candidates[0] == expected_first
     assert all(value % 256 == 0 for value in candidates)
-    assert all(min(2048, expected_first) <= value <= expected_first for value in candidates)
+    assert all(expected_minimum <= value <= expected_first for value in candidates)
 
 
 def test_auto_cache_candidates_include_page_aligned_minimum(monkeypatch: pytest.MonkeyPatch) -> None:

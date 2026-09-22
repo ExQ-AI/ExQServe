@@ -121,6 +121,71 @@ def test_store_evicts_lru_by_aggregate_byte_budget() -> None:
     asyncio.run(scenario())
 
 
+def test_store_refuses_child_at_record_budget_without_destroying_committed_ancestors() -> None:
+    async def scenario() -> None:
+        store = InMemoryResponseStore(max_records=3)
+        assert await store.put(_record("a", "a", model="m")) is ResponseStoreDisposition.STORED
+        assert await store.put(_record("b", "b", parent="a", model="m")) is ResponseStoreDisposition.STORED
+        assert await store.put(_record("c", "c", parent="b", model="m")) is ResponseStoreDisposition.STORED
+
+        assert (
+            await store.put(_record("d", "d", parent="c", model="m"))
+            is ResponseStoreDisposition.REFUSED_BUDGET
+        )
+        assert await store.size() == 3
+        assert await store.materialize("c") == (
+            MessageItem(MessageRole.USER, "a"),
+            MessageItem(MessageRole.USER, "b"),
+            MessageItem(MessageRole.USER, "c"),
+        )
+        assert await store.get("d") is None
+
+    asyncio.run(scenario())
+
+
+def test_store_evicts_unrelated_root_instead_of_new_child_ancestors() -> None:
+    async def scenario() -> None:
+        store = InMemoryResponseStore(max_records=4)
+        assert await store.put(_record("other", "other", model="m")) is ResponseStoreDisposition.STORED
+        assert await store.put(_record("a", "a", model="m")) is ResponseStoreDisposition.STORED
+        assert await store.put(_record("b", "b", parent="a", model="m")) is ResponseStoreDisposition.STORED
+        assert await store.put(_record("c", "c", parent="b", model="m")) is ResponseStoreDisposition.STORED
+
+        assert await store.put(_record("d", "d", parent="c", model="m")) is ResponseStoreDisposition.STORED
+        assert await store.get("other") is None
+        assert await store.materialize("d") == (
+            MessageItem(MessageRole.USER, "a"),
+            MessageItem(MessageRole.USER, "b"),
+            MessageItem(MessageRole.USER, "c"),
+            MessageItem(MessageRole.USER, "d"),
+        )
+
+    asyncio.run(scenario())
+
+
+def test_store_refuses_child_at_byte_budget_without_destroying_committed_ancestors() -> None:
+    async def scenario() -> None:
+        records = (
+            _record("a", "a" * 64, model="m"),
+            _record("b", "b" * 64, parent="a", model="m"),
+            _record("c", "c" * 64, parent="b", model="m"),
+        )
+        budget = sum(estimate_response_record_bytes(record) for record in records)
+        store = InMemoryResponseStore(max_records=10, max_total_bytes=budget)
+        for record in records:
+            assert await store.put(record) is ResponseStoreDisposition.STORED
+
+        assert (
+            await store.put(_record("d", "d" * 64, parent="c", model="m"))
+            is ResponseStoreDisposition.REFUSED_BUDGET
+        )
+        assert (await store.stats()).estimated_bytes == budget
+        assert await store.materialize("c") is not None
+        assert await store.get("d") is None
+
+    asyncio.run(scenario())
+
+
 def test_store_refuses_single_record_larger_than_budget_explicitly() -> None:
     async def scenario() -> None:
         record = _record("large", "z" * 512)
@@ -189,3 +254,37 @@ def test_store_1000_hop_chain_materializes_iteratively_with_linear_retained_payl
         assert stats.estimated_bytes == sum(estimate_response_record_bytes(record) for record in records)
 
     asyncio.run(scenario())
+
+def test_store_pinned_chain_survives_ttl_and_capacity_until_all_pins_release() -> None:
+    async def scenario() -> None:
+        now = [0.0]
+        store = InMemoryResponseStore(
+            max_records=2,
+            ttl_seconds=1.0,
+            clock=lambda: now[0],
+        )
+        assert await store.put(_record("parent", "p", model="m")) is ResponseStoreDisposition.STORED
+        assert (
+            await store.put(_record("child", "c", parent="parent", model="m"))
+            is ResponseStoreDisposition.STORED
+        )
+
+        first_pin = await store.pin_chain("child")
+        second_pin = await store.pin_chain("child")
+        assert first_pin == ("child", "parent")
+        assert second_pin == first_pin
+
+        now[0] = 2.0
+        assert await store.get("parent") is not None
+        assert (
+            await store.put(_record("other", "o", model="m"))
+            is ResponseStoreDisposition.REFUSED_BUDGET
+        )
+
+        await store.unpin_chain(first_pin)
+        now[0] = 4.0
+        assert await store.materialize("child") is not None
+
+        await store.unpin_chain(second_pin)
+        now[0] = 6.0
+        assert await store.get("parent") is None

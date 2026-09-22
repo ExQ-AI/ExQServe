@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
 from exqserve.core.events import (
     CompletionReason,
@@ -20,7 +21,10 @@ from exqserve.protocol.openai.api import _iter_responses_sse, create_openai_app
 from exqserve.protocol.openai.responses import ResponsesStreamSerializer, build_response_object
 from exqserve.serving.contracts import ServingRequest
 from exqserve.state.response_authority import ResponseStateAuthority, ResponseStateNotFound
-from exqserve.state.response_lifecycle import InMemoryResponseLifecycleStore
+from exqserve.state.response_lifecycle import (
+    InMemoryResponseLifecycleStore,
+    ResponseLifecycleRetentionRefused,
+)
 from exqserve.state.session import StatefulServingSession
 from exqserve.state.store import InMemoryResponseStore, ResponseRecord, ResponseStoreDisposition
 
@@ -107,7 +111,13 @@ async def _request(app, method: str, url: str, **kwargs: object) -> httpx.Respon
         return await client.request(method, url, **kwargs)
 
 
-def _initial(response_id: str, *, store: bool = True, text: str = "") -> dict[str, object]:
+def _initial(
+    response_id: str,
+    *,
+    store: bool = True,
+    text: str = "",
+    parent: str | None = None,
+) -> dict[str, object]:
     return build_response_object(
         response_id=response_id,
         created_at=1,
@@ -117,7 +127,7 @@ def _initial(response_id: str, *, store: bool = True, text: str = "") -> dict[st
         parallel_tool_calls=True,
         tool_choice="auto",
         usage=None,
-        previous_response_id=None,
+        previous_response_id=parent,
         store=store,
     )
 
@@ -541,5 +551,98 @@ def test_responses_terminal_close_does_not_abandon_committed_state() -> None:
         assert retained["status"] == "completed"
         assert await state.materialize(response_id) is not None
         assert inner.cancel_calls == 0
+
+    asyncio.run(scenario())
+
+@pytest.mark.parametrize("status", ("completed", "incomplete", "failed"))
+def test_retained_terminal_capacity_refusal_is_uniform_for_finish_statuses(status: str) -> None:
+    async def scenario() -> None:
+        lifecycle = InMemoryResponseLifecycleStore(max_records=1)
+        authority = ResponseStateAuthority(InMemoryResponseStore(max_records=10), lifecycle)
+
+        parent_session = _Session()
+        parent = _initial("resp_parent")
+        await lifecycle.register_active(parent, parent_session, retain=True)
+        parent_terminal = dict(parent)
+        parent_terminal["status"] = "completed"
+        assert await lifecycle.finish("resp_parent", parent_terminal)
+
+        child_session = _Session()
+        child = _initial("resp_child", parent="resp_parent")
+        await authority.register_active(child, child_session, retain=True)
+        terminal = dict(child)
+        terminal["status"] = status
+
+        assert not await authority.finish("resp_child", terminal)
+        assert await authority.retrieve("resp_child") is None
+        stats = await lifecycle.stats()
+        assert stats.active == 0
+        assert stats.retained == 1
+        retained_parent = await lifecycle.retrieve("resp_parent")
+        assert retained_parent is not None
+        assert retained_parent["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_retained_cancel_capacity_refusal_is_explicit_and_does_not_leave_active_state() -> None:
+    async def scenario() -> None:
+        lifecycle = InMemoryResponseLifecycleStore(max_records=1)
+        authority = ResponseStateAuthority(InMemoryResponseStore(max_records=10), lifecycle)
+
+        parent_session = _Session()
+        parent = _initial("resp_parent")
+        await lifecycle.register_active(parent, parent_session, retain=True)
+        parent_terminal = dict(parent)
+        parent_terminal["status"] = "completed"
+        assert await lifecycle.finish("resp_parent", parent_terminal)
+
+        child_session = _Session()
+        child = _initial("resp_child", parent="resp_parent")
+        await authority.register_active(child, child_session, retain=True)
+
+        with pytest.raises(ResponseLifecycleRetentionRefused):
+            await authority.cancel("resp_child")
+
+        assert child_session.cancel_calls == 1
+        assert await authority.retrieve("resp_child") is None
+        stats = await lifecycle.stats()
+        assert stats.active == 0
+        assert stats.retained == 1
+        retained_parent = await lifecycle.retrieve("resp_parent")
+        assert retained_parent is not None
+        assert retained_parent["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_endpoint_maps_retention_refusal_to_response_store_refused() -> None:
+    async def scenario() -> None:
+        lifecycle = InMemoryResponseLifecycleStore(max_records=1)
+        parent_session = _Session()
+        parent = _initial("resp_parent")
+        await lifecycle.register_active(parent, parent_session, retain=True)
+        parent_terminal = dict(parent)
+        parent_terminal["status"] = "completed"
+        assert await lifecycle.finish("resp_parent", parent_terminal)
+
+        child_session = _Session()
+        child = _initial("resp_child", parent="resp_parent")
+        await lifecycle.register_active(child, child_session, retain=True)
+        app = create_openai_app(_Engine(), response_lifecycle_store=lifecycle)
+
+        response = await _request(app, "POST", "/v1/responses/resp_child/cancel")
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "response_store_refused"
+        assert child_session.cancel_calls == 1
+
+        child_get = await _request(app, "GET", "/v1/responses/resp_child")
+        assert child_get.status_code == 404
+        stats = await lifecycle.stats()
+        assert stats.active == 0
+        assert stats.retained == 1
+        retained_parent = await lifecycle.retrieve("resp_parent")
+        assert retained_parent is not None
+        assert retained_parent["status"] == "completed"
 
     asyncio.run(scenario())

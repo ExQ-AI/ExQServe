@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -61,6 +62,7 @@ from exqserve.state.response_lifecycle import (
     InMemoryResponseLifecycleStore,
     ResponseLifecycleNotCancellable,
     ResponseLifecycleNotFound,
+    ResponseLifecycleRetentionRefused,
 )
 from exqserve.state.session import StatefulServingSession
 from exqserve.state.store import InMemoryResponseStore, ResponseStore
@@ -95,6 +97,84 @@ def _is_terminal(event: GenerationEvent) -> bool:
 
 def _request_headers(request_id: str) -> dict[str, str]:
     return {"x-request-id": request_id}
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _race_nonstream_disconnect[T](request: Request, result: Awaitable[T]) -> T:
+    result_task = asyncio.ensure_future(result)
+    disconnect_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.sleep(0)
+        if result_task.done():
+            return await result_task
+
+        disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
+        done, _ = await asyncio.wait(
+            {result_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if result_task in done:
+            return await result_task
+        result_task.cancel()
+        await asyncio.gather(result_task, return_exceptions=True)
+        raise asyncio.CancelledError
+    finally:
+        if disconnect_task is not None and not disconnect_task.done():
+            disconnect_task.cancel()
+        if not result_task.done():
+            result_task.cancel()
+        if disconnect_task is None:
+            await asyncio.gather(result_task, return_exceptions=True)
+        else:
+            await asyncio.gather(disconnect_task, result_task, return_exceptions=True)
+
+
+async def _race_stream_setup_disconnect[T](
+    request: Request,
+    result: Awaitable[T],
+    cleanup_result: Callable[[T], Awaitable[None]],
+) -> T:
+    """Race stream setup against disconnect, with disconnect winning setup ties."""
+
+    result_task = asyncio.ensure_future(result)
+    disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
+    handed_off = False
+    try:
+        done, _ = await asyncio.wait(
+            {result_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect_task in done:
+            raise asyncio.CancelledError
+        value = await result_task
+        handed_off = True
+        return value
+    finally:
+        for task in (disconnect_task, result_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(disconnect_task, result_task, return_exceptions=True)
+
+        if not handed_off and result_task.done() and not result_task.cancelled():
+            exception = result_task.exception()
+            if exception is None:
+                cleanup_task = asyncio.ensure_future(cleanup_result(result_task.result()))
+                while not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup_task.result()
+
+
+async def _cancel_stream_setup_session(session: ServingSessionLike) -> None:
+    await session.cancel()
 
 
 def _error_response(error: OpenAIProtocolError, request_id: str | None = None) -> JSONResponse:
@@ -331,9 +411,15 @@ async def _responses_previous_context(
     state_authority: ResponseStateAuthority,
     previous_response_id: str | None,
     model: str,
+    *,
+    pin_owner: str | None = None,
 ) -> tuple[CanonicalItem, ...]:
     try:
-        return await state_authority.resolve_previous(previous_response_id, model)
+        return await state_authority.resolve_previous(
+            previous_response_id,
+            model,
+            pin_owner=pin_owner,
+        )
     except ResponseStateNotFound:
         raise OpenAIProtocolError(
             404,
@@ -412,11 +498,15 @@ def create_openai_router(
                 body = await _body_dict(request, max_request_body_bytes)
                 parsed = completions_codec.parse(body, request_id=request_id)
                 _require_current_model(parsed.model, served_model)
-                session = await _submit_raw(completion_engine, parsed.raw)
                 prompt = parsed.raw.input.items[0]
                 assert isinstance(prompt, RawPromptItem)
                 echo_text = prompt.text if parsed.echo and prompt.text is not None else ""
                 if parsed.stream:
+                    session = await _race_stream_setup_disconnect(
+                        request,
+                        _submit_raw(completion_engine, parsed.raw),
+                        _cancel_stream_setup_session,
+                    )
                     serializer = CompletionsStreamSerializer(
                         parsed.model,
                         echo_text=echo_text,
@@ -427,10 +517,15 @@ def create_openai_router(
                         media_type="text/event-stream",
                         headers=_request_headers(request_id),
                     )
-                result = await _consume_completions(
-                    session,
-                    CompletionsAccumulator(parsed.model, echo_text=echo_text),
-                )
+
+                async def run_nonstream() -> dict[str, object]:
+                    session = await _submit_raw(completion_engine, parsed.raw)
+                    return await _consume_completions(
+                        session,
+                        CompletionsAccumulator(parsed.model, echo_text=echo_text),
+                    )
+
+                result = await _race_nonstream_disconnect(request, run_nonstream())
                 return JSONResponse(result, headers=_request_headers(request_id))
             except OpenAIProtocolError as exc:
                 return _error_response(exc, request_id)
@@ -442,8 +537,12 @@ def create_openai_router(
             body = await _body_dict(request, max_request_body_bytes)
             parsed = chat_codec.parse(body, request_id=request_id)
             _require_current_model(parsed.model, served_model)
-            session = await _submit(engine, parsed.serving)
             if parsed.stream:
+                session = await _race_stream_setup_disconnect(
+                    request,
+                    _submit(engine, parsed.serving),
+                    _cancel_stream_setup_session,
+                )
                 serializer = ChatStreamSerializer(
                     parsed.model,
                     include_usage=parsed.include_usage,
@@ -453,7 +552,12 @@ def create_openai_router(
                     media_type="text/event-stream",
                     headers=_request_headers(request_id),
                 )
-            result = await _consume_chat(session, ChatAccumulator(parsed.model))
+
+            async def run_nonstream() -> dict[str, object]:
+                session = await _submit(engine, parsed.serving)
+                return await _consume_chat(session, ChatAccumulator(parsed.model))
+
+            result = await _race_nonstream_disconnect(request, run_nonstream())
             return JSONResponse(result, headers=_request_headers(request_id))
         except OpenAIProtocolError as exc:
             return _error_response(exc, request_id)
@@ -469,13 +573,17 @@ def create_openai_router(
                 state_authority,
                 parsed.previous_response_id,
                 parsed.model,
+                pin_owner=request_id,
             )
-            serving = parsed.serving_with_context(previous_context)
-            input_tokens = await _count_input_tokens(engine, serving)
-            return JSONResponse(
-                {"object": "response.input_tokens", "input_tokens": input_tokens},
-                headers=_request_headers(request_id),
-            )
+            try:
+                serving = parsed.serving_with_context(previous_context)
+                input_tokens = await _count_input_tokens(engine, serving)
+                return JSONResponse(
+                    {"object": "response.input_tokens", "input_tokens": input_tokens},
+                    headers=_request_headers(request_id),
+                )
+            finally:
+                await state_authority.release_continuation(request_id)
         except OpenAIProtocolError as exc:
             return _error_response(exc, request_id)
 
@@ -523,6 +631,8 @@ def create_openai_router(
                 ),
                 request_id,
             )
+        except ResponseLifecycleRetentionRefused:
+            return _error_response(_response_store_refused_error(), request_id)
         return JSONResponse(response, headers=_request_headers(request_id))
 
     @router.post("/v1/responses")
@@ -533,45 +643,84 @@ def create_openai_router(
             body = await _body_dict(request, max_request_body_bytes)
             parsed = responses_codec.parse(body, request_id=request_id)
             _require_current_model(parsed.model, served_model)
-            previous_context = await _responses_previous_context(
-                state_authority,
-                parsed.previous_response_id,
-                parsed.model,
-            )
-            serving = parsed.serving_with_context(previous_context)
             response_id = f"resp_{uuid.uuid4().hex}"
-            created_at = int(time.time())
-            session = await _submit(engine, serving)
-            if parsed.store:
-                session = StatefulServingSession(
-                    session,
-                    state_authority,
-                    response_id=response_id,
-                    model=parsed.model,
-                    base_context=previous_context,
-                    current_input=parsed.state_input_items,
-                    store_response=True,
-                    parent_response_id=parsed.previous_response_id,
-                )
-            wire_choice = _responses_tool_choice(serving.tools)
-            initial_response = build_response_object(
-                response_id=response_id,
-                created_at=created_at,
-                model=parsed.model,
-                status="in_progress",
-                output=[],
-                parallel_tool_calls=serving.tools.allow_parallel,
-                tool_choice=wire_choice,
-                usage=None,
-                previous_response_id=parsed.previous_response_id,
-                store=parsed.store,
-            )
-            await state_authority.register_active(
-                initial_response,
-                session,
-                retain=parsed.store,
-            )
+            async def prepare_response_session() -> tuple[
+                ServingSessionLike,
+                ServingRequest,
+                tuple[CanonicalItem, ...],
+                int,
+                object,
+            ]:
+                session: ServingSessionLike | None = None
+                try:
+                    previous_context = await _responses_previous_context(
+                        state_authority,
+                        parsed.previous_response_id,
+                        parsed.model,
+                        pin_owner=response_id,
+                    )
+                    serving = parsed.serving_with_context(previous_context)
+                    created_at = int(time.time())
+                    session = await _submit(engine, serving)
+                    if parsed.store:
+                        session = StatefulServingSession(
+                            session,
+                            state_authority,
+                            response_id=response_id,
+                            model=parsed.model,
+                            base_context=previous_context,
+                            current_input=parsed.state_input_items,
+                            store_response=True,
+                            parent_response_id=parsed.previous_response_id,
+                        )
+                    wire_choice = _responses_tool_choice(serving.tools)
+                    initial_response = build_response_object(
+                        response_id=response_id,
+                        created_at=created_at,
+                        model=parsed.model,
+                        status="in_progress",
+                        output=[],
+                        parallel_tool_calls=serving.tools.allow_parallel,
+                        tool_choice=wire_choice,
+                        usage=None,
+                        previous_response_id=parsed.previous_response_id,
+                        store=parsed.store,
+                    )
+                    await state_authority.register_active(
+                        initial_response,
+                        session,
+                        retain=parsed.store,
+                    )
+                    return session, serving, previous_context, created_at, wire_choice
+                except BaseException:
+                    try:
+                        if session is not None:
+                            await session.cancel()
+                    finally:
+                        await state_authority.release_continuation(response_id)
+                    raise
+
             if parsed.stream:
+                async def cleanup_prepared_response(
+                    prepared: tuple[
+                        ServingSessionLike,
+                        ServingRequest,
+                        tuple[CanonicalItem, ...],
+                        int,
+                        object,
+                    ],
+                ) -> None:
+                    prepared_session = prepared[0]
+                    try:
+                        await prepared_session.cancel()
+                    finally:
+                        await state_authority.abandon(response_id)
+
+                session, serving, _, created_at, wire_choice = await _race_stream_setup_disconnect(
+                    request,
+                    prepare_response_session(),
+                    cleanup_prepared_response,
+                )
                 serializer = ResponsesStreamSerializer(
                     parsed.model,
                     response_id=response_id,
@@ -592,28 +741,31 @@ def create_openai_router(
                     headers=_request_headers(request_id),
                 )
 
-            accumulator = ResponsesAccumulator(
-                parsed.model,
-                response_id=response_id,
-                created_at=created_at,
-                parallel_tool_calls=serving.tools.allow_parallel,
-                tool_choice=wire_choice,
-                previous_response_id=parsed.previous_response_id,
-                store=parsed.store,
-            )
-            try:
-                result = await _consume_responses(session, accumulator)
-            except OpenAIProtocolError:
-                # Non-streaming failures return an HTTP error rather than a Response resource,
-                # so the client never learns response_id. Do not retain unreachable lifecycle state.
-                await state_authority.abandon(response_id)
-                raise
-            except BaseException:
-                await state_authority.abandon(response_id)
-                raise
-            if not await state_authority.finish(response_id, result):
-                raise _response_store_refused_error()
-            await state_authority.abandon(response_id)
+            async def run_nonstream_response() -> dict[str, object]:
+                session: ServingSessionLike | None = None
+                try:
+                    session, serving, _, created_at, wire_choice = await prepare_response_session()
+                    accumulator = ResponsesAccumulator(
+                        parsed.model,
+                        response_id=response_id,
+                        created_at=created_at,
+                        parallel_tool_calls=serving.tools.allow_parallel,
+                        tool_choice=wire_choice,
+                        previous_response_id=parsed.previous_response_id,
+                        store=parsed.store,
+                    )
+                    result = await _consume_responses(session, accumulator)
+                    if not await state_authority.finish(response_id, result):
+                        raise _response_store_refused_error()
+                    await state_authority.abandon(response_id)
+                    return result
+                except BaseException:
+                    if session is not None:
+                        await session.cancel()
+                    await state_authority.abandon(response_id)
+                    raise
+
+            result = await _race_nonstream_disconnect(request, run_nonstream_response())
             return JSONResponse(result, headers=_request_headers(request_id))
         except OpenAIProtocolError as exc:
             if response_id is not None:

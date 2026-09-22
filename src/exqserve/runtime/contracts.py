@@ -143,7 +143,7 @@ class ExLlamaV3LoadConfig:
     cache_key_bits: int | None = 8
     cache_value_bits: int | None = 8
     max_batch_size: int = 16
-    max_chunk_size: int = 2048
+    max_chunk_size: int = 1024
     reserve_per_device_gb: tuple[float, ...] | None = None
     mtp_enabled: bool = False
     mtp_draft_tokens: int = 4

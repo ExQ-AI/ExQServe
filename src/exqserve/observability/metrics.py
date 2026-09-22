@@ -11,6 +11,39 @@ from exqserve.core.engine_stats import RuntimeEngineState, RuntimeEngineStats
 from exqserve.core.timing import GenerationTiming
 from exqserve.core.usage import TokenUsage
 
+_LATENCY_BUCKETS = (
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    1800.0,
+)
+_PREFILL_RATE_BUCKETS = (
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1000.0,
+    2000.0,
+    5000.0,
+    10000.0,
+    20000.0,
+)
+_DECODE_RATE_BUCKETS = (1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)
+
 logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected"})
@@ -113,31 +146,37 @@ class MetricsRegistry:
         self._request_latency = Histogram(
             "exqserve_request_latency_seconds",
             "Accepted request latency through terminal outcome.",
+            buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
         self._ttfe = Histogram(
             "exqserve_time_to_first_semantic_event_seconds",
             "Time from submit start to first client-meaningful semantic event.",
+            buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
         self._tool_start = Histogram(
             "exqserve_time_to_tool_call_start_seconds",
             "Time from submit start to first tool-call start.",
+            buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
         self._backend_queue = Histogram(
             "exqserve_backend_queue_seconds",
             "Measured backend queue duration.",
+            buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
         self._backend_prefill = Histogram(
             "exqserve_backend_prefill_seconds",
             "Measured backend prefill duration.",
+            buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
         self._backend_generation = Histogram(
             "exqserve_backend_generation_seconds",
             "Measured backend generation duration.",
+            buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
         self._input_tokens = Counter(
@@ -164,11 +203,13 @@ class MetricsRegistry:
         self._prefill_rate = Histogram(
             "exqserve_prefill_tokens_per_second",
             "Measured newly-prefilled tokens per backend prefill second.",
+            buckets=_PREFILL_RATE_BUCKETS,
             registry=self.registry,
         )
         self._decode_rate = Histogram(
             "exqserve_decode_tokens_per_second",
             "Measured output tokens per backend generation second.",
+            buckets=_DECODE_RATE_BUCKETS,
             registry=self.registry,
         )
         self._capture_failures = Counter(

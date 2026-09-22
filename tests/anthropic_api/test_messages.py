@@ -14,9 +14,11 @@ from exqserve.core.items import (
     ToolCallItem,
     ToolResultItem,
 )
+from exqserve.model.contracts import ToolConstraintUnsupported
 from exqserve.protocol.anthropic.common import AnthropicProtocolError
 from exqserve.protocol.anthropic.messages import AnthropicMessagesRequestAdapter
 from exqserve.serving.contracts import MidSystemPolicy, ServingVisibilityMode
+from exqserve.serving.guarantees import RequestGuaranteeResolver
 
 
 def test_request_adapter_maps_system_multiturn_tools_results_and_thinking() -> None:
@@ -190,13 +192,123 @@ def test_request_adapter_maps_json_output_format_and_omitted_thinking() -> None:
     assert parsed.serving.reasoning.mode is ReasoningMode.ENABLED
     assert parsed.serving.reasoning.effort is ReasoningEffort.MEDIUM
     assert parsed.serving.structured_output is not None
-    assert parsed.serving.structured_output.requested_guarantee is GenerationGuarantee.NONE
+    assert parsed.serving.structured_output.requested_guarantee is GenerationGuarantee.SCHEMA
     assert (
         parsed.serving.structured_output.fallback_policy
-        is ConstraintFallbackPolicy.ALLOW_VALIDATION_ONLY
+        is ConstraintFallbackPolicy.FAIL_CLOSED
     )
     schema = json.loads(parsed.serving.structured_output.schema.canonical_json)
     assert schema["required"] == ["answer"]
+    plan = RequestGuaranteeResolver().resolve_structured_output(
+        parsed.serving.structured_output,
+        raw_output_is_text_only=True,
+        structured_output_trigger=None,
+    )
+    assert plan is not None
+    assert plan.requested_guarantee is GenerationGuarantee.SCHEMA
+    assert plan.planned_guarantee is GenerationGuarantee.SCHEMA
+    assert plan.fallback_policy is ConstraintFallbackPolicy.FAIL_CLOSED
+
+
+def test_request_adapter_preserves_strict_tool_intent_and_validates_schema() -> None:
+    base = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    parsed = AnthropicMessagesRequestAdapter().parse(
+        {
+            **base,
+            "tools": [
+                {
+                    "name": "lookup",
+                    "strict": True,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        },
+        request_id="req_strict_tool",
+    )
+    assert parsed.serving.tools.tools[0].strict is True
+    resolver = RequestGuaranteeResolver()
+    with pytest.raises(ToolConstraintUnsupported, match="Strict function tools"):
+        resolver.resolve_tool_policy(parsed.serving.tools)
+
+    with pytest.raises(AnthropicProtocolError, match="strict"):
+        AnthropicMessagesRequestAdapter().parse(
+            {
+                **base,
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "strict": "yes",
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            },
+            request_id="req_bad_strict_type",
+        )
+
+    with pytest.raises(AnthropicProtocolError, match="strict"):
+        AnthropicMessagesRequestAdapter().parse(
+            {
+                **base,
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "strict": True,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                        },
+                    }
+                ],
+            },
+            request_id="req_bad_strict_schema",
+        )
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"messages": [{"role": [], "content": "hi"}]}, "roles"),
+        (
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": {}, "data": "AA=="},
+                            }
+                        ],
+                    }
+                ]
+            },
+            "media_type",
+        ),
+        ({"thinking": {"type": []}}, "thinking"),
+    ],
+)
+def test_request_adapter_rejects_unhashable_enum_like_public_values(
+    patch: dict[str, object],
+    message: str,
+) -> None:
+    body: dict[str, object] = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    body.update(patch)
+    with pytest.raises(AnthropicProtocolError, match=message):
+        AnthropicMessagesRequestAdapter().parse(body, request_id="req_bad_public_type")
 
 
 def test_request_adapter_preserves_xhigh_vs_max_effort_distinction() -> None:

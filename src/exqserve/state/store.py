@@ -63,6 +63,12 @@ class ResponseStore(Protocol):
     async def put(self, record: ResponseRecord) -> ResponseStoreDisposition:
         ...
 
+    async def pin_chain(self, response_id: str) -> tuple[str, ...] | None:
+        ...
+
+    async def unpin_chain(self, response_ids: tuple[str, ...]) -> None:
+        ...
+
     async def discard(self, response_id: str) -> None:
         ...
 
@@ -139,6 +145,7 @@ class InMemoryResponseStore:
         self._clock = clock
         self._records: OrderedDict[str, _StoredRecord] = OrderedDict()
         self._children: dict[str, set[str]] = {}
+        self._pins: dict[str, int] = {}
         self._estimated_bytes = 0
         self._lock = asyncio.Lock()
 
@@ -149,6 +156,7 @@ class InMemoryResponseStore:
 
     def _remove_one_locked(self, response_id: str) -> None:
         stored = self._records.pop(response_id, None)
+        self._pins.pop(response_id, None)
         if stored is None:
             self._children.pop(response_id, None)
             return
@@ -180,19 +188,29 @@ class InMemoryResponseStore:
         expired = [
             response_id
             for response_id, stored in self._records.items()
-            if stored.expires_at <= now
+            if stored.expires_at <= now and self._pins.get(response_id, 0) == 0
         ]
         for response_id in expired:
             if response_id in self._records:
                 self._remove_subtree_locked(response_id)
 
-    def _evict_to_budget_locked(self) -> None:
+    def _evict_to_budget_locked(self, protected: set[str]) -> bool:
         while self._records and (
             len(self._records) > self._max_records
             or self._estimated_bytes > self._max_total_bytes
         ):
-            oldest = next(iter(self._records))
-            self._remove_subtree_locked(oldest)
+            victim = next(
+                (
+                    response_id
+                    for response_id in self._records
+                    if response_id not in protected and self._pins.get(response_id, 0) == 0
+                ),
+                None,
+            )
+            if victim is None:
+                return False
+            self._remove_subtree_locked(victim)
+        return True
 
     def _parent_chain_is_valid_locked(self, parent_id: str, child_id: str, model: str) -> bool:
         current: str | None = parent_id
@@ -254,6 +272,13 @@ class InMemoryResponseStore:
             return tuple(items)
 
     async def put(self, record: ResponseRecord) -> ResponseStoreDisposition:
+        disposition, _ = await self.put_with_evictions(record)
+        return disposition
+
+    async def put_with_evictions(
+        self,
+        record: ResponseRecord,
+    ) -> tuple[ResponseStoreDisposition, tuple[str, ...]]:
         if not isinstance(record, ResponseRecord):
             raise TypeError("record must be a ResponseRecord")
         estimated_bytes = estimate_response_record_bytes(record)
@@ -261,17 +286,31 @@ class InMemoryResponseStore:
             now = self._clock()
             self._purge_expired_locked(now)
             if estimated_bytes > self._max_total_bytes:
-                return ResponseStoreDisposition.REFUSED_TOO_LARGE
+                return ResponseStoreDisposition.REFUSED_TOO_LARGE, ()
 
             parent_id = record.parent_response_id
             if parent_id is not None:
                 parent = self._records.get(parent_id)
                 if parent is None:
-                    return ResponseStoreDisposition.REFUSED_MISSING_PARENT
+                    return ResponseStoreDisposition.REFUSED_MISSING_PARENT, ()
                 if parent.record.model != record.model:
-                    return ResponseStoreDisposition.REFUSED_MODEL_MISMATCH
+                    return ResponseStoreDisposition.REFUSED_MODEL_MISMATCH, ()
                 if not self._parent_chain_is_valid_locked(parent_id, record.response_id, record.model):
-                    return ResponseStoreDisposition.REFUSED_INVALID_GRAPH
+                    return ResponseStoreDisposition.REFUSED_INVALID_GRAPH, ()
+
+            protected = {record.response_id}
+            current = parent_id
+            while current is not None:
+                protected.add(current)
+                stored = self._records[current]
+                current = stored.record.parent_response_id
+
+            records_before = self._records.copy()
+            children_before = {
+                response_id: set(children)
+                for response_id, children in self._children.items()
+            }
+            estimated_bytes_before = self._estimated_bytes
 
             if record.response_id in self._records:
                 self._remove_subtree_locked(record.response_id)
@@ -284,10 +323,59 @@ class InMemoryResponseStore:
             if parent_id is not None:
                 self._children.setdefault(parent_id, set()).add(record.response_id)
             self._records.move_to_end(record.response_id)
-            self._evict_to_budget_locked()
-            if record.response_id not in self._records:
-                return ResponseStoreDisposition.REFUSED_BUDGET
-            return ResponseStoreDisposition.STORED
+            if not self._evict_to_budget_locked(protected):
+                self._records = records_before
+                self._children = children_before
+                self._estimated_bytes = estimated_bytes_before
+                return ResponseStoreDisposition.REFUSED_BUDGET, ()
+            evicted = tuple(
+                response_id
+                for response_id in records_before
+                if response_id != record.response_id and response_id not in self._records
+            )
+            return ResponseStoreDisposition.STORED, evicted
+
+    async def pin_chain(self, response_id: str) -> tuple[str, ...] | None:
+        """Pin one committed response and all ancestors against TTL/LRU removal."""
+
+        self._validate_response_id(response_id)
+        async with self._lock:
+            now = self._clock()
+            self._purge_expired_locked(now)
+            first = self._records.get(response_id)
+            if first is None:
+                return None
+            model = first.record.model
+            chain: list[str] = []
+            seen: set[str] = set()
+            current: str | None = response_id
+            while current is not None:
+                if current in seen:
+                    return None
+                seen.add(current)
+                stored = self._records.get(current)
+                if stored is None or stored.record.model != model:
+                    return None
+                chain.append(current)
+                current = stored.record.parent_response_id
+
+            for current in chain:
+                self._pins[current] = self._pins.get(current, 0) + 1
+                stored = self._records[current]
+                stored.expires_at = now + self._ttl_seconds
+                self._records.move_to_end(current)
+            return tuple(chain)
+
+    async def unpin_chain(self, response_ids: tuple[str, ...]) -> None:
+        if not isinstance(response_ids, tuple):
+            raise TypeError("response_ids must be a tuple")
+        async with self._lock:
+            for response_id in response_ids:
+                count = self._pins.get(response_id, 0)
+                if count <= 1:
+                    self._pins.pop(response_id, None)
+                else:
+                    self._pins[response_id] = count - 1
 
     async def discard(self, response_id: str) -> None:
         self._validate_response_id(response_id)

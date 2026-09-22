@@ -70,3 +70,39 @@ def test_responses_invalid_previous_or_store_fail_explicitly() -> None:
     with pytest.raises(OpenAIProtocolError) as exc_info:
         adapter.parse({"model": "m", "input": "x", "store": "yes"}, request_id="r")
     assert exc_info.value.code == "invalid_store"
+
+
+@pytest.mark.parametrize("bad_type", ([], {}, None, 1, 1.5, True))
+@pytest.mark.parametrize(
+    ("item", "expected_code"),
+    (
+        (
+            {"type": "message", "role": "user", "content": [{"type": None, "text": "x"}]},
+            "unsupported_content_part",
+        ),
+        (
+            {"type": "message", "role": "assistant", "content": [{"type": None, "text": "x"}]},
+            "unsupported_content_part",
+        ),
+        (
+            {"type": "function_call_output", "call_id": "call_1", "output": [{"type": None, "text": "x"}]},
+            "unsupported_function_output",
+        ),
+    ),
+)
+def test_responses_content_part_type_wrong_shapes_are_protocol_errors(
+    bad_type: object,
+    item: dict[str, object],
+    expected_code: str,
+) -> None:
+    adapter = ResponsesRequestAdapter(default_max_output_tokens=8)
+    payload = dict(item)
+    content_key = "output" if payload["type"] == "function_call_output" else "content"
+    parts = [dict(payload[content_key][0])]  # type: ignore[index]
+    parts[0]["type"] = bad_type
+    payload[content_key] = parts
+
+    with pytest.raises(OpenAIProtocolError) as exc_info:
+        adapter.parse({"model": "m", "input": [payload]}, request_id="r")
+
+    assert exc_info.value.code == expected_code

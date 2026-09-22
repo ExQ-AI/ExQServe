@@ -36,7 +36,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "cache_tokens": "auto",
     "kv_cache_bits": "8",
     "max_batch_size": 8,
-    "max_chunk_size": 2048,
+    "max_chunk_size": 1024,
     "mtp": False,
     "mtp_draft_tokens": 4,
     "mtp_cache_bits": "4",
@@ -192,7 +192,14 @@ def _build_parser(
         help="KV cache precision for both key/value caches; use fp16 to disable quantization.",
     )
     parser.add_argument("--max-batch-size", type=int)
-    parser.add_argument("--max-chunk-size", type=int)
+    parser.add_argument(
+        "--max-chunk-size",
+        type=int,
+        help=(
+            "Maximum ExLlamaV3 prefill chunk size; lower values trade some prompt throughput "
+            "for better service responsiveness during long prefills (default: 1024)."
+        ),
+    )
     parser.add_argument(
         "--mtp",
         action=argparse.BooleanOptionalAction,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
+import pytest
+
 from exqserve.control.request import (
     RequestControlConfig,
     RequestController,
@@ -86,6 +88,30 @@ def test_deadline_cancels_backend_without_cancelling_runtime_iterator_task() -> 
         assert raw.cancel_calls == 1
         assert raw.next_was_cancelled is False
         assert session.terminal_reason is RequestTerminalReason.TIMEOUT
+        assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_timeout_starts_when_request_lease_is_acquired_before_preprocessing() -> None:
+    async def scenario() -> None:
+        runtime = _Runtime()
+        controller = RequestController(
+            runtime,
+            RequestControlConfig(max_in_flight=1, timeout_seconds=0.01),
+        )
+        lease = await controller.acquire("deadline")
+        assert lease.deadline is not None
+
+        # Represents preprocessing time before the first runtime attempt.
+        await asyncio.sleep(0.02)
+        with pytest.raises(RequestRejected) as exc_info:
+            await lease.submit(_request())
+        assert exc_info.value.error.code == "request_timeout"
+        assert exc_info.value.attempt_started is False
+        assert runtime.sessions == []
+
+        await lease.release()
         assert controller.in_flight == 0
 
     asyncio.run(scenario())

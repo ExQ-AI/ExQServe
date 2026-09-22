@@ -296,6 +296,10 @@ class ControlledSessionLike(Protocol):
 
 
 class RequestLeaseLike(Protocol):
+    @property
+    def deadline(self) -> float | None:
+        ...
+
     async def submit(self, request: RuntimeGenerationRequest) -> ControlledSessionLike:
         ...
 
@@ -383,6 +387,29 @@ def _safe_error(
     retryable: bool = False,
 ) -> CanonicalError:
     return CanonicalError(category, code, message, retryable)
+
+
+def _lease_deadline(lease: RequestLeaseLike) -> float | None:
+    deadline = getattr(lease, "deadline", None)
+    if isinstance(deadline, bool) or not isinstance(deadline, int | float):
+        return None
+    return float(deadline)
+
+
+def _request_timeout_rejected() -> ServingRejected:
+    return ServingRejected(
+        _safe_error(
+            ErrorCategory.RUNTIME_FAILURE,
+            "request_timeout",
+            "Inference request exceeded its serving deadline.",
+            retryable=True,
+        )
+    )
+
+
+def _raise_if_deadline_expired(deadline: float | None) -> None:
+    if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+        raise _request_timeout_rejected()
 
 
 def _is_instruction_item(item: object) -> bool:
@@ -772,25 +799,59 @@ class ServingEngine:
         return self._compile_request_with_compiler(compiler, request)
 
     async def _compile_request_async(
-        self, request: ServingRequest, *, kind: str = "chat"
+        self,
+        request: ServingRequest,
+        *,
+        kind: str = "chat",
+        deadline: float | None = None,
     ) -> CompiledPrompt:
+        if deadline is None:
+            deadline_resolver = getattr(self._controller, "request_deadline", None)
+            if callable(deadline_resolver):
+                resolved = deadline_resolver(request.input.request_id)
+                if isinstance(resolved, int | float) and not isinstance(resolved, bool):
+                    deadline = float(resolved)
+
+        _raise_if_deadline_expired(deadline)
         pool = self._preprocessing_pool
         if pool is not None:
-            return await pool.run(
-                kind,
-                lambda lane: self._compile_request_with_compiler(lane.compiler, request),
-            )
+            async def run_pool() -> CompiledPrompt:
+                return await pool.run(
+                    kind,
+                    lambda lane: self._compile_request_with_compiler(lane.compiler, request),
+                )
 
-        async with self._compile_lock:
-            task = asyncio.create_task(asyncio.to_thread(self._compile_request, request))
             try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # The worker thread cannot be cancelled. Keep the compiler lease
-                # until it exits so a cancelled request cannot overlap a later
-                # tokenizer/vision compilation on the same runtime objects.
-                await await_task_termination(task)
-                raise
+                if deadline is None:
+                    return await run_pool()
+                async with asyncio.timeout_at(deadline):
+                    compiled = await run_pool()
+            except TimeoutError as exc:
+                raise _request_timeout_rejected() from exc
+            _raise_if_deadline_expired(deadline)
+            return compiled
+
+        async def run_direct() -> CompiledPrompt:
+            async with self._compile_lock:
+                task = asyncio.create_task(asyncio.to_thread(self._compile_request, request))
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # The worker thread cannot be cancelled. Keep the compiler lease
+                    # until it exits so a cancelled request cannot overlap a later
+                    # tokenizer/vision compilation on the same runtime objects.
+                    await await_task_termination(task)
+                    raise
+
+        try:
+            if deadline is None:
+                return await run_direct()
+            async with asyncio.timeout_at(deadline):
+                compiled = await run_direct()
+        except TimeoutError as exc:
+            raise _request_timeout_rejected() from exc
+        _raise_if_deadline_expired(deadline)
+        return compiled
 
     async def count_input_tokens(self, request: ServingRequest) -> int:
         try:
@@ -798,7 +859,11 @@ class ServingEngine:
         except RequestRejected as exc:
             raise ServingRejected(exc.error) from exc
         try:
-            compiled = await self._compile_request_async(request, kind="count_tokens")
+            deadline = _lease_deadline(lease)
+            compiled = await self._compile_request_async(
+                request, kind="count_tokens", deadline=deadline
+            )
+            _raise_if_deadline_expired(deadline)
             return len(compiled.input_ids)
         finally:
             await lease.release()

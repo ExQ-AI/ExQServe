@@ -21,6 +21,8 @@ def test_cli_defaults_to_auto_output_tokens_and_accepts_explicit_auto(tmp_path: 
     assert explicit.default_api_output_tokens is None
     assert defaulted.cache_tokens is None
     assert explicit.cache_tokens is None
+    assert defaulted.max_chunk_size == 1024
+    assert explicit.max_chunk_size == 1024
 
 
 def test_cli_parses_runtime_control_and_capture_options(tmp_path: Path) -> None:

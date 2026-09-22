@@ -112,7 +112,7 @@ def _user_content(value: object, *, param: str) -> str | tuple[TextContentPart |
                     "image_url.url must be a non-empty string.",
                     f"{part_param}.image_url.url",
                 )
-            if detail is not None and detail not in {"auto", "low", "high"}:
+            if detail is not None and (not isinstance(detail, str) or detail not in {"auto", "low", "high"}):
                 raise invalid_request(
                     "invalid_image_detail",
                     "image_url.detail must be auto, low, or high.",
@@ -173,7 +173,7 @@ def _parse_messages(value: object) -> tuple[CanonicalItem, ...]:
     for index, raw_message in enumerate(value):
         message = _as_dict(raw_message, code="invalid_messages", param=f"messages[{index}]")
         role = message.get("role")
-        if role in role_map:
+        if isinstance(role, str) and role in role_map:
             content = _text_content(message.get("content"), param=f"messages[{index}].content")
             assert content is not None
             items.append(MessageItem(role_map[role], content))
@@ -395,7 +395,8 @@ class ChatRequestAdapter:
         n = body.get("n", 1)
         if isinstance(n, bool) or n != 1:
             raise invalid_request("unsupported_n", "Only n=1 is supported in V1.", "n")
-        if body.get("logprobs") not in {None, False}:
+        logprobs = body.get("logprobs")
+        if logprobs is not None and logprobs is not False:
             raise invalid_request("unsupported_logprobs", "logprobs are not supported in V1.", "logprobs")
 
         items = _parse_messages(body.get("messages"))

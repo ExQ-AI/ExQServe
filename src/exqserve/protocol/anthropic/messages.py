@@ -11,9 +11,10 @@ from exqserve.agent.reasoning import (
     ReasoningMode,
     ReasoningPolicy,
 )
-from exqserve.agent.schema import JsonSchema
+from exqserve.agent.schema import JsonSchema, validate_strict_function_schema
 from exqserve.agent.structured_output import StructuredOutputSpec
 from exqserve.agent.tools import FunctionTool, ToolChoice, ToolChoiceMode, ToolPolicy
+from exqserve.core.generation_guarantees import ConstraintFallbackPolicy, GenerationGuarantee
 from exqserve.core.items import (
     CanonicalItem,
     ImageContentPart,
@@ -63,7 +64,7 @@ def _image_part(block: dict[str, object]) -> ImageContentPart:
     if source_type == "base64":
         media_type = source.get("media_type")
         data = source.get("data")
-        if media_type not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+        if not isinstance(media_type, str) or media_type not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
             raise invalid_request("image media_type is unsupported.")
         if not isinstance(data, str) or not data:
             raise invalid_request("base64 image data must be a non-empty string.")
@@ -267,12 +268,21 @@ def _parse_tools(value: object) -> tuple[FunctionTool, ...]:
             raise invalid_request("Anthropic server/built-in tools are not supported in V1.")
         name = tool.get("name")
         description = tool.get("description")
+        strict = tool.get("strict", False)
         if not isinstance(name, str) or not name.strip():
             raise invalid_request("tool name must be a non-empty string.")
         if description is not None and not isinstance(description, str):
             raise invalid_request("tool description must be a string.")
+        if not isinstance(strict, bool):
+            raise invalid_request("tool strict must be boolean.")
+        schema = _schema(tool.get("input_schema"))
+        if strict:
+            try:
+                validate_strict_function_schema(schema)
+            except (TypeError, ValueError) as exc:
+                raise invalid_request(f"strict tool input_schema is invalid: {exc}") from exc
         try:
-            tools.append(FunctionTool(name, description, _schema(tool.get("input_schema"))))
+            tools.append(FunctionTool(name, description, schema, strict))
         except (TypeError, ValueError) as exc:
             raise invalid_request("tool declaration is invalid.") from exc
     return tuple(tools)
@@ -339,7 +349,11 @@ def _parse_output_config(value: object) -> tuple[ReasoningEffort | None, Structu
             raise invalid_request("output_config.format.schema must be an object.")
         try:
             schema_json = json.dumps(schema_value, ensure_ascii=False, separators=(",", ":"))
-            structured_output = StructuredOutputSpec(JsonSchema(schema_json))
+            structured_output = StructuredOutputSpec(
+                JsonSchema(schema_json),
+                GenerationGuarantee.SCHEMA,
+                ConstraintFallbackPolicy.FAIL_CLOSED,
+            )
         except (TypeError, ValueError) as exc:
             raise invalid_request("output_config.format.schema is invalid.") from exc
 
@@ -364,7 +378,7 @@ def _parse_reasoning(
             False,
             ReasoningBudgetOverride(ReasoningBudgetMode.DISABLE),
         )
-    if thinking_type in {"enabled", "adaptive"}:
+    if thinking_type == "enabled" or thinking_type == "adaptive":
         budget_override = ReasoningBudgetOverride()
         if "budget_tokens" in thinking:
             budget = thinking.get("budget_tokens")
@@ -372,7 +386,7 @@ def _parse_reasoning(
                 raise invalid_request("thinking.budget_tokens must be a positive integer.")
             budget_override = ReasoningBudgetOverride(ReasoningBudgetMode.EXPLICIT, budget)
         display = thinking.get("display")
-        if display not in {None, "summarized", "omitted"}:
+        if display is not None and (not isinstance(display, str) or display not in {"summarized", "omitted"}):
             raise invalid_request("thinking.display is unsupported.")
         return ReasoningPolicy(ReasoningMode.ENABLED, effort), display == "omitted", budget_override
     raise invalid_request("Unsupported thinking type.")

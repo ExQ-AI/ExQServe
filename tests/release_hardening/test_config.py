@@ -16,7 +16,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.cache_key_bits == 8
     assert config.cache_value_bits == 8
     assert config.max_batch_size == 8
-    assert config.max_chunk_size == 2048
+    assert config.max_chunk_size == 1024
     assert config.max_in_flight == 8
     assert config.max_inference_recovery_attempts == 0
     assert config.default_api_output_tokens is None
@@ -48,6 +48,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert runtime.cache_tokens is None
     assert runtime.cache_key_bits == 8
     assert runtime.cache_value_bits == 8
+    assert runtime.max_chunk_size == 1024
     assert runtime.mtp_enabled is False
     assert runtime.mtp_draft_tokens == 4
     assert runtime.mtp_cache_bits == 4

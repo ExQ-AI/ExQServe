@@ -34,7 +34,7 @@ from exqserve.runtime.contracts import (
     RuntimeTextDelta,
 )
 from exqserve.serving.contracts import RawServingRequest, ServingRejected
-from exqserve.serving.preprocessing import RendererLanePool
+from exqserve.serving.preprocessing import RendererLanePool, await_task_termination
 from exqserve.serving.runtime_events import timing_event_from_runtime
 from exqserve.serving.terminal import (
     TerminalDecision,
@@ -63,6 +63,10 @@ class ControlledRawSession(Protocol):
 
 
 class RawRequestLease(Protocol):
+    @property
+    def deadline(self) -> float | None:
+        ...
+
     async def submit(self, request: RuntimeGenerationRequest) -> ControlledRawSession:
         ...
 
@@ -102,6 +106,29 @@ def _safe_error(
     return CanonicalError(category, code, message, retryable)
 
 
+def _lease_deadline(lease: RawRequestLease) -> float | None:
+    deadline = getattr(lease, "deadline", None)
+    if isinstance(deadline, bool) or not isinstance(deadline, int | float):
+        return None
+    return float(deadline)
+
+
+def _request_timeout_rejected() -> ServingRejected:
+    return ServingRejected(
+        _safe_error(
+            ErrorCategory.RUNTIME_FAILURE,
+            "request_timeout",
+            "Inference request exceeded its serving deadline.",
+            retryable=True,
+        )
+    )
+
+
+def _raise_if_deadline_expired(deadline: float | None) -> None:
+    if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+        raise _request_timeout_rejected()
+
+
 class RawServingEngine:
     def __init__(
         self,
@@ -126,6 +153,8 @@ class RawServingEngine:
         except RequestRejected as exc:
             raise ServingRejected(exc.error) from exc
 
+        deadline = _lease_deadline(lease)
+        _raise_if_deadline_expired(deadline)
         controlled: ControlledRawSession | None = None
         try:
             prompt = request.input.items[0]
@@ -136,15 +165,45 @@ class RawServingEngine:
                 try:
                     pool = self._preprocessing_pool
                     if pool is not None:
-                        rendered = await pool.run(
-                            "raw_text",
-                            lambda lane: lane.renderer.tokenize_text(prompt_text),
-                        )
+                        async def render_pool() -> RuntimeRenderedPrompt:
+                            return await pool.run(
+                                "raw_text",
+                                lambda lane: lane.renderer.tokenize_text(prompt_text),
+                            )
+
+                        try:
+                            if deadline is None:
+                                rendered = await render_pool()
+                            else:
+                                async with asyncio.timeout_at(deadline):
+                                    rendered = await render_pool()
+                        except TimeoutError as exc:
+                            raise _request_timeout_rejected() from exc
                     else:
                         tokenizer = self._tokenizer
                         if tokenizer is None:
                             raise RuntimeError("raw tokenizer is unavailable")
-                        rendered = tokenizer.tokenize_text(prompt.text)
+                        async def tokenize_direct() -> RuntimeRenderedPrompt:
+                            task = asyncio.create_task(
+                                asyncio.to_thread(tokenizer.tokenize_text, prompt_text)
+                            )
+                            try:
+                                return await asyncio.shield(task)
+                            except asyncio.CancelledError:
+                                await await_task_termination(task)
+                                raise
+
+                        try:
+                            if deadline is None:
+                                rendered = await tokenize_direct()
+                            else:
+                                async with asyncio.timeout_at(deadline):
+                                    rendered = await tokenize_direct()
+                        except TimeoutError as exc:
+                            raise _request_timeout_rejected() from exc
+                    _raise_if_deadline_expired(deadline)
+                except ServingRejected:
+                    raise
                 except (TypeError, ValueError) as exc:
                     raise ServingRejected(
                         _safe_error(

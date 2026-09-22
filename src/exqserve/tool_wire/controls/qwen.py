@@ -7,8 +7,11 @@ Qwen parser, keeping generation-language authority separate from syntactic decod
 
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from threading import Lock
 from typing import cast
 
 from jsonschema import Draft202012Validator
@@ -140,6 +143,9 @@ _QWEN_COMPAT_SUFFIX_MAX_BYTES = 64 * 1024
 _QWEN_COMPAT_PROBE_WORK_MAX_CHARS = 64 * 1024
 _QWEN_COMPAT_SEMANTIC_WORK_MAX_CHARS = 64 * 1024
 _QWEN_COMPAT_SEMANTIC_CANDIDATE_MAX = 256
+_QWEN_COMPILE_CACHE_MAXSIZE = 128
+_QWEN_COMPILE_CACHE_MAX_SOURCE_CHARS = 64 * 1024
+_QWEN_COMPILE_CACHE_MAX_WEIGHT_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +171,13 @@ class QwenToolWireCompilation:
             or self.order_generation_narrowed
             or self.branch_generation_narrowed
         )
+
+
+_QWEN_COMPILE_CACHE: OrderedDict[tuple[object, ...], tuple[QwenToolWireCompilation, int]] = OrderedDict()
+_QWEN_COMPILE_CACHE_LOCK = Lock()
+_QWEN_COMPILE_CACHE_HITS = 0
+_QWEN_COMPILE_CACHE_MISSES = 0
+_QWEN_COMPILE_CACHE_WEIGHT_BYTES = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1178,7 +1191,7 @@ def build_qwen_constrained_tool_region_decoder(
     return QwenToolRegionDecoder(authority)
 
 
-def compile_qwen_tool_wire(
+def _compile_qwen_tool_wire_uncached(
     policy: ToolPolicy,
     mode: ToolConstraintMode,
     *,
@@ -1432,6 +1445,174 @@ def compile_qwen_tool_wire(
         ),
         branch_generation_narrowed=branch_generation_narrowed,
     )
+
+
+def _qwen_compile_cache_key(
+    policy: ToolPolicy,
+    mode: ToolConstraintMode,
+    budget: CompileBudget | None,
+    max_parallel_calls: int,
+) -> tuple[object, ...] | None:
+    exposed_tools = _exposed_qwen_tools(policy)
+    if len(exposed_tools) > _HARD_MAX_EXPOSED_TOOLS:
+        return None
+
+    aggregate_source_chars = 0
+    tool_keys: list[tuple[str, bytes, bool]] = []
+    for tool in exposed_tools:
+        source = tool.parameters.canonical_json
+        aggregate_source_chars += len(source)
+        if (
+            len(tool.name) > _HARD_MAX_NAME_CHARS
+            or len(source) > _HARD_MAX_SCHEMA_SOURCE_CHARS_PER_TOOL
+            or aggregate_source_chars > _HARD_MAX_SCHEMA_SOURCE_CHARS_TOTAL
+        ):
+            return None
+        if aggregate_source_chars > _QWEN_COMPILE_CACHE_MAX_SOURCE_CHARS:
+            return None
+        try:
+            _utf8_len_or_hard_reject(tool.name, label="Tool name")
+        except _HardComplexityExceeded:
+            return None
+        source_digest = hashlib.sha256(source.encode("utf-8")).digest()
+        tool_keys.append((str(tool.name), source_digest, tool.strict))
+
+    budget_key = (
+        None
+        if budget is None
+        else (
+            budget.max_permutations,
+            budget.max_estimated_rules,
+            budget.max_estimated_bytes,
+            budget.max_work_units,
+        )
+    )
+    return (
+        qwen_production_tool_wire_spec().fingerprint,
+        mode.value,
+        policy.choice.mode.value,
+        policy.choice.name,
+        policy.allow_parallel,
+        tuple(tool_keys),
+        budget_key,
+        max_parallel_calls,
+        id(_qwen_effective_tool_modes),
+        id(_tool_constraints.constraint_schema),
+        id(qwen_property_schema),
+        id(build_lark_tool_constraint_candidate),
+        id(finalize_lark_tool_constraint_candidate),
+        id(compile_tool_wire_plan),
+        id(Draft202012Validator),
+    )
+
+
+def _qwen_compile_cache_weight(
+    policy: ToolPolicy,
+    compiled: QwenToolWireCompilation,
+) -> int:
+    source_bytes = sum(
+        len(tool.parameters.canonical_json.encode("utf-8"))
+        for tool in _exposed_qwen_tools(policy)
+    )
+    grammar_bytes = 0 if compiled.constraint is None else len(
+        compiled.constraint.lark_grammar.encode("utf-8")
+    )
+    return source_bytes + compiled.plan.budget_result.estimated_bytes + grammar_bytes
+
+
+def compile_qwen_tool_wire(
+    policy: ToolPolicy,
+    mode: ToolConstraintMode,
+    *,
+    budget: CompileBudget | None = None,
+    max_parallel_calls: int = 4,
+) -> QwenToolWireCompilation:
+    """Compile or reuse one immutable Qwen constrained Tool-Wire artifact."""
+
+    global _QWEN_COMPILE_CACHE_HITS, _QWEN_COMPILE_CACHE_MISSES
+    global _QWEN_COMPILE_CACHE_WEIGHT_BYTES
+
+    if not isinstance(policy, ToolPolicy):
+        raise TypeError("policy must be a ToolPolicy")
+    if not isinstance(mode, ToolConstraintMode):
+        raise TypeError("mode must be a ToolConstraintMode")
+    if (
+        not isinstance(max_parallel_calls, int)
+        or isinstance(max_parallel_calls, bool)
+        or max_parallel_calls <= 0
+    ):
+        raise ValueError("max_parallel_calls must be a positive integer")
+    if budget is not None and not isinstance(budget, CompileBudget):
+        raise TypeError("budget must be a CompileBudget or None")
+
+    key = _qwen_compile_cache_key(policy, mode, budget, max_parallel_calls)
+    if key is not None:
+        with _QWEN_COMPILE_CACHE_LOCK:
+            cached = _QWEN_COMPILE_CACHE.pop(key, None)
+            if cached is not None:
+                _QWEN_COMPILE_CACHE[key] = cached
+                _QWEN_COMPILE_CACHE_HITS += 1
+                cached_compilation, _ = cached
+                return cached_compilation
+            _QWEN_COMPILE_CACHE_MISSES += 1
+
+    compiled = _compile_qwen_tool_wire_uncached(
+        policy,
+        mode,
+        budget=budget,
+        max_parallel_calls=max_parallel_calls,
+    )
+    if key is not None:
+        weight = _qwen_compile_cache_weight(policy, compiled)
+        if weight <= _QWEN_COMPILE_CACHE_MAX_WEIGHT_BYTES:
+            with _QWEN_COMPILE_CACHE_LOCK:
+                replaced = _QWEN_COMPILE_CACHE.pop(key, None)
+                if replaced is not None:
+                    _, replaced_weight = replaced
+                    _QWEN_COMPILE_CACHE_WEIGHT_BYTES -= replaced_weight
+                _QWEN_COMPILE_CACHE[key] = (compiled, weight)
+                _QWEN_COMPILE_CACHE_WEIGHT_BYTES += weight
+                _QWEN_COMPILE_CACHE.move_to_end(key)
+                while (
+                    len(_QWEN_COMPILE_CACHE) > _QWEN_COMPILE_CACHE_MAXSIZE
+                    or _QWEN_COMPILE_CACHE_WEIGHT_BYTES > _QWEN_COMPILE_CACHE_MAX_WEIGHT_BYTES
+                ):
+                    _, (_, evicted_weight) = _QWEN_COMPILE_CACHE.popitem(last=False)
+                    _QWEN_COMPILE_CACHE_WEIGHT_BYTES -= evicted_weight
+    return compiled
+
+
+def qwen_tool_wire_compile_cache_stats() -> tuple[int, int, int, int]:
+    """Return (hits, misses, maxsize, currsize) for bounded compile-cache observability."""
+
+    with _QWEN_COMPILE_CACHE_LOCK:
+        return (
+            _QWEN_COMPILE_CACHE_HITS,
+            _QWEN_COMPILE_CACHE_MISSES,
+            _QWEN_COMPILE_CACHE_MAXSIZE,
+            len(_QWEN_COMPILE_CACHE),
+        )
+
+
+def _qwen_tool_wire_compile_cache_weight_stats() -> tuple[int, int]:
+    """Return (max_weight_bytes, current_weight_bytes) for focused resource regressions."""
+
+    with _QWEN_COMPILE_CACHE_LOCK:
+        return (
+            _QWEN_COMPILE_CACHE_MAX_WEIGHT_BYTES,
+            _QWEN_COMPILE_CACHE_WEIGHT_BYTES,
+        )
+
+
+def _clear_qwen_tool_wire_compile_cache() -> None:
+    global _QWEN_COMPILE_CACHE_HITS, _QWEN_COMPILE_CACHE_MISSES
+    global _QWEN_COMPILE_CACHE_WEIGHT_BYTES
+
+    with _QWEN_COMPILE_CACHE_LOCK:
+        _QWEN_COMPILE_CACHE.clear()
+        _QWEN_COMPILE_CACHE_HITS = 0
+        _QWEN_COMPILE_CACHE_MISSES = 0
+        _QWEN_COMPILE_CACHE_WEIGHT_BYTES = 0
 
 
 def qwen_production_tool_constraint(

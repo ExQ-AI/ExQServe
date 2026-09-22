@@ -211,6 +211,8 @@ def test_chat_image_url_maps_to_ordered_multimodal_user_item() -> None:
         ({"n": 2}, "unsupported_n"),
         ({"n": True}, "unsupported_n"),
         ({"logprobs": True}, "unsupported_logprobs"),
+        ({"logprobs": {}}, "unsupported_logprobs"),
+        ({"messages": [{"role": [], "content": "hi"}]}, "unsupported_message_role"),
         (
             {"tools": [{"type": "custom", "custom": {"name": "x"}}]},
             "unsupported_tool_type",

@@ -93,6 +93,37 @@ def test_strict_function_schema_accepts_required_nullable_nested_objects() -> No
     validate_strict_function_schema(schema)
 
 
+@pytest.mark.parametrize("keyword_name", ["properties", "items", "required", "type", "default"])
+def test_strict_function_schema_allows_property_names_that_match_schema_keywords(
+    keyword_name: str,
+) -> None:
+    schema = JsonSchema(
+        '{"type":"object","properties":{'
+        f'"{keyword_name}":{{"type":"string"}}'
+        '},"required":['
+        f'"{keyword_name}"'
+        '],"additionalProperties":false}'
+    )
+
+    validate_strict_function_schema(schema)
+
+
+def test_strict_function_schema_walks_only_schema_bearing_keywords() -> None:
+    schema = JsonSchema(
+        '{"type":"object","properties":{'
+        '"choice":{"anyOf":['
+        '{"type":"object","properties":{"x":{"type":"string"}},'
+        '"required":["x"],"additionalProperties":false},'
+        '{"type":"array","items":{"type":"object","properties":{"y":{"type":"integer"}},'
+        '"required":["y"],"additionalProperties":false}}]},'
+        '"annotation":{"type":"string","default":{"properties":{"not":"a schema"}},'
+        '"examples":[{"items":{"also":"data"}}]}'
+        '},"required":["choice","annotation"],"additionalProperties":false}'
+    )
+
+    validate_strict_function_schema(schema)
+
+
 def test_strict_function_schema_requires_closed_objects_and_all_properties_required() -> None:
     with pytest.raises(ValueError, match="additionalProperties"):
         validate_strict_function_schema(

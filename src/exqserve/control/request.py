@@ -443,6 +443,12 @@ class RequestController:
     def in_flight(self) -> int:
         return self._in_flight
 
+    def request_deadline(self, request_id: str) -> float | None:
+        """Return the absolute deadline owned by the active request lease, if any."""
+
+        lease = self._leases_by_request_id.get(request_id)
+        return None if lease is None else lease.deadline
+
     @property
     def runtime_capabilities(self) -> RuntimeCapabilities | None:
         capabilities = getattr(self._runtime, "capabilities", None)
@@ -547,6 +553,10 @@ class RequestController:
                 )
 
             lease = RequestLease(self, request_id)
+            if self._config.timeout_seconds is not None:
+                lease._deadline = asyncio.get_running_loop().time() + float(
+                    self._config.timeout_seconds
+                )
             self._leases_by_request_id[request_id] = lease
             self._in_flight += 1
             self._drained.clear()

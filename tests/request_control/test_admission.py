@@ -137,11 +137,11 @@ def test_explicit_lease_spans_two_attempts_and_releases_capacity_once() -> None:
         )
         request = _request()
         lease = await controller.acquire(request.request_id)
-        assert lease.deadline is None
-
-        first = await lease.submit(request)
         first_deadline = lease.deadline
         assert first_deadline is not None
+
+        first = await lease.submit(request)
+        assert lease.deadline == first_deadline
         assert [event async for event in first] == []
         assert controller.in_flight == 1
         assert lease.is_active is True

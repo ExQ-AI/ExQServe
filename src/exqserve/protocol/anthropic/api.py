@@ -27,6 +27,7 @@ from exqserve.protocol.anthropic.serialization import (
     AnthropicMessageStreamSerializer,
     anthropic_sse,
 )
+from exqserve.protocol.disconnect import race_nonstream_disconnect
 from exqserve.serving.contracts import (
     ServingRejected,
     ServingRequest,
@@ -215,7 +216,24 @@ def create_anthropic_router(
             body = await _body_dict(request, max_request_body_bytes)
             parsed = codec.parse(body, request_id=request_id)
             _require_model(parsed.model, served_model)
-            session = await _submit(engine, parsed.serving)
+            if not parsed.stream:
+                async def run_nonstream() -> dict[str, object]:
+                    session = await _submit(engine, parsed.serving)
+                    return await _consume(
+                        session,
+                        AnthropicMessageAccumulator(
+                            parsed.model,
+                            omit_thinking=parsed.omit_thinking,
+                        ),
+                    )
+
+                result = await race_nonstream_disconnect(request, run_nonstream())
+                return JSONResponse(result, headers=_headers(request_id))
+
+            session = await race_nonstream_disconnect(
+                request,
+                _submit(engine, parsed.serving),
+            )
             if parsed.stream:
                 serializer = AnthropicMessageStreamSerializer(
                     parsed.model,
@@ -227,11 +245,6 @@ def create_anthropic_router(
                     media_type="text/event-stream",
                     headers=_headers(request_id),
                 )
-            result = await _consume(
-                session,
-                AnthropicMessageAccumulator(parsed.model, omit_thinking=parsed.omit_thinking),
-            )
-            return JSONResponse(result, headers=_headers(request_id))
         except AnthropicProtocolError as exc:
             return _error_response(exc, request_id)
 

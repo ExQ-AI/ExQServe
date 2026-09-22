@@ -75,7 +75,7 @@ def _reject_unsupported(body: dict[str, object]) -> None:
     if isinstance(n, bool) or n != 1:
         raise invalid_request("unsupported_n", "Only n=1 is supported.", "n")
     best_of = body.get("best_of", 1)
-    if isinstance(best_of, bool) or best_of not in {None, 1}:
+    if isinstance(best_of, bool) or (best_of is not None and best_of != 1):
         raise invalid_request("unsupported_best_of", "best_of greater than 1 is not supported.", "best_of")
     if body.get("logprobs") is not None:
         raise invalid_request("unsupported_logprobs", "logprobs are not supported.", "logprobs")

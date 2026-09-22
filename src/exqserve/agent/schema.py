@@ -84,10 +84,6 @@ def validate_strict_function_schema(schema: JsonSchema) -> None:
 
 
 def _validate_strict_schema_node(value: JsonValue, path: tuple[str | int, ...]) -> None:
-    if isinstance(value, list):
-        for index, child in enumerate(value):
-            _validate_strict_schema_node(child, (*path, index))
-        return
     if not isinstance(value, dict):
         return
 
@@ -112,8 +108,48 @@ def _validate_strict_schema_node(value: JsonValue, path: tuple[str | int, ...]) 
                 f"object schema at {location} must require every property; missing {missing[0]!r}"
             )
 
-    for key, child in value.items():
-        _validate_strict_schema_node(child, (*path, key))
+    for child_path, child in _strict_schema_children(value, path):
+        _validate_strict_schema_node(child, child_path)
+
+
+def _strict_schema_children(
+    value: dict[str, JsonValue],
+    path: tuple[str | int, ...],
+) -> tuple[tuple[tuple[str | int, ...], JsonValue], ...]:
+    children: list[tuple[tuple[str | int, ...], JsonValue]] = []
+
+    for keyword in ("properties", "patternProperties", "$defs", "dependentSchemas"):
+        mapping = value.get(keyword)
+        if isinstance(mapping, dict):
+            for name, child in mapping.items():
+                if isinstance(child, dict):
+                    children.append(((*path, keyword, name), child))
+
+    for keyword in (
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+    ):
+        child = value.get(keyword)
+        if isinstance(child, dict):
+            children.append(((*path, keyword), child))
+
+    for keyword in ("prefixItems", "allOf", "anyOf", "oneOf"):
+        sequence = value.get(keyword)
+        if isinstance(sequence, list):
+            for index, child in enumerate(sequence):
+                if isinstance(child, dict):
+                    children.append(((*path, keyword, index), child))
+
+    return tuple(children)
 
 
 def _format_schema_path(path: tuple[str | int, ...]) -> str:
