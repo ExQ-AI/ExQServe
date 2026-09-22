@@ -167,7 +167,7 @@ class ExLlamaV3LoadConfig:
     tp_output_device: int | None = None
     device_ids: tuple[int, ...] | None = None
     chat_template: str | None = None
-    vision_cache_mb: int = 256
+    vision_cache_mb: int = 1024
     sysmem_kv_cache_mb: int = 0
     sysmem_recurrent_cache_mb: int = 4096
     ngram_match_min: int = 0

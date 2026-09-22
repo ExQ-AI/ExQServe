@@ -26,6 +26,16 @@ def test_engine_metrics_replace_ready_values_with_nan_when_unavailable() -> None
             cpu_kv_cached_pages=4,
             cpu_kv_cache_evictions_since_generator_start=2,
             recurrent_cache_bytes=65536,
+            vision_cache_budget_bytes=1024 * 1024,
+            vision_cache_retained_entries=3,
+            vision_cache_retained_tensor_bytes=4096,
+            vision_cache_hits=7,
+            vision_cache_admission_skipped=2,
+            vision_cache_over_budget_requests=1,
+            vision_cache_incomplete_prefix_retention_requests=1,
+            vision_cache_last_request_unique_media_count=4,
+            vision_cache_last_request_protected_prefix_entries=3,
+            vision_cache_last_request_first_unretained_media_ordinal=4,
         )
     ]
     metrics = MetricsRegistry()
@@ -36,14 +46,22 @@ def test_engine_metrics_replace_ready_values_with_nan_when_unavailable() -> None
     assert _sample(ready, "exqserve_engine_cpu_kv_cached_pages") == 4.0
     assert _sample(ready, "exqserve_engine_cpu_kv_cache_evictions_since_generator_start") == 2.0
     assert _sample(ready, "exqserve_engine_recurrent_cache_bytes") == 65536.0
+    assert _sample(ready, "exqserve_engine_vision_cache_budget_bytes") == 1024.0 * 1024
+    assert _sample(ready, "exqserve_engine_vision_cache_retained_entries") == 3.0
+    assert _sample(ready, "exqserve_engine_vision_cache_hits") == 7.0
+    assert _sample(ready, "exqserve_engine_vision_cache_admission_skipped") == 2.0
+    assert _sample(ready, "exqserve_engine_vision_cache_over_budget_requests") == 1.0
+    assert _sample(ready, "exqserve_engine_vision_cache_last_request_first_unretained_media_ordinal") == 4.0
     assert 'exqserve_engine_state{state="ready"} 1.0' in ready
 
     current[0] = RuntimeEngineStats(RuntimeEngineState.UNAVAILABLE)
     unavailable = metrics.render_text()
     active = _sample(unavailable, "exqserve_engine_active_jobs")
     allocated = _sample(unavailable, "exqserve_engine_kv_pages_allocated_since_generator_start")
+    vision_budget = _sample(unavailable, "exqserve_engine_vision_cache_budget_bytes")
     assert active is not None and math.isnan(active)
     assert allocated is not None and math.isnan(allocated)
+    assert vision_budget is not None and math.isnan(vision_budget)
     assert 'exqserve_engine_state{state="unavailable"} 1.0' in unavailable
     assert 'exqserve_engine_state{state="ready"} 0.0' in unavailable
 

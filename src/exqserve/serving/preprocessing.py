@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
@@ -32,6 +33,28 @@ class RendererMetricsLike(Protocol):
 
     def renderer_finished(self, elapsed_seconds: float) -> None:
         ...
+
+
+class _PreprocessingCancellation(threading.Event):
+    """Event-compatible cancellation with an atomic persistent-publication boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._commit_lock = threading.Lock()
+
+    def set(self) -> None:
+        with self._commit_lock:
+            super().set()
+
+    def clear(self) -> None:
+        with self._commit_lock:
+            super().clear()
+
+    @contextmanager
+    def commit_guard(self) -> Iterator[bool]:
+        """Hold cancellation/publication ordering through one persistent commit."""
+        with self._commit_lock:
+            yield not super().is_set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,15 +128,22 @@ class RendererLanePool:
         execution_started = time.perf_counter()
         if metrics is not None:
             metrics.renderer_started(kind)
+        cancel_event = _PreprocessingCancellation()
+        set_cancel_event = getattr(lane.renderer, "set_preprocessing_cancel_event", None)
+        if callable(set_cancel_event):
+            set_cancel_event(cancel_event)
         task = asyncio.create_task(asyncio.to_thread(operation, lane))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
+            cancel_event.set()
             # Worker-thread work cannot be cancelled safely. Keep the lane leased until
             # the actual call exits so cancellation cannot overlap later work on it.
             await await_task_termination(task)
             raise
         finally:
+            if callable(set_cancel_event):
+                set_cancel_event(None)
             if metrics is not None:
                 metrics.renderer_finished(time.perf_counter() - execution_started)
             if not self._closed:

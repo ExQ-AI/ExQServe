@@ -124,6 +124,70 @@ _ENGINE_NUMERIC_FIELDS = (
         "exqserve_engine_recurrent_cache_pruned_since_generator_start",
         "Stranded recurrent checkpoints pruned since the current Generator started.",
     ),
+    (
+        "vision_cache_budget_bytes",
+        "exqserve_engine_vision_cache_budget_bytes",
+        "Configured retained-tensor byte budget for the Vision embedding cache.",
+    ),
+    (
+        "vision_cache_retained_entries",
+        "exqserve_engine_vision_cache_retained_entries",
+        "Current Vision embedding cache entries.",
+    ),
+    (
+        "vision_cache_retained_tensor_bytes",
+        "exqserve_engine_vision_cache_retained_tensor_bytes",
+        "Current retained Vision embedding tensor bytes.",
+    ),
+    ("vision_cache_queries", "exqserve_engine_vision_cache_queries", "Cumulative unique Vision media lookups."),
+    ("vision_cache_hits", "exqserve_engine_vision_cache_hits", "Cumulative Vision embedding cache hits."),
+    ("vision_cache_misses", "exqserve_engine_vision_cache_misses", "Cumulative Vision embedding cache misses."),
+    ("vision_cache_evictions", "exqserve_engine_vision_cache_evictions", "Cumulative Vision embedding cache evictions."),
+    (
+        "vision_cache_admission_skipped",
+        "exqserve_engine_vision_cache_admission_skipped",
+        "Cumulative Vision embeddings skipped from persistent admission.",
+    ),
+    (
+        "vision_cache_over_budget_requests",
+        "exqserve_engine_vision_cache_over_budget_requests",
+        "Cumulative multimodal requests whose unique Vision working set exceeded the cache budget.",
+    ),
+    (
+        "vision_cache_incomplete_prefix_retention_requests",
+        "exqserve_engine_vision_cache_incomplete_prefix_retention_requests",
+        "Cumulative multimodal requests without full persistent prefix identity retention.",
+    ),
+    (
+        "vision_cache_last_request_unique_media_count",
+        "exqserve_engine_vision_cache_last_request_unique_media_count",
+        "Unique media count in the last committed multimodal request.",
+    ),
+    (
+        "vision_cache_last_request_unique_media_bytes",
+        "exqserve_engine_vision_cache_last_request_unique_media_bytes",
+        "Retained-tensor bytes required by unique media in the last committed multimodal request.",
+    ),
+    (
+        "vision_cache_last_request_retained_media_bytes",
+        "exqserve_engine_vision_cache_last_request_retained_media_bytes",
+        "Bytes of last-request Vision media retained after commit.",
+    ),
+    (
+        "vision_cache_last_request_protected_prefix_entries",
+        "exqserve_engine_vision_cache_last_request_protected_prefix_entries",
+        "Prefix-priority media entries protected for the last committed multimodal request.",
+    ),
+    (
+        "vision_cache_last_request_protected_prefix_bytes",
+        "exqserve_engine_vision_cache_last_request_protected_prefix_bytes",
+        "Prefix-priority Vision embedding bytes protected for the last committed multimodal request.",
+    ),
+    (
+        "vision_cache_last_request_first_unretained_media_ordinal",
+        "exqserve_engine_vision_cache_last_request_first_unretained_media_ordinal",
+        "One-based ordinal of the first media item outside persistent prefix retention.",
+    ),
 )
 
 

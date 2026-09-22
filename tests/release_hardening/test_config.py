@@ -25,7 +25,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.response_store_max_bytes == 64 * 1024 * 1024
     assert config.max_request_body_bytes == 32 * 1024 * 1024
     assert config.max_injection_body_bytes == 64 * 1024
-    assert config.vision_cache_mb == 256
+    assert config.vision_cache_mb == 1024
     assert config.sysmem_kv_cache_mb == 0
     assert config.sysmem_recurrent_cache_mb == 4096
     assert config.ngram_match_min == 0
@@ -67,7 +67,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert runtime.tp_output_device is None
     assert runtime.device_ids is None
     assert runtime.chat_template is None
-    assert runtime.vision_cache_mb == 256
+    assert runtime.vision_cache_mb == 1024
     assert runtime.sysmem_kv_cache_mb == 0
     assert runtime.sysmem_recurrent_cache_mb == 4096
     assert runtime.ngram_match_min == 0

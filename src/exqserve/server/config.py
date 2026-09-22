@@ -67,7 +67,7 @@ class ServerConfig:
     draft_confidence: float = 0.4
     chat_template: Path | None = None
     max_injection_body_bytes: int = 64 * 1024
-    vision_cache_mb: int = 256
+    vision_cache_mb: int = 1024
     model_dialect: str = "auto"
     tool_constraint_mode: ToolConstraintMode = ToolConstraintMode.OFF
     sysmem_kv_cache_mb: int = 0

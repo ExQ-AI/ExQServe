@@ -41,6 +41,22 @@ class RuntimeEngineStats:
     recurrent_cache_bytes: int | None = None
     recurrent_cache_evictions_since_generator_start: int | None = None
     recurrent_cache_pruned_since_generator_start: int | None = None
+    vision_cache_budget_bytes: int | None = None
+    vision_cache_retained_entries: int | None = None
+    vision_cache_retained_tensor_bytes: int | None = None
+    vision_cache_queries: int | None = None
+    vision_cache_hits: int | None = None
+    vision_cache_misses: int | None = None
+    vision_cache_evictions: int | None = None
+    vision_cache_admission_skipped: int | None = None
+    vision_cache_over_budget_requests: int | None = None
+    vision_cache_incomplete_prefix_retention_requests: int | None = None
+    vision_cache_last_request_unique_media_count: int | None = None
+    vision_cache_last_request_unique_media_bytes: int | None = None
+    vision_cache_last_request_retained_media_bytes: int | None = None
+    vision_cache_last_request_protected_prefix_entries: int | None = None
+    vision_cache_last_request_protected_prefix_bytes: int | None = None
+    vision_cache_last_request_first_unretained_media_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, RuntimeEngineState):
@@ -69,6 +85,22 @@ class RuntimeEngineStats:
             "recurrent_cache_bytes",
             "recurrent_cache_evictions_since_generator_start",
             "recurrent_cache_pruned_since_generator_start",
+            "vision_cache_budget_bytes",
+            "vision_cache_retained_entries",
+            "vision_cache_retained_tensor_bytes",
+            "vision_cache_queries",
+            "vision_cache_hits",
+            "vision_cache_misses",
+            "vision_cache_evictions",
+            "vision_cache_admission_skipped",
+            "vision_cache_over_budget_requests",
+            "vision_cache_incomplete_prefix_retention_requests",
+            "vision_cache_last_request_unique_media_count",
+            "vision_cache_last_request_unique_media_bytes",
+            "vision_cache_last_request_retained_media_bytes",
+            "vision_cache_last_request_protected_prefix_entries",
+            "vision_cache_last_request_protected_prefix_bytes",
+            "vision_cache_last_request_first_unretained_media_ordinal",
         ):
             value = getattr(self, name)
             if value is None:

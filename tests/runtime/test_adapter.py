@@ -1493,6 +1493,200 @@ def test_two_vision_lanes_share_single_flight_and_double_check_cache(
     asyncio.run(scenario())
 
 
+def test_cancelled_vision_preprocessing_does_not_commit_request_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=True)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    renderer = runtime.create_prompt_renderer()
+    renderer._resources.tokenizer.rendered_text = "<|image|>"
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[object] = []
+    vision_model = backend._state["vision_model"]
+
+    def blocking_embedding(tokenizer: object, image: object) -> object:
+        calls.append(tokenizer)
+        started.set()
+        release.wait(timeout=2)
+        return SimpleNamespace(
+            text_alias="<$EMB_1$>",
+            token_list=[2, 1_000_000_001, 3],
+            embeddings=_FakeEmbeddingTensor(),
+            deepstack_embeddings=[],
+        )
+
+    monkeypatch.setattr(vision_model, "get_image_embeddings", blocking_embedding)
+    pool = RendererLanePool((RendererLane(renderer, object()),))  # type: ignore[arg-type]
+    messages = [{"role": "user", "content": [{"type": "image", "image": "same"}]}]
+
+    def render(lane: RendererLane) -> object:
+        return lane.renderer.render_chat_template(  # type: ignore[attr-defined]
+            messages,
+            None,
+            {},
+            add_generation_prompt=True,
+            protect_literal_tokens=False,
+        )
+
+    async def scenario() -> None:
+        active = asyncio.create_task(pool.run("chat", render))
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set()
+
+        active.cancel()
+        await asyncio.sleep(0.02)
+        stats_during_cancel = runtime.vision_cache_stats
+        assert stats_during_cancel is not None
+        assert stats_during_cancel.entries == 0
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+        stats_after_cancel = runtime.vision_cache_stats
+        assert stats_after_cancel is not None
+        assert stats_after_cancel.entries == 0
+        assert stats_after_cancel.last_request_unique_media_count == 0
+        assert len(calls) == 1
+
+        await pool.run("chat", render)
+        stats_after_retry = runtime.vision_cache_stats
+        assert stats_after_retry is not None
+        assert stats_after_retry.entries == 1
+        assert stats_after_retry.last_request_unique_media_count == 1
+        assert len(calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_vision_preprocessing_at_commit_boundary_preserves_previous_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend(supports_vision=True)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    renderer = runtime.create_prompt_renderer()
+    renderer._resources.tokenizer.rendered_text = "<|image|>"
+    vision_model = backend._state["vision_model"]
+
+    def embedding(tokenizer: object, image: object) -> object:
+        return SimpleNamespace(
+            text_alias="<vision-new>",
+            token_list=[2, 1_000_000_001, 3],
+            embeddings=_FakeEmbeddingTensor(),
+            deepstack_embeddings=[],
+        )
+
+    monkeypatch.setattr(vision_model, "get_image_embeddings", embedding)
+    cache = renderer._resources.vision_cache
+    assert cache is not None
+    old_embedding = SimpleNamespace(
+        text_alias="<vision-old>",
+        token_list=[2, 1_000_000_000, 3],
+        embeddings=_FakeEmbeddingTensor(),
+        deepstack_embeddings=[],
+    )
+    assert cache.put("old", old_embedding) is True
+    before = runtime.vision_cache_stats
+    assert before is not None
+
+    entered_commit = threading.Event()
+    release_commit = threading.Event()
+    original_commit = cache.commit_request
+
+    def blocked_commit(items: tuple[tuple[str, object], ...]):
+        entered_commit.set()
+        assert release_commit.wait(timeout=2)
+        return original_commit(items)
+
+    monkeypatch.setattr(cache, "commit_request", blocked_commit)
+    pool = RendererLanePool((RendererLane(renderer, object()),))  # type: ignore[arg-type]
+    messages = [{"role": "user", "content": [{"type": "image", "image": "new"}]}]
+
+    def render(lane: RendererLane) -> object:
+        return lane.renderer.render_chat_template(  # type: ignore[attr-defined]
+            messages,
+            None,
+            {},
+            add_generation_prompt=True,
+            protect_literal_tokens=False,
+        )
+
+    async def scenario() -> None:
+        active = asyncio.create_task(pool.run("chat", render))
+        for _ in range(200):
+            if entered_commit.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert entered_commit.is_set()
+
+        active.cancel()
+        for _ in range(200):
+            if renderer._preprocessing_cancelled():
+                break
+            await asyncio.sleep(0.005)
+        assert renderer._preprocessing_cancelled()
+        release_commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+        after = runtime.vision_cache_stats
+        assert after is not None
+        assert cache.peek("old") is old_embedding
+        assert after.entries == before.entries
+        assert after.retained_tensor_bytes == before.retained_tensor_bytes
+        assert after.evictions == before.evictions
+        assert after.admission_skipped == before.admission_skipped
+        assert after.over_budget_requests == before.over_budget_requests
+        assert (
+            after.incomplete_prefix_retention_requests
+            == before.incomplete_prefix_retention_requests
+        )
+        assert after.last_request_unique_media_count == before.last_request_unique_media_count
+        assert after.last_request_unique_media_bytes == before.last_request_unique_media_bytes
+        assert after.last_request_retained_media_bytes == before.last_request_retained_media_bytes
+        assert (
+            after.last_request_protected_prefix_entries
+            == before.last_request_protected_prefix_entries
+        )
+        assert after.last_request_protected_prefix_bytes == before.last_request_protected_prefix_bytes
+        assert (
+            after.last_request_first_unretained_media_ordinal
+            == before.last_request_first_unretained_media_ordinal
+        )
+
+    asyncio.run(scenario())
+
+
 def test_mtp_fp16_draft_cache_omits_quantization_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
     from exqserve.runtime import exllamav3 as module
 
@@ -2215,6 +2409,15 @@ def test_vision_cache_reuses_embedding_across_requests_and_skips_decode(
     assert stats is not None
     assert (stats.queries, stats.hits, stats.misses, stats.entries) == (2, 1, 1, 1)
     assert stats.retained_tensor_bytes == 32
+    engine_stats = runtime.engine_stats
+    assert engine_stats.vision_cache_budget_bytes == 1024 * 1024
+    assert engine_stats.vision_cache_retained_entries == 1
+    assert engine_stats.vision_cache_retained_tensor_bytes == 32
+    assert engine_stats.vision_cache_queries == 2
+    assert engine_stats.vision_cache_hits == 1
+    assert engine_stats.vision_cache_misses == 1
+    assert engine_stats.vision_cache_last_request_protected_prefix_entries == 1
+    assert engine_stats.vision_cache_last_request_first_unretained_media_ordinal is None
 
 
 def test_vision_cache_reuses_same_embedding_for_a_b_a_order(
@@ -2258,7 +2461,7 @@ def test_vision_cache_reuses_same_embedding_for_a_b_a_order(
     assert embeddings[0] is not embeddings[1]
     stats = runtime.vision_cache_stats
     assert stats is not None
-    assert (stats.queries, stats.hits, stats.misses, stats.entries) == (3, 1, 2, 2)
+    assert (stats.queries, stats.hits, stats.misses, stats.entries) == (2, 0, 2, 2)
 
 
 def test_vision_cache_key_uses_media_bytes_not_source_string(
@@ -2292,6 +2495,126 @@ def test_vision_cache_key_uses_media_bytes_not_source_string(
     stats = runtime.vision_cache_stats
     assert stats is not None
     assert (stats.hits, stats.misses, stats.entries) == (0, 2, 2)
+
+
+def test_vision_cache_zero_budget_reuses_duplicate_media_within_one_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=0,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "<|image|> and <|image|>"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "same-image"},
+                {"type": "image", "image": "same-image"},
+            ],
+        }
+    ]
+
+    runtime.render_chat_template(messages, None, {})
+
+    vision_model = backend._state["vision_model"]
+    assert len(vision_model.image_embedding_calls) == 1
+    embeddings = tokenizer.multimodal_encode_calls[0][1]
+    assert len(embeddings) == 2
+    assert embeddings[0] is embeddings[1]
+    stats = runtime.vision_cache_stats
+    assert stats is not None
+    assert (stats.queries, stats.hits, stats.misses, stats.entries) == (1, 0, 1, 0)
+    assert stats.last_request_unique_media_count == 1
+    assert stats.last_request_first_unretained_media_ordinal == 1
+
+    runtime.render_chat_template(messages, None, {})
+    assert len(vision_model.image_embedding_calls) == 2
+
+
+
+def test_vision_cache_compile_failure_does_not_commit_request_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_load_image_bytes", lambda source, **_: source.encode("utf-8"))
+    monkeypatch.setattr(module, "_decode_image_bytes", lambda data: ("decoded-image", data))
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            vision_enabled=True,
+            vision_cache_mb=1,
+        )
+    )
+    tokenizer = backend._state["tokenizer"]
+    tokenizer.rendered_text = "<|image|>"
+    message_a = [{"role": "user", "content": [{"type": "image", "image": "image-a"}]}]
+    message_b = [{"role": "user", "content": [{"type": "image", "image": "image-b"}]}]
+
+    runtime.render_chat_template(message_a, None, {})
+    vision_model = backend._state["vision_model"]
+    assert len(vision_model.image_embedding_calls) == 1
+    before_failure = runtime.vision_cache_stats
+    assert before_failure is not None
+    assert before_failure.entries == 1
+    assert before_failure.last_request_unique_media_count == 1
+
+    original_encode = tokenizer.encode
+
+    def fail_multimodal_encode(
+        text: str,
+        *,
+        add_bos: bool,
+        add_eos: bool,
+        encode_special_tokens: bool,
+        embeddings: list[object] | None = None,
+    ) -> _FakeTensor:
+        if embeddings is not None:
+            raise RuntimeError("synthetic final compile failure")
+        return original_encode(
+            text,
+            add_bos=add_bos,
+            add_eos=add_eos,
+            encode_special_tokens=encode_special_tokens,
+            embeddings=embeddings,
+        )
+
+    monkeypatch.setattr(tokenizer, "encode", fail_multimodal_encode)
+    with pytest.raises(RuntimeError, match="synthetic final compile failure"):
+        runtime.render_chat_template(message_b, None, {})
+
+    after_failure = runtime.vision_cache_stats
+    assert after_failure is not None
+    assert after_failure.entries == 1
+    assert after_failure.last_request_unique_media_count == 1
+    assert len(vision_model.image_embedding_calls) == 2
+
+    monkeypatch.setattr(tokenizer, "encode", original_encode)
+    runtime.render_chat_template(message_a, None, {})
+    assert len(vision_model.image_embedding_calls) == 2
+
+    runtime.render_chat_template(message_b, None, {})
+    assert len(vision_model.image_embedding_calls) == 3
+    final_stats = runtime.vision_cache_stats
+    assert final_stats is not None
+    assert final_stats.entries == 2
 
 
 def test_vision_cache_zero_budget_disables_reuse(monkeypatch: pytest.MonkeyPatch) -> None:

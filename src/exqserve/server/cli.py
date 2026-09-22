@@ -61,7 +61,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "vision_offload": False,
     "allow_remote_images": False,
     "max_image_bytes": 20 * 1024 * 1024,
-    "vision_cache_mb": 256,
+    "vision_cache_mb": 1024,
     "sysmem_kv_cache_mb": 0,
     "sysmem_recurrent_cache_mb": 4096,
     "ngram_match_min": 0,

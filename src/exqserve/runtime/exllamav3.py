@@ -1709,6 +1709,7 @@ class _ExLlamaV3Resources:
     cache: Any
     vision_model: Any | None
     vision_cache: VisionEmbeddingCache | None
+    vision_transaction_lock: threading.Lock
     vision_lock: threading.Lock
     draft_model: Any | None
     draft_cache: Any | None
@@ -1785,6 +1786,14 @@ def _create_async_generator(
 class _ExLlamaV3PromptRenderer:
     def __init__(self, resources: _ExLlamaV3Resources) -> None:
         self._resources = resources
+        self._preprocessing_cancel_event: threading.Event | None = None
+
+    def set_preprocessing_cancel_event(self, event: threading.Event | None) -> None:
+        self._preprocessing_cancel_event = event
+
+    def _preprocessing_cancelled(self) -> bool:
+        event = self._preprocessing_cancel_event
+        return event is not None and event.is_set()
 
     def tokenize_text(self, text: str) -> RuntimeRenderedPrompt:
         text_codec = self._resources.tokenizer
@@ -1876,7 +1885,10 @@ class _ExLlamaV3PromptRenderer:
             if not config.vision_enabled or vision_model is None:
                 raise ValueError("vision input requires a vision-enabled runtime")
             vision_cache = resources.vision_cache
-            embeddings: list[object] = []
+
+            occurrence_keys: list[str] = []
+            unique_keys: list[str] = []
+            media_by_key: dict[str, bytes] = {}
             for source in sources:
                 data = _load_image_bytes(
                     source,
@@ -1884,34 +1896,51 @@ class _ExLlamaV3PromptRenderer:
                     max_bytes=config.max_image_bytes,
                 )
                 cache_key = hashlib.sha256(data).hexdigest()
-                embedding = None if vision_cache is None else vision_cache.get(cache_key)
-                if embedding is None:
-                    image = _decode_image_bytes(data)
+                occurrence_keys.append(cache_key)
+                if cache_key not in media_by_key:
+                    unique_keys.append(cache_key)
+                    media_by_key[cache_key] = data
+
+            with resources.vision_transaction_lock:
+                resolved = (
+                    {}
+                    if vision_cache is None
+                    else vision_cache.snapshot_request(tuple(unique_keys))
+                )
+                for cache_key in unique_keys:
+                    if cache_key in resolved:
+                        continue
+                    image = _decode_image_bytes(media_by_key[cache_key])
                     with resources.vision_lock:
-                        embedding = None if vision_cache is None else vision_cache.peek(cache_key)
-                        if embedding is None:
-                            embedding = vision_model.get_image_embeddings(tokenizer=text_codec, image=image)
-                            if vision_cache is not None:
-                                vision_cache.put(cache_key, embedding)
-                embeddings.append(embedding)
-            encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
-            if sentinels:
-                _, input_ids = encode_protected_prompt(
-                    text_codec,
-                    encoded_text,
-                    sentinels,
-                    embeddings,
-                )
-            else:
-                encoded = text_codec.encode(
-                    encoded_text,
-                    add_bos=False,
-                    add_eos=False,
-                    encode_special_tokens=True,
-                    embeddings=embeddings,
-                )
-                input_ids = _tensor_to_token_ids(encoded)
-            attachments = tuple(_VisionAttachment(embedding) for embedding in embeddings)
+                        resolved[cache_key] = vision_model.get_image_embeddings(
+                            tokenizer=text_codec,
+                            image=image,
+                        )
+
+                embeddings = [resolved[cache_key] for cache_key in occurrence_keys]
+                encoded_text = _rendered_with_embedding_aliases(text_codec, rendered_text, embeddings)
+                if sentinels:
+                    _, input_ids = encode_protected_prompt(
+                        text_codec,
+                        encoded_text,
+                        sentinels,
+                        embeddings,
+                    )
+                else:
+                    encoded = text_codec.encode(
+                        encoded_text,
+                        add_bos=False,
+                        add_eos=False,
+                        encode_special_tokens=True,
+                        embeddings=embeddings,
+                    )
+                    input_ids = _tensor_to_token_ids(encoded)
+                attachments = tuple(_VisionAttachment(embedding) for embedding in embeddings)
+                if vision_cache is not None:
+                    vision_cache.commit_request_if_active(
+                        tuple((cache_key, resolved[cache_key]) for cache_key in unique_keys),
+                        self._preprocessing_cancel_event,
+                    )
         elif sentinels:
             _, input_ids = encode_protected_prompt(
                 text_codec,
@@ -1979,7 +2008,11 @@ class ExLlamaV3Runtime:
         self._generator_lifecycle_lock = asyncio.Lock()
         self._observed_generator: Any | None = None
         self._moe_pinned_arena_active = False
+        self._preprocessing_cancel_event: threading.Event | None = None
         self._closing = False
+
+    def set_preprocessing_cancel_event(self, event: threading.Event | None) -> None:
+        self._preprocessing_cancel_event = event
 
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
@@ -2045,6 +2078,8 @@ class ExLlamaV3Runtime:
         if self._generator_state is _GeneratorLifecycleState.FAILED:
             return RuntimeEngineStats(RuntimeEngineState.FAILED)
 
+        vision_cache = getattr(resources, "vision_cache", None)
+        vision_stats = None if vision_cache is None else vision_cache.stats()
         generator = self._generator
         if generator is None:
             cache_tokens = _optional_nonnegative_int(getattr(resources.cache, "max_num_tokens", None))
@@ -2057,11 +2092,73 @@ class ExLlamaV3Runtime:
                 kv_pages_total=total_pages,
                 kv_pages_referenced=0 if total_pages is not None else None,
                 kv_pages_unreferenced=total_pages,
+                vision_cache_budget_bytes=None if vision_stats is None else vision_stats.max_retained_bytes,
+                vision_cache_retained_entries=None if vision_stats is None else vision_stats.entries,
+                vision_cache_retained_tensor_bytes=None if vision_stats is None else vision_stats.retained_tensor_bytes,
+                vision_cache_queries=None if vision_stats is None else vision_stats.queries,
+                vision_cache_hits=None if vision_stats is None else vision_stats.hits,
+                vision_cache_misses=None if vision_stats is None else vision_stats.misses,
+                vision_cache_evictions=None if vision_stats is None else vision_stats.evictions,
+                vision_cache_admission_skipped=None if vision_stats is None else vision_stats.admission_skipped,
+                vision_cache_over_budget_requests=None if vision_stats is None else vision_stats.over_budget_requests,
+                vision_cache_incomplete_prefix_retention_requests=(
+                    None if vision_stats is None else vision_stats.incomplete_prefix_retention_requests
+                ),
+                vision_cache_last_request_unique_media_count=(
+                    None if vision_stats is None else vision_stats.last_request_unique_media_count
+                ),
+                vision_cache_last_request_unique_media_bytes=(
+                    None if vision_stats is None else vision_stats.last_request_unique_media_bytes
+                ),
+                vision_cache_last_request_retained_media_bytes=(
+                    None if vision_stats is None else vision_stats.last_request_retained_media_bytes
+                ),
+                vision_cache_last_request_protected_prefix_entries=(
+                    None if vision_stats is None else vision_stats.last_request_protected_prefix_entries
+                ),
+                vision_cache_last_request_protected_prefix_bytes=(
+                    None if vision_stats is None else vision_stats.last_request_protected_prefix_bytes
+                ),
+                vision_cache_last_request_first_unretained_media_ordinal=(
+                    None if vision_stats is None else vision_stats.last_request_first_unretained_media_ordinal
+                ),
             )
 
         backend_generator = getattr(generator, "generator", None)
         if backend_generator is None:
-            return RuntimeEngineStats(RuntimeEngineState.READY)
+            return RuntimeEngineStats(
+                RuntimeEngineState.READY,
+                vision_cache_budget_bytes=None if vision_stats is None else vision_stats.max_retained_bytes,
+                vision_cache_retained_entries=None if vision_stats is None else vision_stats.entries,
+                vision_cache_retained_tensor_bytes=None if vision_stats is None else vision_stats.retained_tensor_bytes,
+                vision_cache_queries=None if vision_stats is None else vision_stats.queries,
+                vision_cache_hits=None if vision_stats is None else vision_stats.hits,
+                vision_cache_misses=None if vision_stats is None else vision_stats.misses,
+                vision_cache_evictions=None if vision_stats is None else vision_stats.evictions,
+                vision_cache_admission_skipped=None if vision_stats is None else vision_stats.admission_skipped,
+                vision_cache_over_budget_requests=None if vision_stats is None else vision_stats.over_budget_requests,
+                vision_cache_incomplete_prefix_retention_requests=(
+                    None if vision_stats is None else vision_stats.incomplete_prefix_retention_requests
+                ),
+                vision_cache_last_request_unique_media_count=(
+                    None if vision_stats is None else vision_stats.last_request_unique_media_count
+                ),
+                vision_cache_last_request_unique_media_bytes=(
+                    None if vision_stats is None else vision_stats.last_request_unique_media_bytes
+                ),
+                vision_cache_last_request_retained_media_bytes=(
+                    None if vision_stats is None else vision_stats.last_request_retained_media_bytes
+                ),
+                vision_cache_last_request_protected_prefix_entries=(
+                    None if vision_stats is None else vision_stats.last_request_protected_prefix_entries
+                ),
+                vision_cache_last_request_protected_prefix_bytes=(
+                    None if vision_stats is None else vision_stats.last_request_protected_prefix_bytes
+                ),
+                vision_cache_last_request_first_unretained_media_ordinal=(
+                    None if vision_stats is None else vision_stats.last_request_first_unretained_media_ordinal
+                ),
+            )
         active_jobs = _call_optional_nonnegative_int(backend_generator, "num_active_jobs")
         pending_jobs = _call_optional_nonnegative_int(backend_generator, "num_pending_jobs")
         max_batch_size = _optional_nonnegative_int(getattr(backend_generator, "max_batch_size", None))
@@ -2115,6 +2212,36 @@ class ExLlamaV3Runtime:
             ),
             recurrent_cache_pruned_since_generator_start=_optional_nonnegative_int(
                 recurrent_metrics.get("stash_pruned")
+            ),
+            vision_cache_budget_bytes=None if vision_stats is None else vision_stats.max_retained_bytes,
+            vision_cache_retained_entries=None if vision_stats is None else vision_stats.entries,
+            vision_cache_retained_tensor_bytes=None if vision_stats is None else vision_stats.retained_tensor_bytes,
+            vision_cache_queries=None if vision_stats is None else vision_stats.queries,
+            vision_cache_hits=None if vision_stats is None else vision_stats.hits,
+            vision_cache_misses=None if vision_stats is None else vision_stats.misses,
+            vision_cache_evictions=None if vision_stats is None else vision_stats.evictions,
+            vision_cache_admission_skipped=None if vision_stats is None else vision_stats.admission_skipped,
+            vision_cache_over_budget_requests=None if vision_stats is None else vision_stats.over_budget_requests,
+            vision_cache_incomplete_prefix_retention_requests=(
+                None if vision_stats is None else vision_stats.incomplete_prefix_retention_requests
+            ),
+            vision_cache_last_request_unique_media_count=(
+                None if vision_stats is None else vision_stats.last_request_unique_media_count
+            ),
+            vision_cache_last_request_unique_media_bytes=(
+                None if vision_stats is None else vision_stats.last_request_unique_media_bytes
+            ),
+            vision_cache_last_request_retained_media_bytes=(
+                None if vision_stats is None else vision_stats.last_request_retained_media_bytes
+            ),
+            vision_cache_last_request_protected_prefix_entries=(
+                None if vision_stats is None else vision_stats.last_request_protected_prefix_entries
+            ),
+            vision_cache_last_request_protected_prefix_bytes=(
+                None if vision_stats is None else vision_stats.last_request_protected_prefix_bytes
+            ),
+            vision_cache_last_request_first_unretained_media_ordinal=(
+                None if vision_stats is None else vision_stats.last_request_first_unretained_media_ordinal
             ),
         )
 
@@ -2715,6 +2842,7 @@ class ExLlamaV3Runtime:
             vision_model,
             vision_cache,
             threading.Lock(),
+            threading.Lock(),
             draft_model,
             draft_cache_object,
             tuple(loras),
@@ -2785,7 +2913,9 @@ class ExLlamaV3Runtime:
         protect_literal_tokens: bool = False,
         structural_marker_texts: tuple[str, ...] = (),
     ) -> RuntimeRenderedPrompt:
-        return _ExLlamaV3PromptRenderer(self._require_resources()).render_chat_template(
+        renderer = _ExLlamaV3PromptRenderer(self._require_resources())
+        renderer.set_preprocessing_cancel_event(self._preprocessing_cancel_event)
+        return renderer.render_chat_template(
             messages,
             tools,
             template_kwargs,
