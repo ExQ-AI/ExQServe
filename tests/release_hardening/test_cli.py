@@ -148,6 +148,7 @@ def test_cli_and_yaml_parse_ngram_and_moe_cpu_options(tmp_path: Path) -> None:
             "7",
             "--moe-cpu-offload-layers",
             "12",
+            "--moe-pinned-arena",
             "--moe-cpu-threads",
             "6",
         ]
@@ -155,6 +156,7 @@ def test_cli_and_yaml_parse_ngram_and_moe_cpu_options(tmp_path: Path) -> None:
     assert cli_config.ngram_match_min == 3
     assert cli_config.ngram_draft_size == 7
     assert cli_config.moe_cpu_offload_layers == 12
+    assert cli_config.moe_pinned_arena is True
     assert cli_config.moe_cpu_threads == 6
 
     config_path = tmp_path / "ngram-moe.yaml"
@@ -165,6 +167,7 @@ def test_cli_and_yaml_parse_ngram_and_moe_cpu_options(tmp_path: Path) -> None:
                 "ngram-match-min: 4",
                 "ngram-draft-tokens: 9",
                 "moe-cpu-offload-layers: 16",
+                "moe-pinned-arena: true",
                 "moe-cpu-threads: 8",
             ]
         ),
@@ -174,6 +177,7 @@ def test_cli_and_yaml_parse_ngram_and_moe_cpu_options(tmp_path: Path) -> None:
     assert yaml_config.ngram_match_min == 4
     assert yaml_config.ngram_draft_size == 9
     assert yaml_config.moe_cpu_offload_layers == 16
+    assert yaml_config.moe_pinned_arena is True
     assert yaml_config.moe_cpu_threads == 8
 
     invalid_key = tmp_path / "invalid-ngram-key.yaml"

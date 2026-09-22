@@ -33,6 +33,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert config.moe_cpu_offload_layers == 0
     assert config.moe_cpu_split_experts == 0
     assert config.draft_moe_cpu_offload_layers == 0
+    assert config.moe_pinned_arena is False
     assert config.vision_offload is False
     assert config.moe_cpu_threads is None
     assert config.tool_constraint_mode is ToolConstraintMode.OFF
@@ -74,6 +75,7 @@ def test_server_config_defaults_are_generic_and_cpu_safe(tmp_path: Path) -> None
     assert runtime.moe_cpu_offload_layers == 0
     assert runtime.moe_cpu_split_experts == 0
     assert runtime.draft_moe_cpu_offload_layers == 0
+    assert runtime.moe_pinned_arena is False
     assert runtime.vision_offload is False
     assert runtime.moe_cpu_threads is None
 
@@ -170,12 +172,14 @@ def test_server_config_round_trips_ngram_and_moe_cpu_settings(tmp_path: Path) ->
         ngram_match_min=3,
         ngram_draft_size=7,
         moe_cpu_offload_layers=12,
+        moe_pinned_arena=True,
         moe_cpu_threads=6,
     )
     runtime = config.runtime_load_config()
     assert runtime.ngram_match_min == 3
     assert runtime.ngram_draft_size == 7
     assert runtime.moe_cpu_offload_layers == 12
+    assert runtime.moe_pinned_arena is True
     assert runtime.moe_cpu_threads == 6
 
     with pytest.raises(ValueError, match="cannot be combined"):
@@ -186,6 +190,8 @@ def test_server_config_round_trips_ngram_and_moe_cpu_settings(tmp_path: Path) ->
         ServerConfig(model_directory=tmp_path / "model", moe_cpu_offload_layers=2, tensor_parallel=True)
     with pytest.raises(ValueError, match="moe_cpu_threads"):
         ServerConfig(model_directory=tmp_path / "model", moe_cpu_threads=0)
+    with pytest.raises(ValueError, match="requires MoE CPU offload"):
+        ServerConfig(model_directory=tmp_path / "model", moe_pinned_arena=True)
 
 
 def test_server_config_round_trips_thin_runtime_parity_settings(tmp_path: Path) -> None:

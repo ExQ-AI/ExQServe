@@ -341,6 +341,13 @@ def _backend(
             state["model_config"] = config
             return model
 
+        def tp_cpu_cache_close(self) -> None:
+            pass
+
+    class Generator:
+        def close(self) -> None:
+            pass
+
     class CacheLayerQuant:
         pass
 
@@ -356,10 +363,11 @@ def _backend(
             state["generator"] = self
 
     backend = SimpleNamespace(
-        cpu_page_cache_lifecycle_safe=True,
+        __version__="1.5.0",
         Config=Config,
         Tokenizer=Tokenizer,
         Model=Model,
+        Generator=Generator,
         Cache=Cache,
         CacheLayer_quant=CacheLayerQuant,
         AsyncGenerator=AsyncGenerator,
@@ -383,12 +391,31 @@ def _reset_factories() -> None:
     _FakeLoRA.fail_directory = None
 
 
-def test_sysmem_kv_requires_lifecycle_safe_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sysmem_kv_requires_lifecycle_close_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     from exqserve.runtime import exllamav3 as module
 
     _reset_factories()
     backend = _backend()
-    backend.cpu_page_cache_lifecycle_safe = False
+    backend.Generator = SimpleNamespace()
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    runtime = ExLlamaV3Runtime()
+
+    with pytest.raises(RuntimeError, match="page-cache shutdown support"):
+        runtime.load(
+            ExLlamaV3LoadConfig("/models/qwen", cache_tokens=1024, sysmem_kv_cache_mb=64)
+        )
+
+    assert backend._state["config_directories"] == []
+
+
+def test_sysmem_kv_rejects_legacy_marker_without_close_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    _reset_factories()
+    backend = _backend()
+    backend.__version__ = "1.4.9"
+    backend.cpu_page_cache_lifecycle_safe = True
+    backend.Model.tp_cpu_cache_close = None
     monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
     runtime = ExLlamaV3Runtime()
 
@@ -884,6 +911,284 @@ def test_load_applies_main_moe_cpu_settings_before_model_construction(
     model_config = state["model_config"]
     assert model_config.infer_params.moe_cpu_offload == 12
     assert model_config.infer_params.moe_cpu_threads == 6
+
+
+def test_load_configures_moe_pinned_arena_before_model_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    calls: list[tuple[object, bool]] = []
+
+    def configure(candidate: object, enabled: bool) -> bool:
+        calls.append((candidate, enabled))
+        return enabled
+
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_configure_moe_pinned_arena", configure)
+    monkeypatch.setattr(module, "_validate_moe_pinned_arena_activation", lambda *args: None)
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=1024,
+            moe_cpu_offload_layers=4,
+            moe_pinned_arena=True,
+        )
+    )
+
+    assert calls == [(backend, True)]
+    assert runtime.moe_pinned_arena_active is True
+    assert backend._state["model_infer_params_at_from_config"] == [
+        ("/models/qwen", "text", 4, None),
+    ]
+    asyncio.run(runtime.close())
+    assert runtime.moe_pinned_arena_active is False
+
+
+def test_moe_pinned_arena_helper_uses_capability_not_release_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    backend.__version__ = "1.4.9"
+    tuning = SimpleNamespace(pinned_arena=False)
+    monkeypatch.setattr(
+        module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(TUNING=tuning)
+        if name == "exllamav3.model.moe_cpu_host"
+        else (_ for _ in ()).throw(ImportError(name)),
+    )
+    assert module._configure_moe_pinned_arena(backend, True) is True
+    assert tuning.pinned_arena is True
+    module._configure_moe_pinned_arena(backend, False)
+
+
+def test_sysmem_shutdown_support_uses_close_contract_not_release_version() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    backend.__version__ = "1.4.9"
+    assert module._supports_sysmem_kv_shutdown(backend) is True
+    backend.Model.tp_cpu_cache_close = None
+    assert module._supports_sysmem_kv_shutdown(backend) is False
+
+
+def test_moe_pinned_arena_helper_requires_upstream_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+    monkeypatch.setattr(
+        module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(TUNING=SimpleNamespace())
+        if name == "exllamav3.model.moe_cpu_host"
+        else (_ for _ in ()).throw(ImportError(name)),
+    )
+    with pytest.raises(RuntimeError, match="does not expose"):
+        module._configure_moe_pinned_arena(backend, True)
+
+
+def test_moe_pinned_arena_helper_rejects_non_linux_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+    with pytest.raises(RuntimeError, match="only supported on Linux"):
+        module._configure_moe_pinned_arena(backend, True)
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
+
+
+def test_moe_pinned_arena_capability_failure_does_not_mutate_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+    monkeypatch.setattr(module.importlib, "import_module", lambda name: SimpleNamespace(TUNING=SimpleNamespace()))
+    with pytest.raises(RuntimeError, match="does not expose"):
+        module._configure_moe_pinned_arena(backend, True)
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
+
+
+def test_moe_pinned_arena_failed_load_and_close_reset_global_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    tuning = SimpleNamespace(pinned_arena=False)
+    fake_module = SimpleNamespace(TUNING=tuning)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module.importlib, "import_module", lambda name: fake_module)
+    monkeypatch.setitem(module.sys.modules, "exllamav3.model.moe_cpu_host", fake_module)
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+    config = ExLlamaV3LoadConfig("/models/qwen", 1024, moe_cpu_offload_layers=2, moe_pinned_arena=True)
+    runtime = ExLlamaV3Runtime()
+    with pytest.raises(RuntimeError, match="activated no eligible"):
+        runtime.load(config)
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
+    assert tuning.pinned_arena is False
+
+    monkeypatch.setattr(module, "_validate_moe_pinned_arena_activation", lambda *args: None)
+    runtime.load(config)
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "1"
+    assert tuning.pinned_arena is True
+    asyncio.run(runtime.close())
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
+    assert tuning.pinned_arena is False
+
+
+def test_moe_pinned_arena_auto_retry_keeps_global_switch_until_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    tuning = SimpleNamespace(pinned_arena=False)
+    fake_module = SimpleNamespace(TUNING=tuning)
+    original_from_directory = backend.Config.from_directory
+    original_load = backend._state["model"].load
+    load_states: list[tuple[str | None, bool]] = []
+    load_calls = 0
+
+    def from_directory(directory: str) -> object:
+        config = original_from_directory(directory)
+        config.moe_cpu_hosts = {"text": SimpleNamespace(pinned=True)}
+        return config
+
+    def flaky_load(**kwargs: object) -> None:
+        nonlocal load_calls
+        load_calls += 1
+        load_states.append(
+            (
+                module.os.environ.get("EXL3_MOE_PINNED_ARENA"),
+                tuning.pinned_arena,
+            )
+        )
+        if load_calls == 1:
+            raise RuntimeError("CUDA out of memory")
+        original_load(**kwargs)
+
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_auto_cache_candidates", lambda config: (1024, 512))
+    monkeypatch.setattr(backend.Config, "from_directory", staticmethod(from_directory))
+    monkeypatch.setattr(backend._state["model"], "load", flaky_load)
+    monkeypatch.setattr(module.importlib, "import_module", lambda name: fake_module)
+    monkeypatch.setitem(module.sys.modules, "exllamav3.model.moe_cpu_host", fake_module)
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+
+    runtime = ExLlamaV3Runtime()
+    runtime.load(
+        ExLlamaV3LoadConfig(
+            "/models/qwen",
+            cache_tokens=None,
+            moe_cpu_offload_layers=2,
+            moe_pinned_arena=True,
+        )
+    )
+
+    assert load_calls == 2
+    assert load_states == [("1", True), ("1", True)]
+    assert runtime.moe_pinned_arena_active is True
+    assert runtime._resources is not None
+    assert runtime._resources.config.cache_tokens == 512
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "1"
+    assert tuning.pinned_arena is True
+
+    asyncio.run(runtime.close())
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
+    assert tuning.pinned_arena is False
+
+
+def test_moe_pinned_arena_pretry_device_failure_rolls_back_global_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    tuning = SimpleNamespace(pinned_arena=False)
+    fake_module = SimpleNamespace(TUNING=tuning)
+    monkeypatch.setattr(module, "_load_backend_module", lambda: backend)
+    monkeypatch.setattr(module, "_cuda_device_count", lambda: 1)
+    monkeypatch.setattr(module.importlib, "import_module", lambda name: fake_module)
+    monkeypatch.setitem(module.sys.modules, "exllamav3.model.moe_cpu_host", fake_module)
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+
+    runtime = ExLlamaV3Runtime()
+    with pytest.raises(ValueError, match="unavailable CUDA device index"):
+        runtime.load(
+            ExLlamaV3LoadConfig(
+                "/models/qwen",
+                cache_tokens=1024,
+                device_ids=(1,),
+                moe_cpu_offload_layers=2,
+                moe_pinned_arena=True,
+            )
+        )
+
+    assert runtime.is_ready is False
+    assert runtime.moe_pinned_arena_active is False
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
+    assert tuning.pinned_arena is False
+
+
+def test_moe_pinned_arena_activation_requires_real_pinned_host() -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    config = ExLlamaV3LoadConfig(
+        "/models/qwen",
+        1024,
+        moe_cpu_offload_layers=2,
+        moe_pinned_arena=True,
+    )
+    with pytest.raises(RuntimeError, match="activated no eligible"):
+        module._validate_moe_pinned_arena_activation(config, SimpleNamespace())
+    with pytest.raises(RuntimeError, match="did not activate"):
+        module._validate_moe_pinned_arena_activation(
+            config,
+            SimpleNamespace(moe_cpu_hosts={"text": SimpleNamespace(pinned=False)}),
+        )
+    module._validate_moe_pinned_arena_activation(
+        config,
+        SimpleNamespace(moe_cpu_hosts={"text": SimpleNamespace(pinned=True)}),
+    )
+
+
+def test_moe_pinned_arena_helper_sets_and_resets_upstream_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exqserve.runtime import exllamav3 as module
+
+    backend = _backend()
+    tuning = SimpleNamespace(pinned_arena=False)
+    fake_module = SimpleNamespace(TUNING=tuning)
+    monkeypatch.setenv("EXL3_MOE_PINNED_ARENA", "0")
+    monkeypatch.setitem(module.sys.modules, "exllamav3.model.moe_cpu_host", fake_module)
+    monkeypatch.setattr(
+        module.importlib,
+        "import_module",
+        lambda name: fake_module
+        if name == "exllamav3.model.moe_cpu_host"
+        else (_ for _ in ()).throw(ImportError(name)),
+    )
+
+    assert module._configure_moe_pinned_arena(backend, True) is True
+    assert tuning.pinned_arena is True
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "1"
+    assert module._configure_moe_pinned_arena(backend, False) is False
+    assert tuning.pinned_arena is False
+    assert module.os.environ["EXL3_MOE_PINNED_ARENA"] == "0"
 
 
 def test_load_applies_moe_split_and_vision_offload_before_component_construction(

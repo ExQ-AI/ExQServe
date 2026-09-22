@@ -77,6 +77,7 @@ class ServerConfig:
     moe_cpu_offload_layers: int = 0
     moe_cpu_split_experts: int = 0
     draft_moe_cpu_offload_layers: int = 0
+    moe_pinned_arena: bool = False
     moe_cpu_threads: int | None = None
     tool_call_fanout_limit: int = 32
     constrained_parallel_tool_call_limit: int = 4
@@ -239,6 +240,14 @@ class ServerConfig:
                 raise TypeError("moe_cpu_threads must be an integer or None")
             if self.moe_cpu_threads <= 0:
                 raise ValueError("moe_cpu_threads must be positive or None")
+        if not isinstance(self.moe_pinned_arena, bool):
+            raise TypeError("moe_pinned_arena must be a boolean")
+        if self.moe_pinned_arena and not (
+            self.moe_cpu_offload_layers
+            or self.moe_cpu_split_experts
+            or self.draft_moe_cpu_offload_layers
+        ):
+            raise ValueError("moe_pinned_arena requires MoE CPU offload or expert splitting")
         if not isinstance(self.response_store_ttl_seconds, int | float) or isinstance(
             self.response_store_ttl_seconds, bool
         ):
@@ -318,6 +327,7 @@ class ServerConfig:
             moe_cpu_offload_layers=self.moe_cpu_offload_layers,
             moe_cpu_split_experts=self.moe_cpu_split_experts,
             draft_moe_cpu_offload_layers=self.draft_moe_cpu_offload_layers,
+            moe_pinned_arena=self.moe_pinned_arena,
             moe_cpu_threads=self.moe_cpu_threads,
             lora_adapters=tuple(
                 LoRAAdapterConfig(

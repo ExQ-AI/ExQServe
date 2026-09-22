@@ -143,6 +143,7 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
     assert q8.moe_cpu_offload_layers == 0
     assert q8.moe_cpu_split_experts == 0
     assert q8.draft_moe_cpu_offload_layers == 0
+    assert q8.moe_pinned_arena is False
     assert q8.vision_offload is False
     assert q8.moe_cpu_threads is None
     selected = ExLlamaV3LoadConfig("/m", 256, device_ids=(0, 2), tp_output_device=2)
@@ -232,6 +233,13 @@ def test_load_config_supports_q8_and_fp16_cache_without_profile_fields() -> None
         ExLlamaV3LoadConfig("/m", 256, moe_cpu_threads=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="moe_cpu_threads"):
         ExLlamaV3LoadConfig("/m", 256, moe_cpu_threads=0)
+    with pytest.raises(TypeError, match="moe_pinned_arena"):
+        ExLlamaV3LoadConfig("/m", 256, moe_pinned_arena=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="requires MoE CPU offload"):
+        ExLlamaV3LoadConfig("/m", 256, moe_pinned_arena=True)
+    assert ExLlamaV3LoadConfig(
+        "/m", 256, moe_cpu_offload_layers=4, moe_pinned_arena=True
+    ).moe_pinned_arena is True
     with pytest.raises(ValueError, match="layer-split"):
         ExLlamaV3LoadConfig("/m", 256, moe_cpu_offload_layers=4, tensor_parallel=True)
     with pytest.raises(ValueError, match="vision_offload requires vision_enabled"):

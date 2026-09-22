@@ -175,6 +175,7 @@ class ExLlamaV3LoadConfig:
     moe_cpu_offload_layers: int = 0
     moe_cpu_split_experts: int = 0
     draft_moe_cpu_offload_layers: int = 0
+    moe_pinned_arena: bool = False
     moe_cpu_threads: int | None = None
 
     def __post_init__(self) -> None:
@@ -312,6 +313,13 @@ class ExLlamaV3LoadConfig:
                 raise TypeError("moe_cpu_threads must be an integer or None")
             if self.moe_cpu_threads <= 0:
                 raise ValueError("moe_cpu_threads must be positive or None")
+        _validate_bool("moe_pinned_arena", self.moe_pinned_arena)
+        if self.moe_pinned_arena and not (
+            self.moe_cpu_offload_layers
+            or self.moe_cpu_split_experts
+            or self.draft_moe_cpu_offload_layers
+        ):
+            raise ValueError("moe_pinned_arena requires MoE CPU offload or expert splitting")
         if self.draft_model_directory is not None:
             if not isinstance(self.draft_model_directory, str):
                 raise TypeError("draft_model_directory must be a string or None")

@@ -28,7 +28,7 @@ exqserve = "exqserve.server.cli:main"
 
 [project.optional-dependencies]
 runtime = [
-    "exllamav3>=1.4.9,<1.5",
+    "exllamav3>=1.4.9,<1.6",
 ]
 dev = [
     "build>=1.2,<2",

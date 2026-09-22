@@ -1068,8 +1068,82 @@ def _load_backend_module() -> Any:
     return importlib.import_module("exllamav3")
 
 
+def _backend_release_version(backend: Any) -> tuple[int, int, int] | None:
+    raw_version = getattr(backend, "__version__", None)
+    if not isinstance(raw_version, str) and getattr(backend, "__name__", None) == "exllamav3":
+        try:
+            version_module = importlib.import_module("exllamav3.version")
+        except ImportError:
+            return None
+        raw_version = getattr(version_module, "__version__", None)
+    if not isinstance(raw_version, str):
+        return None
+    release = raw_version.split("+", 1)[0].split("-", 1)[0]
+    parts = release.split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        major, minor, patch = (int(part) for part in parts[:3])
+    except ValueError:
+        return None
+    return major, minor, patch
+
+
 def _supports_sysmem_kv_shutdown(backend: Any) -> bool:
-    return getattr(backend, "cpu_page_cache_lifecycle_safe", False) is True
+    generator_close = getattr(getattr(backend, "Generator", None), "close", None)
+    async_generator_close = getattr(getattr(backend, "AsyncGenerator", None), "close", None)
+    tp_cache_close = getattr(getattr(backend, "Model", None), "tp_cpu_cache_close", None)
+    return all(callable(callback) for callback in (generator_close, async_generator_close, tp_cache_close))
+
+
+def _configure_moe_pinned_arena(backend: Any, enabled: bool) -> bool:
+    if not isinstance(enabled, bool):
+        raise TypeError("moe_pinned_arena must be a boolean")
+    if enabled:
+        if sys.platform != "linux":
+            raise RuntimeError("moe_pinned_arena is only supported on Linux")
+        try:
+            module = importlib.import_module("exllamav3.model.moe_cpu_host")
+        except ImportError as exc:
+            raise RuntimeError("active ExLlamaV3 runtime does not expose MoE pinned-arena support") from exc
+        tuning = getattr(module, "TUNING", None)
+        if tuning is None or not hasattr(tuning, "pinned_arena"):
+            raise RuntimeError("active ExLlamaV3 runtime does not expose MoE pinned-arena support")
+        os.environ["EXL3_MOE_PINNED_ARENA"] = "1"
+        tuning.pinned_arena = True
+        return bool(tuning.pinned_arena)
+
+    os.environ["EXL3_MOE_PINNED_ARENA"] = "0"
+    loaded = sys.modules.get("exllamav3.model.moe_cpu_host")
+    tuning = None if loaded is None else getattr(loaded, "TUNING", None)
+    if tuning is not None and hasattr(tuning, "pinned_arena"):
+        tuning.pinned_arena = False
+    return False
+
+
+def _validate_moe_pinned_arena_activation(
+    config: ExLlamaV3LoadConfig,
+    *backend_configs: object | None,
+) -> None:
+    if not config.moe_pinned_arena:
+        return
+    hosts: list[object] = []
+    for backend_config in backend_configs:
+        if backend_config is None:
+            continue
+        configured = getattr(backend_config, "moe_cpu_hosts", None)
+        if isinstance(configured, Mapping):
+            hosts.extend(configured.values())
+    if not hosts:
+        raise RuntimeError(
+            "moe_pinned_arena was requested, but the selected model activated no eligible "
+            "MoE CPU-offload host"
+        )
+    if not all(bool(getattr(host, "pinned", False)) for host in hosts):
+        raise RuntimeError(
+            "moe_pinned_arena was requested, but the active ExLlamaV3 MoE host did not "
+            "activate pinned-arena mode"
+        )
 
 
 def _load_torch_module() -> Any:
@@ -1831,12 +1905,17 @@ class ExLlamaV3Runtime:
         self._recovery_task: asyncio.Task[None] | None = None
         self._generator_lifecycle_lock = asyncio.Lock()
         self._observed_generator: Any | None = None
+        self._moe_pinned_arena_active = False
         self._closing = False
 
     @property
     def model_metadata(self) -> RuntimeModelMetadata:
         resources = self._resources
         return RuntimeModelMetadata() if resources is None else resources.model_metadata
+
+    @property
+    def moe_pinned_arena_active(self) -> bool:
+        return self._moe_pinned_arena_active
 
     @property
     def vision_loaded(self) -> bool:
@@ -2286,39 +2365,50 @@ class ExLlamaV3Runtime:
         if self._resources is not None:
             raise RuntimeError("ExLlamaV3 runtime is already loaded")
 
-        if config.sysmem_kv_cache_mb > 0:
-            backend = _load_backend_module()
-            if not _supports_sysmem_kv_shutdown(backend):
+        _configure_cuda_malloc_async(config.cuda_malloc_async)
+        _configure_qc_staging(config.qc_staging)
+
+        backend = _load_backend_module()
+        self._moe_pinned_arena_active = False
+        _configure_moe_pinned_arena(backend, config.moe_pinned_arena)
+
+        try:
+            if config.sysmem_kv_cache_mb > 0 and not _supports_sysmem_kv_shutdown(backend):
                 raise RuntimeError(
                     "sysmem_kv_cache_mb requires ExLlamaV3 CPU page-cache shutdown support; "
                     "the active runtime must be upgraded or the system-memory K/V tier disabled"
                 )
 
-        _configure_cuda_malloc_async(config.cuda_malloc_async)
-        _configure_qc_staging(config.qc_staging)
-        if config.cache_tokens is not None:
-            resources = self._build_resources(config)
-        else:
-            resources = None
-            last_memory_error: BaseException | None = None
-            for cache_tokens in _auto_cache_candidates(config):
-                resolved_config = replace(config, cache_tokens=cache_tokens)
-                try:
-                    resources = self._build_resources(resolved_config)
-                    break
-                except Exception as exc:
-                    if not _is_memory_capacity_error(exc):
-                        raise
-                    last_memory_error = exc
-                    logger.warning(
-                        "AUTO cache capacity %d tokens did not fit; retrying conservatively",
-                        cache_tokens,
-                    )
-            if resources is None:
-                raise RuntimeError(
-                    "ExLlamaV3 AUTO cache resolution could not fit even one backend page"
-                ) from last_memory_error
+            if config.cache_tokens is not None:
+                resources = self._build_resources(config)
+            else:
+                resources = None
+                last_memory_error: BaseException | None = None
+                for cache_tokens in _auto_cache_candidates(config):
+                    resolved_config = replace(config, cache_tokens=cache_tokens)
+                    try:
+                        resources = self._build_resources(resolved_config)
+                        break
+                    except Exception as exc:
+                        if not _is_memory_capacity_error(exc):
+                            raise
+                        last_memory_error = exc
+                        logger.warning(
+                            "AUTO cache capacity %d tokens did not fit; retrying conservatively",
+                            cache_tokens,
+                        )
+                if resources is None:
+                    raise RuntimeError(
+                        "ExLlamaV3 AUTO cache resolution could not fit even one backend page"
+                    ) from last_memory_error
+        except Exception:
+            if config.moe_pinned_arena:
+                _configure_moe_pinned_arena(backend, False)
+            raise
         self._resources = resources
+        self._moe_pinned_arena_active = config.moe_pinned_arena
+        if self._moe_pinned_arena_active:
+            logger.info("ExLlamaV3 experimental MoE pinned arena active for CPU offload")
         self._generator = None
         self._generator_episode = None
         self._generator_state = _GeneratorLifecycleState.READY
@@ -2339,6 +2429,7 @@ class ExLlamaV3Runtime:
         model: Any | None = None
         vision_model: Any | None = None
         draft_model: Any | None = None
+        draft_config: Any | None = None
         cache_object: Any | None = None
         draft_cache_object: Any | None = None
         loras: list[Any] = []
@@ -2475,6 +2566,7 @@ class ExLlamaV3Runtime:
                     draft_load_kwargs["autosplit_no_forward"] = True
                 draft_model.load(**draft_load_kwargs)
             model.load(**load_kwargs)
+            _validate_moe_pinned_arena_activation(config, backend_config, draft_config)
             if config.lora_adapters:
                 lora_class = _load_lora_class()
                 for adapter in config.lora_adapters:
@@ -2753,6 +2845,8 @@ class ExLlamaV3Runtime:
         self._quarantined_episode = None
         self._recovery_task = None
         self._observed_generator = None
+        self._moe_pinned_arena_active = False
+        _configure_moe_pinned_arena(resources.backend, False)
         self._generator_state = _GeneratorLifecycleState.READY
 
         if close_error is not None:

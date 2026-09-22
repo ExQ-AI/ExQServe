@@ -69,6 +69,7 @@ _PARSER_DEFAULTS: dict[str, object] = {
     "moe_cpu_offload_layers": 0,
     "moe_cpu_split_experts": 0,
     "draft_moe_cpu_offload_layers": 0,
+    "moe_pinned_arena": False,
     "moe_cpu_threads": None,
     "max_in_flight": 8,
     "max_prompt_tokens": None,
@@ -103,6 +104,7 @@ _BOOLEAN_CONFIG_KEYS = frozenset(
         "cuda-malloc-async",
         "vision",
         "vision-offload",
+        "moe-pinned-arena",
         "allow-remote-images",
         "public-metrics",
     }
@@ -294,6 +296,14 @@ def _build_parser(
         "--draft-moe-cpu-offload-layers",
         type=int,
         help="Run the first N eligible draft/MTP MoE layers on CPU; 0 disables draft offload.",
+    )
+    parser.add_argument(
+        "--moe-pinned-arena",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Opt in to ExLlamaV3 v1.5 experimental zero-copy pinned expert arena for MoE CPU "
+            "offload. Linux only; disabled by default."
+        ),
     )
     parser.add_argument(
         "--moe-cpu-threads",
@@ -737,6 +747,7 @@ def parse_config(argv: Sequence[str] | None = None) -> ServerConfig:
         moe_cpu_offload_layers=args.moe_cpu_offload_layers,
         moe_cpu_split_experts=args.moe_cpu_split_experts,
         draft_moe_cpu_offload_layers=args.draft_moe_cpu_offload_layers,
+        moe_pinned_arena=args.moe_pinned_arena,
         moe_cpu_threads=args.moe_cpu_threads,
         tool_call_fanout_limit=args.tool_call_fanout_limit,
         constrained_parallel_tool_call_limit=args.constrained_parallel_tool_call_limit,
