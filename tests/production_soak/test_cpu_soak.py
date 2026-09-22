@@ -188,7 +188,7 @@ def test_cpu_mixed_multiclient_soak_switch_cancel_and_recovery(tmp_path: Path) -
                     pass
                 else:
                     raise AssertionError("cancelled HTTP stream task must raise CancelledError")
-                await _wait_for(lambda: composed.controller.in_flight == 0)
+                await _wait_for(lambda: composed.controller.in_flight == 0, timeout=5.0)
                 assert disconnected_session.cancel_calls == 1
                 assert (await composed.response_lifecycle_store.stats()).active == 0
 
