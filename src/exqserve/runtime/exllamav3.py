@@ -65,6 +65,79 @@ from exqserve.runtime.vision_cache import VisionEmbeddingCache, VisionEmbeddingC
 
 logger = logging.getLogger(__name__)
 
+_CUDA_IDLE_TRIM_FREE_THRESHOLD_BYTES = 1 * 1024**3
+_CUDA_IDLE_TRIM_RECLAIMABLE_THRESHOLD_BYTES = 256 * 1024**2
+
+
+def _trim_cuda_allocator_cache_if_pressured(
+    cuda: Any,
+    device_ids: tuple[int, ...],
+    *,
+    active_jobs: int,
+    pending_jobs: int,
+) -> bool:
+    """Run one allocator-global cudaMallocAsync trim at a proven idle pressure boundary."""
+    if active_jobs != 0 or pending_jobs != 0:
+        return False
+    try:
+        if not cuda.is_available():
+            return False
+        memory = getattr(cuda, "memory", None)
+        get_allocator_backend = getattr(memory, "get_allocator_backend", None)
+        if not callable(get_allocator_backend):
+            return False
+        if get_allocator_backend() != "cudaMallocAsync":
+            return False
+        observed: list[tuple[int, int, int, int, int]] = []
+        pressured_device_ids: list[int] = []
+        for device_id in device_ids:
+            free_bytes, _ = cuda.mem_get_info(device_id)
+            allocated_bytes = cuda.memory_allocated(device_id)
+            reserved_bytes = cuda.memory_reserved(device_id)
+            reclaimable_bytes = max(0, reserved_bytes - allocated_bytes)
+            observed.append(
+                (device_id, free_bytes, allocated_bytes, reserved_bytes, reclaimable_bytes)
+            )
+            if (
+                free_bytes < _CUDA_IDLE_TRIM_FREE_THRESHOLD_BYTES
+                and reclaimable_bytes >= _CUDA_IDLE_TRIM_RECLAIMABLE_THRESHOLD_BYTES
+            ):
+                pressured_device_ids.append(device_id)
+        if not pressured_device_ids:
+            return False
+        cuda.empty_cache()
+        before = ",".join(
+            (
+                f"{device_id}:free={free_bytes}:allocated={allocated_bytes}:"
+                f"reserved={reserved_bytes}:reclaimable={reclaimable_bytes}"
+            )
+            for device_id, free_bytes, allocated_bytes, reserved_bytes, reclaimable_bytes in observed
+        )
+        after_parts: list[str] = []
+        for device_id in device_ids:
+            try:
+                post_free_bytes, _ = cuda.mem_get_info(device_id)
+                post_allocated_bytes = cuda.memory_allocated(device_id)
+                post_reserved_bytes = cuda.memory_reserved(device_id)
+                after_parts.append(
+                    f"{device_id}:free={post_free_bytes}:allocated={post_allocated_bytes}:"
+                    f"reserved={post_reserved_bytes}:"
+                    f"reclaimable={max(0, post_reserved_bytes - post_allocated_bytes)}"
+                )
+            except Exception as exc:  # noqa: BLE001 - post-trim telemetry is best effort.
+                after_parts.append(f"{device_id}:telemetry_error={type(exc).__name__}")
+        logger.info(
+            "idle CUDA allocator global trim fired trigger_devices=%s before=%s after=%s",
+            ",".join(str(device_id) for device_id in pressured_device_ids),
+            before,
+            ",".join(after_parts),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - maintenance must never fail healthy serving.
+        logger.warning("idle CUDA allocator global trim skipped after accounting/trim failure: %s", exc)
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class _VisionAttachment:
     embedding: object
@@ -1928,6 +2001,39 @@ class ExLlamaV3Runtime:
         if resources is None or resources.vision_cache is None:
             return None
         return resources.vision_cache.stats()
+
+    def maybe_trim_cuda_allocator_cache(self) -> bool:
+        """Trim reclaimable CUDA allocator cache when the loaded runtime is safely idle and pressured."""
+        resources = self._resources
+        if (
+            resources is None
+            or self._closing
+            or self._generator_state is not _GeneratorLifecycleState.READY
+        ):
+            return False
+        stats = self.engine_stats
+        if stats.active_jobs is None or stats.pending_jobs is None:
+            return False
+        try:
+            torch = importlib.import_module("torch")
+            cuda = torch.cuda
+            configured_device_ids = resources.config.device_ids
+            device_ids = (
+                configured_device_ids
+                if configured_device_ids is not None
+                else tuple(range(int(cuda.device_count())))
+            )
+        except Exception as exc:  # noqa: BLE001 - maintenance must never fail healthy serving.
+            logger.warning("idle CUDA allocator trim skipped while discovering CUDA devices: %s", exc)
+            return False
+        if not device_ids:
+            return False
+        return _trim_cuda_allocator_cache_if_pressured(
+            cuda,
+            device_ids,
+            active_jobs=stats.active_jobs,
+            pending_jobs=stats.pending_jobs,
+        )
 
     @property
     def engine_stats(self) -> RuntimeEngineStats:

@@ -65,6 +65,19 @@ class _FakeRuntime:
         return session
 
 
+class _TrimRuntime(_FakeRuntime):
+    def __init__(self, factory, *, fail_trim: bool = False) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(factory)
+        self.trim_calls = 0
+        self.fail_trim = fail_trim
+
+    def maybe_trim_cuda_allocator_cache(self) -> bool:
+        self.trim_calls += 1
+        if self.fail_trim:
+            raise RuntimeError("trim failed")
+        return True
+
+
 class _BlockingSession:
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
@@ -131,6 +144,50 @@ def test_normal_completion_and_runtime_failure_release_capacity_once() -> None:
         assert isinstance(failed_events[-1], RuntimeFailed)
         assert failed.terminal_reason is RequestTerminalReason.RUNTIME_FAILED
         assert controller.in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_idle_trim_runs_only_after_last_active_request_releases() -> None:
+    async def scenario() -> None:
+        runtime = _TrimRuntime(
+            lambda request: _FakeSession(request.request_id, [_finished(request.request_id)])
+        )
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=2))
+
+        first = await controller.submit(_request("first"))
+        second = await controller.submit(_request("second"))
+        assert controller.in_flight == 2
+
+        assert isinstance([event async for event in first][-1], RuntimeFinished)
+        await asyncio.sleep(0)
+        assert controller.in_flight == 1
+        assert runtime.trim_calls == 0
+
+        assert isinstance([event async for event in second][-1], RuntimeFinished)
+        await asyncio.sleep(0)
+        assert controller.in_flight == 0
+        assert runtime.trim_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_idle_trim_failure_does_not_change_healthy_request_completion() -> None:
+    async def scenario() -> None:
+        runtime = _TrimRuntime(
+            lambda request: _FakeSession(request.request_id, [_finished(request.request_id)]),
+            fail_trim=True,
+        )
+        controller = RequestController(runtime, RequestControlConfig(max_in_flight=1))
+        session = await controller.submit(_request("ok"))
+
+        events = [event async for event in session]
+        await asyncio.sleep(0)
+
+        assert isinstance(events[-1], RuntimeFinished)
+        assert session.terminal_reason is RequestTerminalReason.COMPLETED
+        assert controller.in_flight == 0
+        assert runtime.trim_calls == 1
 
     asyncio.run(scenario())
 

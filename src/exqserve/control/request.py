@@ -522,6 +522,22 @@ class RequestController:
             raise RuntimeError("request-control in-flight count became negative")
         if self._in_flight == 0:
             self._drained.set()
+            asyncio.create_task(
+                self._trim_runtime_if_still_idle(),
+                name="exqserve-idle-cuda-trim",
+            )
+
+    async def _trim_runtime_if_still_idle(self) -> None:
+        async with self._lock:
+            if self._closed or self._in_flight != 0:
+                return
+            trim = getattr(self._runtime, "maybe_trim_cuda_allocator_cache", None)
+            if not callable(trim):
+                return
+            try:
+                trim()
+            except Exception as exc:  # noqa: BLE001 - maintenance must never fail request completion.
+                logger.warning("idle CUDA allocator trim callback failed: %s", exc)
 
     async def acquire(self, request_id: str) -> RequestLease:
         if not isinstance(request_id, str):
